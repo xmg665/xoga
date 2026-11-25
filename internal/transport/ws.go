@@ -14,17 +14,46 @@ import (
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+var wsReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, 4096)
+	},
+}
+
+func unwrapRawWriter(c net.Conn) io.Writer {
+	cur := c
+	for i := 0; i < 4; i++ {
+		if tc, ok := cur.(*net.TCPConn); ok {
+			return tc
+		}
+		if w, ok := cur.(interface{ NetConn() net.Conn }); ok {
+			next := w.NetConn()
+			if next != nil && next != cur {
+				cur = next
+				continue
+			}
+		}
+		break
+	}
+	return c
+}
+
 // AcceptWebSocket performs a zero-dependency RFC 6455 HTTP Upgrade handshake, supports
 // Xray/Sing-box `Sec-WebSocket-Protocol` base64url Early Data (`?ed=2048`), and extracts
 // real client IPs from CDN/reverse-proxy headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`).
 func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
-	br := bufio.NewReaderSize(c, 2048)
+	br := wsReaderPool.Get().(*bufio.Reader)
+	br.Reset(c)
 	reqLine, err := br.ReadString('\n')
 	if err != nil {
+		br.Reset(nil)
+		wsReaderPool.Put(br)
 		return nil, err
 	}
 	parts := strings.Fields(reqLine)
 	if len(parts) < 3 || parts[0] != "GET" {
+		br.Reset(nil)
+		wsReaderPool.Put(br)
 		return nil, errors.New("invalid websocket HTTP request line")
 	}
 
@@ -39,6 +68,8 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 		}
 		if reqPath != cleanExp {
 			_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			br.Reset(nil)
+			wsReaderPool.Put(br)
 			return nil, errors.New("websocket path mismatch")
 		}
 	}
@@ -47,6 +78,8 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
+			br.Reset(nil)
+			wsReaderPool.Put(br)
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -79,6 +112,8 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 
 	if wsKey == "" {
 		_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
+		br.Reset(nil)
+		wsReaderPool.Put(br)
 		return nil, errors.New("missing Sec-WebSocket-Key")
 	}
 
@@ -113,6 +148,8 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 	}
 	resp.WriteString("\r\n")
 	if _, err := c.Write([]byte(resp.String())); err != nil {
+		br.Reset(nil)
+		wsReaderPool.Put(br)
 		return nil, err
 	}
 
@@ -129,6 +166,7 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 
 	return &wsConn{
 		Conn:       c,
+		rawWriter:  unwrapRawWriter(c),
 		br:         br,
 		remoteAddr: remoteAddr,
 		pending:    earlyData,
@@ -145,8 +183,10 @@ func decodeBase64Flexible(s string) ([]byte, error) {
 
 type wsConn struct {
 	net.Conn
+	rawWriter  io.Writer // unwrapped *net.TCPConn when available so net.Buffers hits kernel writev(2)!
 	br         *bufio.Reader
 	remoteAddr net.Addr
+	closeOnce  sync.Once
 
 	readMu   sync.Mutex
 	pending  []byte
@@ -156,6 +196,24 @@ type wsConn struct {
 	maskPos  int
 
 	writeMu sync.Mutex
+}
+
+func (w *wsConn) IsBufferedStream() bool { return true }
+
+func (w *wsConn) NetConn() net.Conn { return w.Conn }
+
+func (w *wsConn) Close() error {
+	err := w.Conn.Close()
+	w.closeOnce.Do(func() {
+		w.readMu.Lock()
+		if w.br != nil {
+			w.br.Reset(nil)
+			wsReaderPool.Put(w.br)
+			w.br = nil
+		}
+		w.readMu.Unlock()
+	})
+	return err
 }
 
 func (w *wsConn) RemoteAddr() net.Addr {
@@ -175,6 +233,9 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
+	if w.br == nil {
+		return 0, io.EOF
+	}
 	for w.frameRem == 0 {
 		var hdr [2]byte
 		if _, err := io.ReadFull(w.br, hdr[:]); err != nil {
@@ -301,9 +362,10 @@ func (w *wsConn) Write(p []byte) (int, error) {
 		hdrLen = 10
 	}
 
-	// Use net.Buffers (writev / scatter-gather I/O) to avoid copying payload into a framed slice!
+	// Use net.Buffers (writev / scatter-gather I/O) against unwrapped *net.TCPConn
+	// so even under ProxyProtocol (`proxy_protocol=true`), WS header + payload emit in 1 single writev(2) syscall!
 	bufs := net.Buffers{hdr[:hdrLen], p}
-	if _, err := bufs.WriteTo(w.Conn); err != nil {
+	if _, err := bufs.WriteTo(w.rawWriter); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -317,6 +379,6 @@ func (w *wsConn) writeControlFrame(opcode byte, payload []byte) error {
 	defer w.writeMu.Unlock()
 	hdr := [2]byte{0x80 | opcode, byte(len(payload))}
 	bufs := net.Buffers{hdr[:], payload}
-	_, err := bufs.WriteTo(w.Conn)
+	_, err := bufs.WriteTo(w.rawWriter)
 	return err
 }

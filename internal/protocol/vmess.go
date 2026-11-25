@@ -201,7 +201,10 @@ func checkVMessCandidate(cand *VMessUserEntry, authID, scratch []byte, now int64
 // for both TCP (`cmd=0x01`) and UDP-over-stream (`cmd=0x02`), with O(1) client-IP user hinting,
 // L1-cached hot-user ring (for L4 transit relays sharing 1 IP across thousands of streams), & anti-replay.
 func (s *Server) handleVMess(conn net.Conn) {
-	br := bufio.NewReaderSize(conn, 1024)
+	var br io.Reader = conn
+	if _, alreadyBuf := conn.(interface{ IsBufferedStream() bool }); !alreadyBuf {
+		br = bufio.NewReaderSize(conn, 2048)
+	}
 
 	var authID [16]byte
 	if _, err := io.ReadFull(br, authID[:]); err != nil {

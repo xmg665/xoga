@@ -7,7 +7,7 @@ import (
 
 const (
 	ipHintSlots = 4096 // power of two; 4096 * 8 bytes = 32 KiB fixed lock-free table
-	hotRingSize = 256  // 256 * 4 bytes = 1 KiB L1-resident active user index ring
+	hotRingSize = 1024 // 1024 * 4 bytes = 4 KiB L1-resident active user index ring (supports 1000+ active users/node)
 )
 
 // ipHintCache is a zero-allocation, lock-free direct-mapped cache mapping client IP -> user slice index.

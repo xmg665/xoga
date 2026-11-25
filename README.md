@@ -42,6 +42,7 @@
     - 内置零内存流媒体/AI `geosite:` 规则集（`netflix`、`disney`、`openai`、`claude`、`gemini`、`perplexity`、`grok`、`tiktok`、`bahamut` 等开箱即用，无需几十 MB 的 `.dat` 文件）
     - 默认开启 `domain_sniff=true` 自动识别客户端预解析 IP 并还原真实 SNI/Host 域名，杜绝客户端本地 DNS 污染导致漏解锁
     - 完整实战配置见 👉 **[《流媒体 DNS 解锁与路由分流解锁完整教程 (docs/UNLOCK_GUIDE.md)》](docs/UNLOCK_GUIDE.md)**
+    - 脚本与容器完整手册见 👉 **[《一键脚本、多实例与 Docker 部署完整教程 (docs/DOCKER_AND_SCRIPT_GUIDE.md)》](docs/DOCKER_AND_SCRIPT_GUIDE.md)**
 
 ---
 
@@ -52,15 +53,44 @@
 bash <(curl -Ls https://raw.githubusercontent.com/xmg665/xoga/main/install.sh)
 ```
 
-### 2. 安装同时直接写入节点配置并启动（推荐脚本化批量部署）
+### 2. 安装同时直接写入节点配置并启动（支持单进程多节点聚合）
 ```bash
+# 对接 V2Board / Xboard
 bash <(curl -Ls https://raw.githubusercontent.com/xmg665/xoga/main/install.sh) \
   type=v2board \
   server_type=vless \
   node_id=1 \
   webapi_url=https://your-panel.example.com \
   webapi_key=your_communication_token
+
+# 对接 SSPanel-UIM（单进程同时聚合承载多个节点）
+bash <(curl -Ls https://raw.githubusercontent.com/xmg665/xoga/main/install.sh) \
+  type=sspanel-uim \
+  server_type=v2ray \
+  node_id=781,782,783,784 \
+  proxy_protocol=true \
+  webapi_url=https://your-panel.example.com/ \
+  webapi_key=your_mu_key
 ```
+
+### 3. Docker 一键启动（100% 兼容 `vaxilu/soga` 环境变量与 `/etc/soga/routes.toml` 挂载）
+```bash
+docker run -d \
+  --name xoga \
+  --restart always \
+  --net host \
+  --ulimit nofile=1048576:1048576 \
+  -e TZ=Asia/Shanghai \
+  -e type=sspanel-uim \
+  -e server_type=v2ray \
+  -e node_id=851 \
+  -e webapi_url=https://your-panel.example.com/ \
+  -e webapi_key=your_mu_key \
+  -e proxy_protocol=true \
+  -v /etc/sg/aomen.toml:/etc/soga/routes.toml \
+  ghcr.io/xmg665/xoga:latest
+```
+更多 `docker-compose.yml`、多开实例（`xoga new`）与迁移示例请阅读 👉 **[docs/DOCKER_AND_SCRIPT_GUIDE.md](docs/DOCKER_AND_SCRIPT_GUIDE.md)**。
 
 ---
 

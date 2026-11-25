@@ -1,0 +1,26 @@
+services:
+  xoga:
+    image: ghcr.io/xmg665/xoga:latest
+    build: .
+    container_name: xoga-node
+    restart: always
+    network_mode: host
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - IS_DOCKER=true
+      - TZ=Asia/Shanghai
+      - type=sspanel-uim
+      - server_type=v2ray
+      - node_id=851
+      - webapi_url=https://panel.example.com/
+      - webapi_key=your_panel_key
+      - proxy_protocol=true
+      - v2ray_reduce_memory=true
+      - mem_limit_mb=512
+    volumes:
+      # 既可挂载到 /etc/xoga/routes.toml，也完全兼容原 soga 的 /etc/soga/routes.toml 路径
+      - ./configs/routes.toml:/etc/xoga/routes.toml:ro
+      - ./configs/dns.yml:/etc/xoga/dns.yml:ro
