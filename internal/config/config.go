@@ -76,8 +76,21 @@ type Config struct {
 	ForbiddenPorts      string   // e.g. "25,26,6881-6999" (soga forbidden_ports)
 	BanPrivateIP        bool     // block RFC1918/loopback targets when true
 	VLESS               bool     // soga `vless=true` when `server_type=v2ray`
-	VLESSFlow           string   // soga `vless_flow=`
+	VLESSFlow           string   // soga `vless_flow=` (e.g. `xtls-rprx-vision`)
 	V2rayReduceMemory   bool     // soga `v2ray_reduce_memory=true`
+
+	// REALITY / Hysteria2 / AnyTLS local overrides (optional when pulled from panel)
+	Reality            bool
+	RealityDest        string
+	RealityPrivateKey  string
+	RealityShortIDs    []string
+	RealityServerNames []string
+	Hy2Obfs            string
+	Hy2ObfsPassword    string
+	Hy2UpMbps          int
+	Hy2DownMbps        int
+	Hy2IgnoreClientBW  bool
+	AnyTLSPadding      string
 	DefaultDNS          []string
 	DNSStrategy         string // ipv4_first, ipv6_first, ipv4_only, ipv6_only
 	DNSCacheTime        int    // minutes (soga `dns_cache_time=10`)
@@ -288,6 +301,36 @@ func (c *Config) ApplyKV(key, val string) {
 		c.VLESS = parseBool(val, false)
 	case "vless_flow":
 		c.VLESSFlow = strings.TrimSpace(val)
+	case "reality", "enable_reality":
+		c.Reality = parseBool(val, false)
+	case "reality_dest", "dest":
+		c.RealityDest = strings.TrimSpace(val)
+	case "reality_private_key", "private_key":
+		c.RealityPrivateKey = strings.TrimSpace(val)
+	case "reality_short_ids", "reality_short_id", "short_id", "short_ids":
+		c.RealityShortIDs = nil
+		for _, p := range strings.Split(val, ",") {
+			c.RealityShortIDs = append(c.RealityShortIDs, strings.TrimSpace(p))
+		}
+	case "reality_server_names", "server_names":
+		c.RealityServerNames = nil
+		for _, p := range strings.Split(val, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				c.RealityServerNames = append(c.RealityServerNames, s)
+			}
+		}
+	case "hy2_obfs", "obfs":
+		c.Hy2Obfs = strings.ToLower(strings.TrimSpace(val))
+	case "hy2_obfs_password", "obfs_password":
+		c.Hy2ObfsPassword = strings.TrimSpace(val)
+	case "hy2_up_mbps", "up_mbps":
+		c.Hy2UpMbps, _ = strconv.Atoi(strings.TrimSpace(val))
+	case "hy2_down_mbps", "down_mbps":
+		c.Hy2DownMbps, _ = strconv.Atoi(strings.TrimSpace(val))
+	case "hy2_ignore_client_bandwidth", "ignore_client_bandwidth":
+		c.Hy2IgnoreClientBW = parseBool(val, false)
+	case "anytls_padding_scheme", "padding_scheme":
+		c.AnyTLSPadding = val
 	case "v2ray_reduce_memory":
 		c.V2rayReduceMemory = parseBool(val, false)
 		if c.V2rayReduceMemory && c.GCPercent == 100 {
@@ -442,6 +485,9 @@ var knownEnvKeys = []string{
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
 	"vless", "vless_flow", "v2ray_reduce_memory",
+	"reality", "enable_reality", "reality_dest", "reality_private_key", "reality_short_ids", "reality_short_id", "reality_server_names",
+	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps", "hy2_ignore_client_bandwidth",
+	"anytls_padding_scheme", "padding_scheme",
 	"dns_cache_time", "default_dns", "dns_strategy", "dns_config_url",
 	"domain_sniff", "force_domain_sniff", "dns_file", "dns_config_file",
 	"log_level", "block_list_file", "white_list_file", "routes_file",
@@ -507,9 +553,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("unsupported panel type %q (supported: v2board, newv2board, xboard, sspanel)", c.Type)
 	}
 	switch c.NormalizedServerType() {
-	case "vless", "vmess", "trojan", "shadowsocks":
+	case "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "anytls":
 	default:
-		return fmt.Errorf("unsupported server_type %q (supported: v2ray, vmess, vless, trojan, ss, shadowsocks)", c.ServerType)
+		return fmt.Errorf("unsupported server_type %q (supported: v2ray, vmess, vless, reality, trojan, ss, shadowsocks, hy2, hysteria2, anytls)", c.ServerType)
 	}
 	return nil
 }
@@ -528,19 +574,30 @@ func (c *Config) NormalizedPanelType() string {
 func (c *Config) NormalizedServerType() string {
 	switch strings.ToLower(c.ServerType) {
 	case "v2ray", "vmess":
-		if c.VLESS {
+		if c.VLESS || c.Reality {
 			return "vless"
 		}
 		return "vmess"
 	case "vless":
 		return "vless"
+	case "reality", "vless-reality":
+		return "vless"
 	case "trojan":
 		return "trojan"
 	case "ss", "shadowsocks":
 		return "shadowsocks"
+	case "hy2", "hysteria2", "hysteria":
+		return "hysteria2"
+	case "anytls":
+		return "anytls"
 	default:
 		return ""
 	}
+}
+
+func (c *Config) IsRealityConfigured() bool {
+	st := strings.ToLower(c.ServerType)
+	return c.Reality || st == "reality" || st == "vless-reality"
 }
 
 // UpdateFile updates or appends k=v pairs in-place while preserving comments and layout,

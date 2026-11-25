@@ -340,5 +340,12 @@ func listenerNeedsRestart(oldSpec, newSpec *panel.NodeSpec) bool {
 		oldSpec.Cipher != newSpec.Cipher ||
 		oldSpec.ServerKey != newSpec.ServerKey ||
 		oldSpec.TLSMode != newSpec.TLSMode ||
-		oldSpec.ServerName != newSpec.ServerName
+		oldSpec.ServerName != newSpec.ServerName ||
+		oldSpec.Flow != newSpec.Flow ||
+		oldSpec.RealityDest != newSpec.RealityDest ||
+		oldSpec.RealityPrivateKey != newSpec.RealityPrivateKey ||
+		oldSpec.Hy2Obfs != newSpec.Hy2Obfs ||
+		oldSpec.Hy2ObfsPassword != newSpec.Hy2ObfsPassword ||
+		oldSpec.Hy2DownMbps != newSpec.Hy2DownMbps ||
+		oldSpec.AnyTLSPaddingScheme != newSpec.AnyTLSPaddingScheme
 }

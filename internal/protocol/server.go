@@ -5,9 +5,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
@@ -53,10 +57,27 @@ type UserIndex struct {
 	Users       []*stats.UserEntry
 	ByTrojan    map[[56]byte]*stats.UserEntry
 	ByUUID      map[[16]byte]*stats.UserEntry
+	BySHA256    map[[32]byte]*stats.UserEntry // AnyTLS O(1) SHA-256(password/UUID) lookup
+	ByPassword  map[string]*stats.UserEntry   // Hysteria2 O(1) password / UUID / id:pass lookup
 	SSUsers     []SSUserEntry
 	SSEIHMap    map[[16]byte]*SSUserEntry
 	VMessUsers  []VMessUserEntry
 	VMessBlocks []cipher.Block // compact 16B/user parallel slice for L1/L2 cache-friendly AuthID scan
+}
+
+func (idx *UserIndex) LookupPassword(cred string) *stats.UserEntry {
+	if idx == nil || cred == "" {
+		return nil
+	}
+	if u, ok := idx.ByPassword[cred]; ok {
+		return u
+	}
+	if _, right, hasColon := strings.Cut(cred, ":"); hasColon && right != "" {
+		if u, ok := idx.ByPassword[right]; ok {
+			return u
+		}
+	}
+	return nil
 }
 
 func BuildUserIndex(users []*stats.UserEntry, ssKeyLen int) *UserIndex {
@@ -64,12 +85,14 @@ func BuildUserIndex(users []*stats.UserEntry, ssKeyLen int) *UserIndex {
 }
 
 // BuildUserIndexForProtocol constructs only the lookup structures required by `proto`
-// ("vmess", "vless", "trojan", "shadowsocks", or "" for all), saving ~35 MiB of unused
-// map buckets across multi-node instances and reusing cached per-user VMess AES key schedules.
+// ("vmess", "vless", "trojan", "shadowsocks", "hysteria2", "anytls", or "" for all),
+// saving ~35 MiB of unused map buckets across multi-node instances and reusing cached VMess key schedules.
 func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen int) *UserIndex {
 	needTrojan := proto == "" || proto == "trojan"
 	needVLESS := proto == "" || proto == "vless"
 	needVMess := proto == "" || proto == "vmess"
+	needAnyTLS := proto == "" || proto == "anytls"
+	needHy2 := proto == "" || proto == "hysteria2"
 	needSS := ssKeyLen > 0 || proto == "shadowsocks"
 
 	idx := &UserIndex{
@@ -81,6 +104,12 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 	if needVLESS {
 		idx.ByUUID = make(map[[16]byte]*stats.UserEntry, len(users))
 	}
+	if needAnyTLS {
+		idx.BySHA256 = make(map[[32]byte]*stats.UserEntry, len(users))
+	}
+	if needHy2 {
+		idx.ByPassword = make(map[string]*stats.UserEntry, len(users))
+	}
 	if needSS && ssKeyLen > 0 {
 		idx.SSUsers = make([]SSUserEntry, 0, len(users))
 		idx.SSEIHMap = make(map[[16]byte]*SSUserEntry, len(users))
@@ -91,8 +120,30 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 	}
 
 	for _, u := range users {
+		if u.IsDisabled() {
+			continue
+		}
 		if needTrojan {
 			idx.ByTrojan[u.TrojanHash] = u
+			if u.Passwd != "" && u.Passwd != u.UUID {
+				var altTrojan [56]byte
+				encodeAltTrojanHash(u.Passwd, &altTrojan)
+				idx.ByTrojan[altTrojan] = u
+			}
+		}
+		if needAnyTLS {
+			idx.BySHA256[u.SHA256UUID] = u
+			if u.Passwd != "" && u.Passwd != u.UUID {
+				idx.BySHA256[u.SHA256Passwd] = u
+			}
+		}
+		if needHy2 {
+			if u.UUID != "" {
+				idx.ByPassword[u.UUID] = u
+			}
+			if u.Passwd != "" {
+				idx.ByPassword[u.Passwd] = u
+			}
 		}
 		if u.HasUUID {
 			if needVLESS {
@@ -136,6 +187,11 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 	return idx
 }
 
+func encodeAltTrojanHash(secret string, dst *[56]byte) {
+	sum := sha256.Sum224([]byte(secret))
+	hex.Encode(dst[:], sum[:])
+}
+
 func deriveSSUserKey(secret string, keyLen int) []byte {
 	if raw, err := base64.StdEncoding.DecodeString(secret); err == nil && len(raw) >= keyLen {
 		out := make([]byte, keyLen)
@@ -177,9 +233,11 @@ type Server struct {
 	userIdx atomic.Pointer[UserIndex]
 	aclEng  atomic.Pointer[acl.Engine]
 
-	tcpLn   net.Listener
-	udpConn net.PacketConn
-	tlsProv *transport.TLSProvider
+	tcpLn        net.Listener
+	udpConn      net.PacketConn
+	tlsProv      *transport.TLSProvider
+	hy2Transport *quic.Transport
+	hy2Listener  *quic.Listener
 
 	closed atomic.Bool
 	wg     sync.WaitGroup
@@ -259,6 +317,10 @@ func (s *Server) Start() error {
 	}
 	addr := net.JoinHostPort(listenIP, strconv.Itoa(port))
 
+	if s.spec.Protocol == "hysteria2" {
+		return s.startHysteria2(addr)
+	}
+
 	rawLn, err := listenTCP(context.Background(), addr)
 	if err != nil {
 		return fmt.Errorf("listen tcp %s: %w", addr, err)
@@ -269,8 +331,23 @@ func (s *Server) Start() error {
 		ln = &relay.ProxyProtoListener{Listener: ln}
 	}
 
-	needTLS := !s.cfg.ForceCloseSSL && (s.spec.TLSMode > 0 || s.cfg.CertFile != "" || s.cfg.CertMode == "http" || s.cfg.CertMode == "self")
-	if needTLS {
+	needReality := !s.cfg.ForceCloseSSL && s.spec.TLSMode == 2
+	needTLS := !s.cfg.ForceCloseSSL && !needReality && (s.spec.TLSMode > 0 || s.spec.Protocol == "anytls" || s.cfg.CertFile != "" || s.cfg.CertMode == "http" || s.cfg.CertMode == "self")
+
+	if needReality {
+		rln, rerr := transport.BuildRealityListener(ln, transport.RealityOptions{
+			Dest:        s.spec.RealityDest,
+			PrivateKey:  s.spec.RealityPrivateKey,
+			ShortIDs:    s.spec.RealityShortIDs,
+			ServerNames: s.spec.RealityServerNames,
+			FallbackSNI: s.spec.ServerName,
+		})
+		if rerr != nil {
+			_ = rawLn.Close()
+			return fmt.Errorf("init REALITY: %w", rerr)
+		}
+		ln = rln
+	} else if needTLS {
 		tp, err := transport.BuildTLSConfig(s.cfg, s.spec.ServerName)
 		if err != nil {
 			_ = rawLn.Close()
@@ -285,7 +362,7 @@ func (s *Server) Start() error {
 	go s.acceptLoop()
 
 	// Start native UDP listener when running Shadowsocks over raw network
-	if s.spec.Protocol == "shadowsocks" && s.spec.Network != "ws" && !needTLS {
+	if s.spec.Protocol == "shadowsocks" && s.spec.Network != "ws" && !needTLS && !needReality {
 		udpConn, err := net.ListenPacket("udp", addr)
 		if err != nil {
 			logger.Warnf("Shadowsocks UDP listen %s failed (TCP still active): %v", addr, err)
@@ -296,14 +373,20 @@ func (s *Server) Start() error {
 		}
 	}
 
-	logger.Infof("Inbound started: protocol=%s addr=%s network=%s tls=%v zerocopy=%v",
-		s.spec.Protocol, addr, s.spec.Network, needTLS, s.cfg.EnableZeroCopy)
+	logger.Infof("Inbound started: protocol=%s addr=%s network=%s tls=%v reality=%v zerocopy=%v",
+		s.spec.Protocol, addr, s.spec.Network, needTLS, needReality, s.cfg.EnableZeroCopy)
 	return nil
 }
 
 func (s *Server) Close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
+	}
+	if s.hy2Listener != nil {
+		_ = s.hy2Listener.Close()
+	}
+	if s.hy2Transport != nil {
+		_ = s.hy2Transport.Close()
 	}
 	if s.tcpLn != nil {
 		_ = s.tcpLn.Close()
@@ -359,26 +442,47 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleShadowsocksTCP(conn)
 	case "vmess":
 		s.handleVMess(conn)
+	case "anytls":
+		s.handleAnyTLS(conn)
 	}
 }
 
-// connectAndRelay performs first-packet sniffing (TLS SNI / HTTP Host / BitTorrent), ACL routing,
-// outbound dialing, and zero-copy or pooled-buffer bidirectional relay.
+// connectAndRelay acquires a tracked user session (so account expiry / quota exhaustion immediately
+// severs the active socket via `DisableAndKick`), then sniffs, routes, dials, and relays.
 func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, destHost string, destPort uint16, preread []byte) {
 	clientIP := relay.ExtractClientIP(clientConn.RemoteAddr())
-	if err := user.AcquireConn(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter()); err != nil {
+	connID, err := user.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), clientConn)
+	if err != nil {
 		logger.Debugf("user %d rejected (%s): %v", user.ID, clientIP, err)
 		return
 	}
-	defer user.ReleaseConn()
+	defer user.ReleaseSession(connID)
 
-	// If no initial payload was read yet, briefly peek up to SmallSize (2 KiB) with a short deadline
-	// so TLS ClientHello SNI, HTTP Host, and BitTorrent handshakes are caught before dialing.
+	s.connectStreamNoAcquire(clientConn, user, destHost, destPort, preread, nil)
+}
+
+func (s *Server) connectStreamNoAcquire(
+	clientConn net.Conn,
+	user *stats.UserEntry,
+	destHost string,
+	destPort uint16,
+	preread []byte,
+	onDial func(error),
+) {
+	if user == nil || user.IsDisabled() {
+		if onDial != nil {
+			onDial(stats.ErrUserDisabled)
+		}
+		return
+	}
+
+	// For multiplexed AnyTLS v2 (`onDial != nil`), client waits for `cmdSYNACK` BEFORE sending first application payload!
+	// So only peek prior to dialing when `onDial == nil`.
 	var peeked []byte
 	var peekBuf *[]byte
 	if len(preread) > 0 {
 		peeked = preread
-	} else {
+	} else if onDial == nil {
 		peekBuf = bufpool.Get(bufpool.SmallSize)
 		defer bufpool.Put(peekBuf)
 		_ = clientConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
@@ -399,11 +503,12 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 	route := aclEng.DecideForNode(s.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		logger.Debugf("blocked user=%d dest=%s:%d sni=%s proto=%s rule=%s", user.ID, destHost, destPort, sn.Domain, sn.Protocol, route.RuleName)
+		if onDial != nil {
+			onDial(errors.New("blocked by audit policy"))
+		}
 		return
 	}
 
-	// Domain Sniff Override: if client sent a pre-resolved IP, rewrite destination to the
-	// sniffed TLS SNI / HTTP Host when matching a DNS unlock rule, route unlock rule, or force_domain_sniff.
 	effectiveHost := destHost
 	if sn.Domain != "" && s.cfg.DomainSniff {
 		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
@@ -416,6 +521,9 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	remoteConn, err := relay.DialOutbound(dialCtx, effectiveHost, destPort, route, s.dnsRes, 10*time.Second)
 	cancel()
+	if onDial != nil {
+		onDial(err)
+	}
 	if err != nil {
 		logger.Debugf("dial %s:%d (rule=%s) failed: %v", effectiveHost, destPort, route.RuleName, err)
 		return

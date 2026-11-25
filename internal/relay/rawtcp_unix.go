@@ -34,6 +34,9 @@ func tryCopyFromRawTCP(
 	}()
 
 	for {
+		if user != nil && user.IsDisabled() {
+			return true
+		}
 		_ = srcTCP.SetReadDeadline(time.Now().Add(idleTimeout))
 		var nr int
 		var readErr error

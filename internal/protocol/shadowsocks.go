@@ -487,6 +487,7 @@ func incNonce(n *[12]byte) {
 type ssUDPSession struct {
 	natConn   net.PacketConn
 	user      *stats.UserEntry
+	sessID    uint64
 	masterKey []byte
 	lastSeen  int64
 }
@@ -560,7 +561,7 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 				}
 			}
 		}
-		if matchedUser == nil {
+		if matchedUser == nil || matchedUser.IsDisabled() {
 			continue
 		}
 
@@ -581,6 +582,9 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		}
 		payload := plain[len(plain)-pr.Len():]
 		matchedUser.AddUpload(int64(len(payload)))
+		if matchedUser.IsDisabled() {
+			continue
+		}
 
 		keyStr := clientAddr.String()
 		natMu.Lock()
@@ -595,9 +599,16 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 				natMu.Unlock()
 				continue
 			}
+			sessID, aerr := matchedUser.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), natPC)
+			if aerr != nil {
+				_ = natPC.Close()
+				natMu.Unlock()
+				continue
+			}
 			sess = &ssUDPSession{
 				natConn:   natPC,
 				user:      matchedUser,
+				sessID:    sessID,
 				masterKey: matchedKey,
 				lastSeen:  time.Now().Unix(),
 			}
@@ -622,6 +633,9 @@ func (s *Server) pipeSSUDPReply(
 ) {
 	defer func() {
 		_ = sess.natConn.Close()
+		if sess.user != nil {
+			sess.user.ReleaseSession(sess.sessID)
+		}
 		natMu.Lock()
 		delete(sessions, keyStr)
 		natMu.Unlock()

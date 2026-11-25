@@ -23,10 +23,14 @@
 
 - **对接面板 (`type=`)**：`v2board`、`newv2board`、`xboard`、`sspanel`（兼容 UIM `custom_config` 与 Metron 分号节点串）
 - **节点协议 (`server_type=`)**：
-  - `vless`：VLESS v0 TCP / UDP（`[16]byte` UUID O(1) 无锁检索，Scatter-Gather 零拷贝响应头）
+  - `vless` / `reality`：VLESS v0 TCP / UDP，原生支持 **VLESS-REALITY**（X25519 + TLS 1.3 零证书抗探测伪装）与 **XTLS-Vision (`xtls-rprx-vision`)** 内层握手填充与零开销直通解包
+  - `hysteria2` / `hy2` / `hysteria`：**Hysteria 2**（QUIC + HTTP/3 `233` 鉴权与 `404` Web 伪装、双向 QUIC TCP 流、RFC 9221 QUIC Datagram 原生 UDP 分片转发、可选 `salamander` BLAKE2b 混淆）
+  - `anytls`：**AnyTLS v1 & v2**（TLS 之上单连接多路复用会话、`SHA-256` 零分配鉴权、`cmdSYNACK` 状态协商、动态 `paddingScheme` 下发及 `sing-box` `sp.v2.udp-over-tcp.arpa` UDP 转发）
   - `trojan`：Trojan TCP / Trojan-UDP Associate（SHA-224 `[56]byte` O(1) 无锁检索）
   - `shadowsocks` / `ss`：经典 AEAD（`aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`）及 **Shadowsocks-2022**（`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`，支持单密钥与 V2Board/Xboard `server_key` 多用户 **EIH** 身份头）
   - `vmess` / `v2ray`：现代 VMess AEAD（AES-128-GCM / ChaCha20-Poly1305 / Shake128 长度掩码与 `GlobalPadding` 混淆 / VMess UDP-over-TCP，内置无锁 IP→User `O(1)` 缓存与零分配栈上 KDF）
+- **会员到期与超流毫秒级强踢保障**：
+  - 账户到期、禁用或流量耗尽后，不仅**新连接立即拒绝**，且自动触发 `DisableAndKick()` **毫秒级强制断开该用户所有已建立的存量 TCP / WebSocket / QUIC / 多路复用 / UDP 长连接**（杜绝不断流白嫖），同时将断开前的尾数流量完整兜底上报面板；若面板下发 `transfer_enable` 配额，还支持传输中原子级实时扣减秒断。
 - **单进程多节点聚合与 Docker 环境变量模式**：
   - 支持 `node_id=781,782,783-790` 单进程同时承载数十个节点（共享同一个 Go 运行时、HTTP/2 面板连接池、DNS 缓存与 `routes.toml` 路由快照，错峰同步防面板拥塞）
   - 支持 `routes.toml` 按 `rules=["node_id:781"]` + `listen = "10.163.0.100"` 将不同节点精准绑定至不同 TUN 隧道 / 多 IP 站群源地址出口（TCP 与 UDP 均生效）

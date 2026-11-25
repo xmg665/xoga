@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/config"
@@ -34,12 +37,15 @@ type UniProxyClient struct {
 	hasUsersHash  bool
 	lastBodyLen   int
 	legacyV2      bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
+	legacyHy      bool // fallback node_type="hysteria" when Xboard/V2Board uses "hysteria" (v2) instead of "hysteria2"
 }
 
 func NewUniProxyClient(cfg *config.Config, httpCli *http.Client) *UniProxyClient {
 	nt := cfg.NormalizedServerType()
 	if strings.EqualFold(cfg.ServerType, "v2ray") {
 		nt = "v2ray"
+	} else if strings.EqualFold(cfg.ServerType, "hysteria") {
+		nt = "hysteria"
 	}
 	return &UniProxyClient{
 		cfg:      cfg,
@@ -58,6 +64,9 @@ func (c *UniProxyClient) endpoint(action string) string {
 	nt := c.nodeType
 	if c.legacyV2 && nt == "vmess" {
 		nt = "v2ray"
+	}
+	if c.legacyHy && nt == "hysteria2" {
+		nt = "hysteria"
 	}
 	c.mu.Unlock()
 
@@ -79,9 +88,17 @@ type uniConfigResp struct {
 	ServerKey       string          `json:"server_key"`
 	TLS             int             `json:"tls"`
 	TLSSettings     json.RawMessage `json:"tls_settings"`
+	TLSSettingsAlt  json.RawMessage `json:"tlsSettings"`
 	Host            string          `json:"host"`
 	ServerName      string          `json:"server_name"`
 	Flow            string          `json:"flow"`
+	Version         int             `json:"version"`
+	UpMbps          int             `json:"up_mbps"`
+	DownMbps        int             `json:"down_mbps"`
+	Obfs            string          `json:"obfs"`
+	ObfsPassword    string          `json:"obfs-password"`
+	ObfsPasswordAlt string          `json:"obfs_password"`
+	PaddingScheme   json.RawMessage `json:"padding_scheme"`
 	Routes          []struct {
 		ID          int             `json:"id"`
 		Match       json.RawMessage `json:"match"`
@@ -100,12 +117,19 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpoint("config"), etag)
-	if err != nil && (status == 400 || status == 404 || status == 500) && c.nodeType == "vmess" {
-		// Retry once with legacy V2Board node_type=v2ray
-		c.mu.Lock()
-		c.legacyV2 = true
-		c.mu.Unlock()
-		body, newETag, status, err = c.doGet(ctx, c.endpoint("config"), "")
+	if err != nil && (status == 400 || status == 404 || status == 422 || status == 500) {
+		if c.nodeType == "vmess" {
+			c.mu.Lock()
+			c.legacyV2 = true
+			c.mu.Unlock()
+			body, newETag, status, err = c.doGet(ctx, c.endpoint("config"), "")
+		} else if c.nodeType == "hysteria2" {
+			// Xboard registers Hysteria v2 under `node_type=hysteria` with `"version": 2`
+			c.mu.Lock()
+			c.legacyHy = true
+			c.mu.Unlock()
+			body, newETag, status, err = c.doGet(ctx, c.endpoint("config"), "")
+		}
 	}
 	if errors.Is(err, ErrNotModified) {
 		return nil, ErrNotModified
@@ -126,31 +150,73 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	}
 
 	proto := strings.ToLower(raw.Protocol)
-	if proto == "" || proto == "v2ray" {
+	switch proto {
+	case "", "v2ray":
 		proto = c.cfg.NormalizedServerType()
+	case "hysteria", "hy2":
+		proto = "hysteria2"
 	}
 
 	spec := &NodeSpec{
-		Protocol:     proto,
-		ListenIP:     raw.ListenIP,
-		ServerPort:   raw.ServerPort,
-		Network:      strings.ToLower(raw.Network),
-		Cipher:       strings.ToLower(raw.Cipher),
-		ServerKey:    raw.ServerKey,
-		TLSMode:      raw.TLS,
-		ServerName:   raw.ServerName,
-		Flow:         raw.Flow,
-		PullInterval: parseAnyInt(raw.BaseConfig.PullInterval),
-		PushInterval: parseAnyInt(raw.BaseConfig.PushInterval),
+		Protocol:          proto,
+		ListenIP:          raw.ListenIP,
+		ServerPort:        raw.ServerPort,
+		Network:           strings.ToLower(raw.Network),
+		Cipher:            strings.ToLower(raw.Cipher),
+		ServerKey:         raw.ServerKey,
+		TLSMode:           raw.TLS,
+		ServerName:        raw.ServerName,
+		Flow:              raw.Flow,
+		PullInterval:      parseAnyInt(raw.BaseConfig.PullInterval),
+		PushInterval:      parseAnyInt(raw.BaseConfig.PushInterval),
+		Hy2UpMbps:         raw.UpMbps,
+		Hy2DownMbps:       raw.DownMbps,
+		Hy2Obfs:           strings.ToLower(strings.TrimSpace(raw.Obfs)),
+		Hy2ObfsPassword:   strings.TrimSpace(raw.ObfsPassword),
+		Hy2IgnoreClientBW: c.cfg.Hy2IgnoreClientBW,
+	}
+	if spec.Hy2ObfsPassword == "" && raw.ObfsPasswordAlt != "" {
+		spec.Hy2ObfsPassword = strings.TrimSpace(raw.ObfsPasswordAlt)
+	}
+	// V2bX / V2Board compatibility: when `obfs` contains a password string directly and `obfs-password` is empty
+	if spec.Hy2Obfs != "" && spec.Hy2Obfs != "salamander" && spec.Hy2ObfsPassword == "" {
+		spec.Hy2ObfsPassword = raw.Obfs
+		spec.Hy2Obfs = "salamander"
+	}
+	if proto == "hysteria2" || proto == "anytls" {
+		if spec.TLSMode == 0 {
+			spec.TLSMode = 1
+		}
+	}
+	if spec.Flow == "" && c.cfg.VLESSFlow != "" {
+		spec.Flow = c.cfg.VLESSFlow
+	}
+	if c.cfg.IsRealityConfigured() && spec.TLSMode != 2 {
+		spec.TLSMode = 2
 	}
 	if spec.ListenIP == "" {
 		spec.ListenIP = "0.0.0.0"
 	}
 	if spec.Network == "" {
-		spec.Network = "tcp"
+		if proto == "hysteria2" {
+			spec.Network = "quic"
+		} else {
+			spec.Network = "tcp"
+		}
 	}
 	if spec.ServerName == "" && raw.Host != "" {
 		spec.ServerName = raw.Host
+	}
+
+	// Parse AnyTLS padding_scheme (either string or []string in Xboard)
+	if len(raw.PaddingScheme) > 0 {
+		var s string
+		var arr []string
+		if json.Unmarshal(raw.PaddingScheme, &s) == nil && s != "" {
+			spec.AnyTLSPaddingScheme = s
+		} else if json.Unmarshal(raw.PaddingScheme, &arr) == nil && len(arr) > 0 {
+			spec.AnyTLSPaddingScheme = strings.Join(arr, "\n")
+		}
 	}
 
 	// Extract WS path & host from networkSettings / network_settings
@@ -176,14 +242,64 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 		}
 	}
 
-	// Extract server_name from tls_settings when needed
-	if spec.ServerName == "" && len(raw.TLSSettings) > 2 {
+	// Extract TLS & REALITY settings from tls_settings / tlsSettings
+	tsBytes := raw.TLSSettings
+	if len(tsBytes) == 0 {
+		tsBytes = raw.TLSSettingsAlt
+	}
+	if len(tsBytes) > 2 {
 		var ts struct {
-			ServerName string `json:"server_name"`
+			ServerName  string   `json:"server_name"`
+			ServerNames []string `json:"server_names"`
+			ServerPort  any      `json:"server_port"`
+			Dest        string   `json:"dest"`
+			ShortID     string   `json:"short_id"`
+			ShortIDs    []string `json:"short_ids"`
+			PrivateKey  string   `json:"private_key"`
 		}
-		if json.Unmarshal(raw.TLSSettings, &ts) == nil && ts.ServerName != "" {
-			spec.ServerName = ts.ServerName
+		if json.Unmarshal(tsBytes, &ts) == nil {
+			if ts.ServerName != "" {
+				spec.ServerName = ts.ServerName
+			}
+			if ts.PrivateKey != "" {
+				spec.RealityPrivateKey = strings.TrimSpace(ts.PrivateKey)
+			}
+			if ts.Dest != "" {
+				spec.RealityDest = strings.TrimSpace(ts.Dest)
+			} else if ts.ServerName != "" {
+				dp := parseAnyInt(ts.ServerPort)
+				if dp <= 0 {
+					dp = 443
+				}
+				spec.RealityDest = net.JoinHostPort(ts.ServerName, strconv.Itoa(dp))
+			}
+			if len(ts.ServerNames) > 0 {
+				spec.RealityServerNames = append(spec.RealityServerNames, ts.ServerNames...)
+			} else if ts.ServerName != "" {
+				for _, sn := range strings.Split(ts.ServerName, ",") {
+					if s := strings.TrimSpace(sn); s != "" {
+						spec.RealityServerNames = append(spec.RealityServerNames, s)
+					}
+				}
+			}
+			if len(ts.ShortIDs) > 0 {
+				spec.RealityShortIDs = append(spec.RealityShortIDs, ts.ShortIDs...)
+			} else if ts.ShortID != "" {
+				for _, sid := range strings.Split(ts.ShortID, ",") {
+					spec.RealityShortIDs = append(spec.RealityShortIDs, strings.TrimSpace(sid))
+				}
+			}
 		}
+	}
+
+	applyConfigProtocolOverrides(c.cfg, spec)
+	if spec.TLSMode == 2 && spec.RealityPrivateKey == "" {
+		// V2bX / V2Board deterministic X25519 private key derivation fallback
+		sum := sha256.Sum256([]byte("vless" + c.cfg.WebAPIKey))
+		sum[0] &= 248
+		sum[31] &= 127
+		sum[31] |= 64
+		spec.RealityPrivateKey = base64.RawURLEncoding.EncodeToString(sum[:])
 	}
 
 	// Convert dynamic panel routes
@@ -205,11 +321,52 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 
 type uniUsersResp struct {
 	Users []struct {
-		ID          int  `json:"id"`
-		UUID        string `json:"uuid"`
-		SpeedLimit  *int `json:"speed_limit"`
-		DeviceLimit *int `json:"device_limit"`
+		ID             int    `json:"id"`
+		UUID           string `json:"uuid"`
+		SpeedLimit     *int   `json:"speed_limit"`
+		DeviceLimit    *int   `json:"device_limit"`
+		Banned         *int   `json:"banned"`
+		ExpiredAt      *int64 `json:"expired_at"`
+		U              *int64 `json:"u"`
+		D              *int64 `json:"d"`
+		TransferEnable *int64 `json:"transfer_enable"`
 	} `json:"users"`
+}
+
+func applyConfigProtocolOverrides(cfg *config.Config, spec *NodeSpec) {
+	if cfg.VLESSFlow != "" && spec.Flow == "" {
+		spec.Flow = cfg.VLESSFlow
+	}
+	if cfg.RealityDest != "" {
+		spec.RealityDest = cfg.RealityDest
+	}
+	if cfg.RealityPrivateKey != "" {
+		spec.RealityPrivateKey = cfg.RealityPrivateKey
+	}
+	if len(cfg.RealityShortIDs) > 0 {
+		spec.RealityShortIDs = append([]string(nil), cfg.RealityShortIDs...)
+	}
+	if len(cfg.RealityServerNames) > 0 {
+		spec.RealityServerNames = append([]string(nil), cfg.RealityServerNames...)
+	}
+	if cfg.Hy2Obfs != "" {
+		spec.Hy2Obfs = cfg.Hy2Obfs
+	}
+	if cfg.Hy2ObfsPassword != "" {
+		spec.Hy2ObfsPassword = cfg.Hy2ObfsPassword
+	}
+	if cfg.Hy2UpMbps > 0 {
+		spec.Hy2UpMbps = cfg.Hy2UpMbps
+	}
+	if cfg.Hy2DownMbps > 0 {
+		spec.Hy2DownMbps = cfg.Hy2DownMbps
+	}
+	if cfg.Hy2IgnoreClientBW {
+		spec.Hy2IgnoreClientBW = true
+	}
+	if cfg.AnyTLSPadding != "" {
+		spec.AnyTLSPaddingScheme = cfg.AnyTLSPadding
+	}
 }
 
 func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
@@ -245,10 +402,31 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 	}
 	c.mu.Unlock()
 
+	nowUnix := time.Now().Unix()
 	out := make([]stats.SyncUserSpec, 0, len(resp.Users))
 	for _, u := range resp.Users {
 		if u.ID <= 0 || u.UUID == "" {
 			continue
+		}
+		if u.Banned != nil && *u.Banned != 0 {
+			continue
+		}
+		if u.ExpiredAt != nil && *u.ExpiredAt > 0 && *u.ExpiredAt <= nowUnix {
+			continue
+		}
+		var remain int64 = -1
+		if u.TransferEnable != nil && *u.TransferEnable > 0 {
+			var used int64
+			if u.U != nil {
+				used += *u.U
+			}
+			if u.D != nil {
+				used += *u.D
+			}
+			remain = *u.TransferEnable - used
+			if remain <= 0 {
+				continue
+			}
 		}
 		var speedBps int64
 		if u.SpeedLimit != nil && *u.SpeedLimit > 0 {
@@ -264,6 +442,7 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 			UUIDOrPass:  u.UUID,
 			SpeedLimit:  speedBps,
 			DeviceLimit: devLim,
+			RemainBytes: remain,
 		})
 	}
 	return out, nil

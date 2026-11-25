@@ -156,14 +156,69 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 			if s, ok := cc["sni"].(string); ok && s != "" {
 				spec.ServerName = s
 			}
-			if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true {
+			if parseAnyInt(cc["security"]) == 2 || cc["security"] == "reality" || cc["reality"] == "1" || cc["reality"] == true {
+				spec.TLSMode = 2
+			} else if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true {
 				spec.TLSMode = 1
 			}
 			if cc["enable_vless"] == "1" || cc["enable_vless"] == true || cc["vless"] == "1" || cc["vless"] == true {
 				spec.Protocol = "vless"
 			}
+			if s, ok := cc["flow"].(string); ok && s != "" {
+				spec.Flow = s
+			}
+			if s, ok := cc["private_key"].(string); ok && s != "" {
+				spec.RealityPrivateKey = strings.TrimSpace(s)
+			}
+			if s, ok := cc["dest"].(string); ok && s != "" {
+				spec.RealityDest = strings.TrimSpace(s)
+			} else if s, ok := cc["reality_dest"].(string); ok && s != "" {
+				spec.RealityDest = strings.TrimSpace(s)
+			}
+			if s, ok := cc["short_id"].(string); ok && s != "" {
+				for _, sid := range strings.Split(s, ",") {
+					spec.RealityShortIDs = append(spec.RealityShortIDs, strings.TrimSpace(sid))
+				}
+			}
+			if arr, ok := cc["short_ids"].([]any); ok {
+				for _, it := range arr {
+					if s, ok := it.(string); ok {
+						spec.RealityShortIDs = append(spec.RealityShortIDs, strings.TrimSpace(s))
+					}
+				}
+			}
+			if arr, ok := cc["server_names"].([]any); ok {
+				for _, it := range arr {
+					if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+						spec.RealityServerNames = append(spec.RealityServerNames, strings.TrimSpace(s))
+					}
+				}
+			}
+			if s, ok := cc["obfs"].(string); ok && s != "" {
+				spec.Hy2Obfs = strings.ToLower(strings.TrimSpace(s))
+			}
+			if s, ok := cc["obfs_password"].(string); ok && s != "" {
+				spec.Hy2ObfsPassword = strings.TrimSpace(s)
+			}
+			if v := parseAnyInt(cc["up_mbps"]); v > 0 {
+				spec.Hy2UpMbps = v
+			}
+			if v := parseAnyInt(cc["down_mbps"]); v > 0 {
+				spec.Hy2DownMbps = v
+			}
+			if s, ok := cc["padding_scheme"].(string); ok && s != "" {
+				spec.AnyTLSPaddingScheme = s
+			}
 		}
 	}
+
+	if c.cfg.IsRealityConfigured() && spec.TLSMode != 2 {
+		spec.TLSMode = 2
+	}
+	if (spec.Protocol == "hysteria2" || spec.Protocol == "anytls") && spec.TLSMode == 0 {
+		spec.TLSMode = 1
+	}
+	applyConfigProtocolOverrides(c.cfg, spec)
 
 	// Local `listen_port` override in xoga.conf always takes final precedence when > 0
 	if c.cfg.ListenPort > 0 {
@@ -301,13 +356,35 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 				case "net", "network":
 					spec.Network = strings.ToLower(v)
 				case "tls", "security":
-					if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "tls") {
+					if v == "2" || strings.EqualFold(v, "reality") {
+						spec.TLSMode = 2
+					} else if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "tls") {
 						spec.TLSMode = 1
 					}
 				case "vless", "enable_vless":
 					if v == "1" || strings.EqualFold(v, "true") {
 						spec.Protocol = "vless"
 					}
+				case "flow":
+					spec.Flow = v
+				case "private_key", "pbk":
+					if k == "private_key" {
+						spec.RealityPrivateKey = v
+					}
+				case "short_id", "sid":
+					for _, sid := range strings.Split(v, ",") {
+						spec.RealityShortIDs = append(spec.RealityShortIDs, strings.TrimSpace(sid))
+					}
+				case "dest", "reality_dest":
+					spec.RealityDest = v
+				case "obfs":
+					spec.Hy2Obfs = strings.ToLower(v)
+				case "obfs_password", "obfs-password":
+					spec.Hy2ObfsPassword = v
+				case "up_mbps":
+					spec.Hy2UpMbps, _ = strconv.Atoi(v)
+				case "down_mbps":
+					spec.Hy2DownMbps, _ = strconv.Atoi(v)
 				case "server_key":
 					spec.ServerKey = v
 				}
@@ -322,6 +399,10 @@ type sspanelUsersResp struct {
 		ID             int    `json:"id"`
 		UUID           string `json:"uuid"`
 		Passwd         string `json:"passwd"`
+		Enable         *int   `json:"enable"`
+		U              int64  `json:"u"`
+		D              int64  `json:"d"`
+		TransferEnable int64  `json:"transfer_enable"`
 		NodeSpeedlimit any    `json:"node_speedlimit"`
 		NodeConnector  any    `json:"node_connector"`
 		V2rayUser      *struct {
@@ -387,15 +468,29 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	needUUID := c.cfg.NormalizedServerType() == "vless" || c.cfg.NormalizedServerType() == "vmess"
 	out := make([]stats.SyncUserSpec, 0, len(resp.Data))
 	for _, item := range resp.Data {
+		if item.Enable != nil && *item.Enable == 0 {
+			continue
+		}
+		var remain int64 = -1
+		if item.TransferEnable > 0 {
+			remain = item.TransferEnable - (item.U + item.D)
+			if remain <= 0 {
+				continue
+			}
+		}
 		uuid := item.UUID
 		if uuid == "" && item.V2rayUser != nil {
 			uuid = item.V2rayUser.UUID
 		}
 		cred := item.Passwd
+		altPass := ""
 		if needUUID && uuid != "" {
 			cred = uuid
+			altPass = item.Passwd
 		} else if cred == "" {
 			cred = uuid
+		} else if uuid != "" && uuid != cred {
+			altPass = uuid
 		}
 		if item.ID <= 0 || cred == "" {
 			continue
@@ -411,8 +506,10 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 		out = append(out, stats.SyncUserSpec{
 			ID:          item.ID,
 			UUIDOrPass:  cred,
+			AltPasswd:   altPass,
 			SpeedLimit:  int64(mbps * 125000.0),
 			DeviceLimit: dev,
+			RemainBytes: remain,
 		})
 	}
 	return out, nil

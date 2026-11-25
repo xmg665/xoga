@@ -38,16 +38,18 @@ func (s *Server) handleVLESS(conn net.Conn) {
 		return
 	}
 	user, ok := idx.ByUUID[uuid]
-	if !ok {
+	if !ok || user.IsDisabled() {
 		return
 	}
 
+	var flow string
 	addonLen := int(fixed[17])
 	if addonLen > 0 {
-		var discard [256]byte
-		if _, err := io.ReadFull(br, discard[:addonLen]); err != nil {
+		var addonBuf [256]byte
+		if _, err := io.ReadFull(br, addonBuf[:addonLen]); err != nil {
 			return
 		}
+		flow = decodeVLESSAddonFlow(addonBuf[:addonLen])
 	}
 
 	var cmdPort [3]byte
@@ -63,10 +65,14 @@ func (s *Server) handleVLESS(conn net.Conn) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	respConn := &vlessRespConn{Conn: conn}
-
 	switch cmd {
 	case 0x01: // TCP
+		if flow == FlowVision || flow == FlowVisionUDP443 {
+			visConn := newVisionConn(conn, br, uuid)
+			s.connectAndRelay(visConn, user, destHost, destPort, nil)
+			return
+		}
+		respConn := &vlessRespConn{Conn: conn}
 		var preread []byte
 		if n := br.Buffered(); n > 0 {
 			preread = make([]byte, n)
@@ -74,6 +80,11 @@ func (s *Server) handleVLESS(conn net.Conn) {
 		}
 		s.connectAndRelay(respConn, user, destHost, destPort, preread)
 	case 0x02: // VLESS UDP (2-byte big-endian length-framed packets)
+		if flow == FlowVision && destPort == 443 {
+			// Per XTLS-Vision spec, reject UDP:443 QUIC so client falls back to TCP TLS 1.3
+			return
+		}
+		respConn := &vlessRespConn{Conn: conn}
 		var r io.Reader = br
 		s.handleVLESSUDP(respConn, r, user, destHost, destPort)
 	}
@@ -151,10 +162,11 @@ func (v *vlessRespConn) Write(p []byte) (int, error) {
 
 func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.UserEntry, destHost string, destPort uint16) {
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
-	if err := user.AcquireConn(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter()); err != nil {
+	connID, err := user.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
+	if err != nil {
 		return
 	}
-	defer user.ReleaseConn()
+	defer user.ReleaseSession(connID)
 
 	route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, destHost, destPort, "", "")
 	if route.Action == acl.ActionBlock {

@@ -28,6 +28,13 @@ type TLSProvider struct {
 }
 
 func BuildTLSConfig(cfg *config.Config, serverName string) (*TLSProvider, error) {
+	return BuildTLSConfigWithALPN(cfg, serverName, []string{"h2", "http/1.1"})
+}
+
+func BuildTLSConfigWithALPN(cfg *config.Config, serverName string, nextProtos []string) (*TLSProvider, error) {
+	if len(nextProtos) == 0 {
+		nextProtos = []string{"h2", "http/1.1"}
+	}
 	domain := cfg.CertDomain
 	if domain == "" {
 		domain = serverName
@@ -46,7 +53,7 @@ func BuildTLSConfig(cfg *config.Config, serverName string) (*TLSProvider, error)
 			tlsConfig: &tls.Config{
 				MinVersion:     tls.VersionTLS12,
 				GetCertificate: reloader.GetCertificate,
-				NextProtos:     []string{"h2", "http/1.1"},
+				NextProtos:     nextProtos,
 			},
 		}, nil
 	}
@@ -75,6 +82,7 @@ func BuildTLSConfig(cfg *config.Config, serverName string) (*TLSProvider, error)
 		}()
 		tc := mgr.TLSConfig()
 		tc.MinVersion = tls.VersionTLS12
+		tc.NextProtos = append(tc.NextProtos, nextProtos...)
 		return &TLSProvider{
 			tlsConfig:  tc,
 			httpServer: httpSrv,
@@ -91,7 +99,7 @@ func BuildTLSConfig(cfg *config.Config, serverName string) (*TLSProvider, error)
 		tlsConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
+			NextProtos:   nextProtos,
 		},
 	}, nil
 }

@@ -74,10 +74,11 @@ func (s *Server) handleTrojan(conn net.Conn) {
 
 func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
-	if err := user.AcquireConn(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter()); err != nil {
+	connID, err := user.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
+	if err != nil {
 		return
 	}
-	defer user.ReleaseConn()
+	defer user.ReleaseSession(connID)
 
 	udpConn, err := net.ListenPacket("udp", "")
 	if err != nil {

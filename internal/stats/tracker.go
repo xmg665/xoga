@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -36,13 +37,15 @@ type TrafficDelta struct {
 // UserEntry holds hot per-user counters and auth keys.
 // Hot atomic fields are isolated from cold metadata to minimize CPU cache-line false sharing.
 type UserEntry struct {
-	// Immutable / rarely-updated identity & cached VMess cipher schedule
+	// Immutable / rarely-updated identity & cached protocol hashes
 	ID             int
 	UUID           string
 	Passwd         string
 	UUIDBytes      [16]byte
 	HasUUID        bool
 	TrojanHash     [56]byte // hex-encoded SHA-224 of password/UUID
+	SHA256UUID     [32]byte // raw SHA-256(UUID) for AnyTLS O(1) auth
+	SHA256Passwd   [32]byte // raw SHA-256(Passwd) for AnyTLS O(1) auth
 	VMessCmdKey    [16]byte
 	VMessAuthBlock cipher.Block
 	VMessAuthReady bool
@@ -54,6 +57,8 @@ type UserEntry struct {
 	downBytes atomic.Int64
 	winBytes  atomic.Int64 // bytes accumulated during current dynamic limit tick
 	activeTCP atomic.Int32
+	disabled  atomic.Bool  // set true immediately when account expires or exceeds traffic quota
+	quotaRem  atomic.Int64 // <0: panel-polled quota; >=0: real-time remaining bytes before instant kick
 
 	_ [64]byte
 
@@ -65,6 +70,11 @@ type UserEntry struct {
 	throttledUntil  atomic.Int64 // Unix seconds
 	dyWhitelisted   atomic.Bool
 	Limiter         *limiter.Bucket
+
+	// Active connections registry for instant millisecond-level disconnect on expiry / quota exhaustion
+	connsMu     sync.Mutex
+	nextConnID  atomic.Uint64
+	activeConns map[uint64]io.Closer
 
 	// Per-user active client IPs (lazily allocated only when user connects -> saves ~28 MiB across multi-node idle users)
 	ipMu       sync.RWMutex
@@ -79,6 +89,7 @@ func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit in
 		Passwd:  uuidOrPass,
 		Limiter: limiter.NewBucketBps(speedLimitBps),
 	}
+	u.quotaRem.Store(-1)
 	u.baseSpeedBps.Store(speedLimitBps)
 	u.deviceLimit.Store(int32(deviceLimit))
 	u.tcpLimit.Store(int32(tcpLimit))
@@ -100,6 +111,66 @@ func (u *UserEntry) RefreshKeys(uuidOrPass string) {
 	}
 	sum224 := sha256.Sum224([]byte(uuidOrPass))
 	hex.Encode(u.TrojanHash[:], sum224[:])
+	u.SHA256UUID = sha256.Sum256([]byte(u.UUID))
+	u.SHA256Passwd = sha256.Sum256([]byte(u.Passwd))
+}
+
+func (u *UserEntry) RefreshDualKeys(uuid, passwd string) {
+	if uuid == "" {
+		uuid = passwd
+	}
+	if passwd == "" {
+		passwd = uuid
+	}
+	if u.UUID == uuid && u.Passwd == passwd {
+		return
+	}
+	u.RefreshKeys(uuid)
+	if passwd != uuid {
+		u.Passwd = passwd
+		u.SHA256Passwd = sha256.Sum256([]byte(passwd))
+	}
+}
+
+func (u *UserEntry) SetRemainingQuota(remainBytes int64) {
+	if remainBytes < 0 {
+		u.quotaRem.Store(-1)
+		return
+	}
+	u.quotaRem.Store(remainBytes)
+	if remainBytes == 0 {
+		u.DisableAndKick()
+	}
+}
+
+func (u *UserEntry) IsDisabled() bool {
+	return u == nil || u.disabled.Load()
+}
+
+// DisableAndKick marks the user disabled and immediately closes all open TCP/UDP/QUIC/Mux connections
+// so expired or over-quota accounts cannot continue streaming on pre-existing long-lived sockets.
+func (u *UserEntry) DisableAndKick() int {
+	if u == nil {
+		return 0
+	}
+	u.disabled.Store(true)
+	u.connsMu.Lock()
+	conns := u.activeConns
+	u.activeConns = nil
+	u.connsMu.Unlock()
+
+	for _, c := range conns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+	return len(conns)
+}
+
+func (u *UserEntry) Reenable() {
+	if u != nil {
+		u.disabled.Store(false)
+	}
 }
 
 func (u *UserEntry) UpdateLimits(speedLimitBps int64, deviceLimit int, tcpLimit int, dyWhite bool) {
@@ -116,6 +187,11 @@ func (u *UserEntry) AddUpload(n int64) {
 	if n > 0 {
 		u.upBytes.Add(n)
 		u.winBytes.Add(n)
+		if u.quotaRem.Load() >= 0 {
+			if u.quotaRem.Add(-n) <= 0 {
+				u.DisableAndKick()
+			}
+		}
 	}
 }
 
@@ -123,6 +199,11 @@ func (u *UserEntry) AddDownload(n int64) {
 	if n > 0 {
 		u.downBytes.Add(n)
 		u.winBytes.Add(n)
+		if u.quotaRem.Load() >= 0 {
+			if u.quotaRem.Add(-n) <= 0 {
+				u.DisableAndKick()
+			}
+		}
 	}
 }
 
@@ -133,14 +214,28 @@ func (u *UserEntry) EffectiveLimiter() *limiter.Bucket {
 	return u.Limiter
 }
 
-// AcquireConn checks TCP stream limits and online IP device limits before accepting a session.
+// AcquireConn checks disabled state, TCP stream limits, and online IP device limits.
 func (u *UserEntry) AcquireConn(clientIP netip.Addr, ipTTLSec int64, redisLim *redisIPLimiter) error {
+	_, err := u.AcquireSession(clientIP, ipTTLSec, redisLim, nil)
+	return err
+}
+
+// AcquireSession validates user status/limits and registers `closer` so `DisableAndKick()`
+// immediately severs active streams the instant the account expires or exceeds traffic quota.
+func (u *UserEntry) AcquireSession(clientIP netip.Addr, ipTTLSec int64, redisLim *redisIPLimiter, closer io.Closer) (uint64, error) {
+	if u == nil || u.disabled.Load() {
+		return 0, ErrUserDisabled
+	}
+	if rem := u.quotaRem.Load(); rem == 0 {
+		return 0, ErrUserDisabled
+	}
+
 	maxTCP := u.tcpLimit.Load()
 	if maxTCP > 0 {
 		cur := u.activeTCP.Add(1)
 		if cur > maxTCP {
 			u.activeTCP.Add(-1)
-			return ErrTCPLimit
+			return 0, ErrTCPLimit
 		}
 	} else {
 		u.activeTCP.Add(1)
@@ -148,12 +243,41 @@ func (u *UserEntry) AcquireConn(clientIP netip.Addr, ipTTLSec int64, redisLim *r
 
 	if err := u.checkAndTouchIP(clientIP, ipTTLSec, redisLim); err != nil {
 		u.activeTCP.Add(-1)
-		return err
+		return 0, err
 	}
-	return nil
+
+	if closer == nil {
+		return 0, nil
+	}
+
+	cid := u.nextConnID.Add(1)
+	u.connsMu.Lock()
+	if u.disabled.Load() {
+		u.connsMu.Unlock()
+		u.activeTCP.Add(-1)
+		_ = closer.Close()
+		return 0, ErrUserDisabled
+	}
+	if u.activeConns == nil {
+		u.activeConns = make(map[uint64]io.Closer, 4)
+	}
+	u.activeConns[cid] = closer
+	u.connsMu.Unlock()
+	return cid, nil
 }
 
 func (u *UserEntry) ReleaseConn() {
+	u.activeTCP.Add(-1)
+}
+
+func (u *UserEntry) ReleaseSession(connID uint64) {
+	if connID > 0 {
+		u.connsMu.Lock()
+		if u.activeConns != nil {
+			delete(u.activeConns, connID)
+		}
+		u.connsMu.Unlock()
+	}
 	u.activeTCP.Add(-1)
 }
 
@@ -266,8 +390,10 @@ type Tracker struct {
 	NodeLimiter *limiter.Bucket
 	redisLim    *redisIPLimiter
 
-	mu    sync.RWMutex
-	users map[int]*UserEntry
+	mu             sync.RWMutex
+	users          map[int]*UserEntry
+	retiredMu      sync.Mutex
+	retiredTraffic []TrafficDelta // final unpushed traffic harvested from expired/kicked users
 }
 
 func NewTracker(cfg *config.Config) *Tracker {
@@ -299,14 +425,19 @@ func (t *Tracker) IPTTLSeconds() int64 {
 
 // SyncUserSpec describes a user pulled from the panel.
 type SyncUserSpec struct {
-	ID          int
-	UUIDOrPass  string
-	SpeedLimit  int64 // bytes/sec from panel (0 = unlimited)
-	DeviceLimit int   // max IPs from panel (0 = unlimited)
+	ID             int
+	UUIDOrPass     string
+	AltPasswd      string // optional secondary credential (e.g. SSPanel passwd alongside uuid)
+	SpeedLimit     int64  // bytes/sec from panel (0 = unlimited)
+	DeviceLimit    int    // max IPs from panel (0 = unlimited)
+	RemainBytes    int64  // <=0: unlimited / panel-polled; >0: real-time byte-exact remaining cap
+	QuotaExhausted bool   // true when panel reports u + d >= transfer_enable
 }
 
 // ReconcileUsers performs an incremental O(N) diff: existing users preserve their UserEntry
 // pointer, active connections, rate limiters, and unpushed atomic traffic counters.
+// Users removed by the panel (expired, banned, or over traffic quota) have their final unpushed
+// bytes captured and ALL active TCP/UDP/QUIC/Mux connections immediately force-closed (`DisableAndKick`).
 func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, added, updated, removed int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -317,6 +448,9 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 	staticSpeedBps := int64(t.cfg.UserSpeedLimit * 125000.0)
 
 	for _, sp := range specs {
+		if sp.QuotaExhausted {
+			continue
+		}
 		seen[sp.ID] = struct{}{}
 		effSpeed := sp.SpeedLimit
 		if staticSpeedBps > 0 && (effSpeed <= 0 || staticSpeedBps < effSpeed) {
@@ -329,35 +463,76 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 		_, dyWhite := t.cfg.DyLimitWhiteUserIDs[sp.ID]
 
 		if existing, ok := t.users[sp.ID]; ok {
-			if existing.UUID != sp.UUIDOrPass {
+			existing.Reenable()
+			prevUUID, prevPass := existing.UUID, existing.Passwd
+			if sp.AltPasswd != "" {
+				existing.RefreshDualKeys(sp.UUIDOrPass, sp.AltPasswd)
+			} else if existing.UUID != sp.UUIDOrPass {
 				existing.RefreshKeys(sp.UUIDOrPass)
+			}
+			if existing.UUID != prevUUID || existing.Passwd != prevPass {
 				updated++
 			}
 			existing.UpdateLimits(effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
+			if sp.RemainBytes > 0 {
+				existing.SetRemainingQuota(sp.RemainBytes)
+			} else {
+				existing.SetRemainingQuota(-1)
+			}
 			entries = append(entries, existing)
 		} else {
 			u := NewUserEntry(sp.ID, sp.UUIDOrPass, effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
+			if sp.AltPasswd != "" {
+				u.RefreshDualKeys(sp.UUIDOrPass, sp.AltPasswd)
+			}
+			if sp.RemainBytes > 0 {
+				u.SetRemainingQuota(sp.RemainBytes)
+			}
 			t.users[sp.ID] = u
 			entries = append(entries, u)
 			added++
 		}
 	}
 
-	for id := range t.users {
+	var retired []TrafficDelta
+	for id, u := range t.users {
 		if _, ok := seen[id]; !ok {
+			// Immediately sever all open sockets belonging to this expired / over-quota user!
+			u.DisableAndKick()
+			up := u.upBytes.Swap(0)
+			down := u.downBytes.Swap(0)
+			if up+down > 0 {
+				retired = append(retired, TrafficDelta{
+					UserID:   id,
+					Upload:   up,
+					Download: down,
+				})
+			}
 			delete(t.users, id)
 			removed++
 		}
 	}
+	if len(retired) > 0 {
+		t.retiredMu.Lock()
+		t.retiredTraffic = append(t.retiredTraffic, retired...)
+		t.retiredMu.Unlock()
+	}
 	return entries, added, updated, removed
 }
 
-// HarvestTraffic atomically swaps out non-zero upload/download byte counters.
+// HarvestTraffic atomically swaps out non-zero upload/download byte counters (including kicked users' final bytes).
 func (t *Tracker) HarvestTraffic(minBytes int64) []TrafficDelta {
+	var batch []TrafficDelta
+	t.retiredMu.Lock()
+	if len(t.retiredTraffic) > 0 {
+		batch = append(batch, t.retiredTraffic...)
+		t.retiredTraffic = nil
+	}
+	t.retiredMu.Unlock()
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	var batch []TrafficDelta
 	for id, u := range t.users {
 		up := u.upBytes.Swap(0)
 		down := u.downBytes.Swap(0)
@@ -382,12 +557,21 @@ func (t *Tracker) HarvestTraffic(minBytes int64) []TrafficDelta {
 // RollbackTraffic restores harvested bytes if pushing to the panel fails.
 func (t *Tracker) RollbackTraffic(batch []TrafficDelta) {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
+	var unmatched []TrafficDelta
 	for _, item := range batch {
 		if u, ok := t.users[item.UserID]; ok {
 			u.upBytes.Add(item.Upload)
 			u.downBytes.Add(item.Download)
+		} else {
+			unmatched = append(unmatched, item)
 		}
+	}
+	t.mu.RUnlock()
+
+	if len(unmatched) > 0 {
+		t.retiredMu.Lock()
+		t.retiredTraffic = append(t.retiredTraffic, unmatched...)
+		t.retiredMu.Unlock()
 	}
 }
 

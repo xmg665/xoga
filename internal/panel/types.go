@@ -19,21 +19,37 @@ var ErrNotModified = errors.New("panel resource not modified (304)")
 
 // NodeSpec represents normalized inbound server parameters pulled from the panel.
 type NodeSpec struct {
-	Protocol       string // vless, vmess, trojan, shadowsocks
+	Protocol       string // vless, vmess, trojan, shadowsocks, hysteria2, anytls
 	ListenIP       string
 	ServerPort     int
-	Network        string // tcp, ws
+	Network        string // tcp, ws, quic
 	WSPath         string
 	WSHost         string
 	Cipher         string // aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, 2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm
 	ServerKey      string // Shadowsocks-2022 base64 PSK
-	TLSMode        int    // 0: none, 1: tls, 2: reality (fallback to tls)
+	TLSMode        int    // 0: none, 1: tls, 2: reality
 	ServerName     string
-	Flow           string
+	Flow           string // e.g. xtls-rprx-vision
 	PullInterval   int
 	PushInterval   int
 	Routes         []acl.DynamicRoute
 	ConfigChecksum string
+
+	// REALITY parameters (`tls == 2` or `security=reality`)
+	RealityDest        string
+	RealityPrivateKey  string
+	RealityShortIDs    []string
+	RealityServerNames []string
+
+	// Hysteria 2 parameters (`hysteria` / `hysteria2` / `hy2`)
+	Hy2UpMbps         int
+	Hy2DownMbps       int
+	Hy2Obfs           string
+	Hy2ObfsPassword   string
+	Hy2IgnoreClientBW bool
+
+	// AnyTLS parameters (`anytls`)
+	AnyTLSPaddingScheme string
 }
 
 // SystemStatus holds lightweight host resource metrics reported to the panel.

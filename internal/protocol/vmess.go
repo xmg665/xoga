@@ -397,10 +397,11 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 
 func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, destHost string, destPort uint16) {
 	clientIP := relay.ExtractClientIP(vmConn.RemoteAddr())
-	if err := user.AcquireConn(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter()); err != nil {
+	connID, err := user.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), vmConn)
+	if err != nil {
 		return
 	}
-	defer user.ReleaseConn()
+	defer user.ReleaseSession(connID)
 
 	route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, destHost, destPort, "", "")
 	if route.Action == acl.ActionBlock {

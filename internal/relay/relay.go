@@ -81,6 +81,9 @@ func copyOneWay(
 	if enableZeroCopy && srcIsTCP && userLim == nil && nodeLim.IsUnlimited() {
 		if dstTCP, ok1 := unwrapTCP(dst); ok1 {
 			for {
+				if user != nil && user.IsDisabled() {
+					return
+				}
 				now := time.Now()
 				_ = srcTCP.SetReadDeadline(now.Add(idleTimeout))
 				_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout))
@@ -116,6 +119,9 @@ func copyOneWay(
 	defer bufpool.Put(bp)
 
 	for {
+		if user != nil && user.IsDisabled() {
+			return
+		}
 		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
