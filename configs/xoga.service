@@ -1,0 +1,22 @@
+[Unit]
+Description=xoga Lightweight Proxy Backend Service
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+LimitAS=infinity
+LimitRSS=infinity
+LimitCORE=infinity
+LimitNOFILE=1048576
+WorkingDirectory=/usr/local/xoga/
+ExecStart=/usr/local/xoga/xoga run -c /etc/xoga/xoga.conf
+Restart=on-failure
+RestartSec=3
+StartLimitInterval=100s
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

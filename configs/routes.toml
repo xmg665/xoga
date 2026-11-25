@@ -1,0 +1,6 @@
+# 出站路由配置，默认本机直连出站，无需配置
+# 示例:
+# [[routes]]
+# match = ["openai.com", "chatgpt.com"]
+# action = "proxy"
+# outbound = "socks5://127.0.0.1:1080"

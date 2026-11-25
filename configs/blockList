@@ -1,0 +1,4 @@
+# 审计黑名单规则 (支持域名后缀、full:完整域名、keyword:关键词、regexp:正则、IP/CIDR)
+# 示例:
+# keyword:torrent
+# 127.0.0.0/8
