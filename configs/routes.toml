@@ -1,6 +1,49 @@
-# 出站路由配置，默认本机直连出站，无需配置
-# 示例:
+# 出站路由与解锁分流配置 (支持保存后 5 秒内自动热重载，100% 兼容原版 soga routes.toml 语法)
+enable=true
+
+# ==================== 示例一：AI 平台走本机 WARP (wireproxy / warp-svc 127.0.0.1:40000) ====================
 # [[routes]]
-# match = ["openai.com", "chatgpt.com"]
-# action = "proxy"
-# outbound = "socks5://127.0.0.1:1080"
+# name = "ai-warp"
+# rules = [
+#   "geosite:openai",
+#   "geosite:claude",
+#   "geosite:gemini",
+#   "geosite:perplexity",
+#   "geosite:grok",
+#   "geosite:metaai"
+# ]
+# [[routes.Outs]]
+# type = "socks"
+# server = "127.0.0.1"
+# port = 40000
+
+# ==================== 示例二：流媒体走远端解锁落地机 (支持 socks5 / http / ss / trojan / vless 多节点轮询容灾) ====================
+# [[routes]]
+# name = "streaming-landing"
+# balance = "round_robin" # 可选: round_robin (轮询), random (随机), first (主备容灾)
+# rules = [
+#   "geosite:netflix",
+#   "geosite:disney",
+#   "geosite:tiktok",
+#   "geosite:bahamut"
+# ]
+# [[routes.Outs]]
+# type = "ss"
+# server = "unlock-hk.example.com"
+# port = 18388
+# cipher = "aes-256-gcm"
+# password = "your_ss_password"
+
+# ==================== 示例三：双栈机器指定干净 IPv6 出口直连解锁 ====================
+# [[routes]]
+# name = "ipv6-unlock"
+# rules = ["geosite:youtube", "geosite:google"]
+# [[routes.Outs]]
+# type = "direct"
+# listen_strategy = "ipv6_only"
+
+# ==================== 默认兜底直连 ====================
+[[routes]]
+rules = ["*"]
+[[routes.Outs]]
+type = "direct"

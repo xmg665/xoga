@@ -2,11 +2,11 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
-	"strconv"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -149,7 +149,9 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		if route.Action == acl.ActionBlock {
 			continue
 		}
-		dstAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dstAddr, err := relay.ResolveUDPTarget(rctx, host, port, s.dnsRes)
+		rcancel()
 		if err != nil {
 			logger.Debugf("trojan udp resolve %s failed: %v", host, err)
 			continue

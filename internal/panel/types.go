@@ -95,6 +95,6 @@ func newKeepAliveHTTPClient() *http.Client {
 	}
 	return &http.Client{
 		Transport: tr,
-		Timeout:   25 * time.Second,
+		Timeout:   45 * time.Second,
 	}
 }

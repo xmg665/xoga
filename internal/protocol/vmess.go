@@ -69,13 +69,7 @@ func (s *Server) handleVMess(conn net.Conn) {
 	var plainAuth [16]byte
 	for i := range idx.VMessUsers {
 		cand := &idx.VMessUsers[i]
-		// Derive AuthID AES-128 key via KDF16(cmdKey, "AES Auth ID Encryption")
-		authKey := vmessKDF(cand.CmdKey[:], "AES Auth ID Encryption")[:16]
-		blk, err := aes.NewCipher(authKey)
-		if err != nil {
-			continue
-		}
-		blk.Decrypt(plainAuth[:], authID[:])
+		cand.AuthBlock.Decrypt(plainAuth[:], authID[:])
 		crc := crc32.ChecksumIEEE(plainAuth[:12])
 		if crc != binary.BigEndian.Uint32(plainAuth[12:16]) {
 			continue

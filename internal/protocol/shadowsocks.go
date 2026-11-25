@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,7 +13,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +22,7 @@ import (
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
+	"github.com/xmg665/xoga/internal/relay"
 	"github.com/xmg665/xoga/internal/stats"
 )
 
@@ -533,7 +534,9 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		if route.Action == acl.ActionBlock {
 			continue
 		}
-		dstUDP, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dstUDP, err := relay.ResolveUDPTarget(rctx, host, port, s.dnsRes)
+		rcancel()
 		if err != nil {
 			continue
 		}

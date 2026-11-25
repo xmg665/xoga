@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/config"
 	"github.com/xmg665/xoga/internal/stats"
 )
@@ -148,9 +149,41 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 		}
 	}
 
+	// Optionally pull SSPanel-UIM dynamic audit rules (`/mod_mu/func/detect_rules`)
+	if rules := c.fetchDetectRules(ctx); len(rules) > 0 {
+		spec.Routes = append(spec.Routes, acl.DynamicRoute{
+			Matches: rules,
+			Action:  "block",
+		})
+	}
+
 	sum := sha256.Sum256(body)
 	spec.ConfigChecksum = hex.EncodeToString(sum[:16])
 	return spec, nil
+}
+
+func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
+	body, _, _, err := c.doGet(ctx, c.modURL("/mod_mu/func/detect_rules", true), "")
+	if err != nil {
+		return nil
+	}
+	var resp struct {
+		Ret  int `json:"ret"`
+		Data []struct {
+			Regex string `json:"regex"`
+			Type  int    `json:"type"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &resp) != nil || resp.Ret != 1 {
+		return nil
+	}
+	var out []string
+	for _, r := range resp.Data {
+		if r.Regex != "" {
+			out = append(out, "regexp:"+r.Regex)
+		}
+	}
+	return out
 }
 
 func parseMetronServerString(srv string, spec *NodeSpec) {

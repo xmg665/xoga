@@ -10,6 +10,7 @@ import (
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/config"
+	"github.com/xmg665/xoga/internal/dns"
 	"github.com/xmg665/xoga/internal/logger"
 	"github.com/xmg665/xoga/internal/panel"
 	"github.com/xmg665/xoga/internal/protocol"
@@ -23,6 +24,7 @@ type Agent struct {
 	cfg     *config.Config
 	client  panel.Client
 	tracker *stats.Tracker
+	dnsRes  *dns.Resolver
 
 	curSpec   *panel.NodeSpec
 	curServer *protocol.Server
@@ -41,6 +43,7 @@ func NewAgent(cfg *config.Config) (*Agent, error) {
 		cfg:     cfg,
 		client:  cli,
 		tracker: stats.NewTracker(cfg),
+		dnsRes:  dns.NewResolver(cfg.DNSConfigPath, cfg.DNSConfigURL, cfg.DefaultDNS, cfg.DNSStrategy),
 	}, nil
 }
 
@@ -136,6 +139,7 @@ func (a *Agent) syncFromPanel(ctx context.Context, first bool) error {
 		} else if a.curSpec.ConfigChecksum != newSpec.ConfigChecksum && a.curServer != nil {
 			// Only routes or intervals changed -> hot-swap ACL without dropping connections!
 			newACL := acl.NewEngine(a.cfg.ForbiddenBitTorrent, a.cfg.WhiteListPath, a.cfg.BlockListPath, a.cfg.RoutesPath, newSpec.Routes)
+			newACL.SetPortAndPrivatePolicy(a.cfg.ForbiddenPorts, a.cfg.BanPrivateIP)
 			a.curServer.UpdateACL(newACL)
 			logger.Infof("Hot-reloaded ACL & panel routes (%d rules)", len(newSpec.Routes))
 		}
@@ -177,7 +181,8 @@ func (a *Agent) syncFromPanel(ctx context.Context, first bool) error {
 	if configChanged || a.curServer == nil {
 		idx := protocol.BuildUserIndex(a.curUsers, ssKeySize)
 		aclEng := acl.NewEngine(a.cfg.ForbiddenBitTorrent, a.cfg.WhiteListPath, a.cfg.BlockListPath, a.cfg.RoutesPath, a.curSpec.Routes)
-		srv, err := protocol.NewServer(a.cfg, a.curSpec, a.tracker, idx, aclEng)
+		aclEng.SetPortAndPrivatePolicy(a.cfg.ForbiddenPorts, a.cfg.BanPrivateIP)
+		srv, err := protocol.NewServer(a.cfg, a.curSpec, a.tracker, idx, aclEng, a.dnsRes)
 		if err != nil {
 			return err
 		}

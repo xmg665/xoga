@@ -1,18 +1,12 @@
 package relay
 
 import (
-	"bufio"
-	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"net/netip"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
 	"github.com/xmg665/xoga/internal/limiter"
 	"github.com/xmg665/xoga/internal/stats"
@@ -185,178 +179,6 @@ func closeWrite(c net.Conn) {
 		return
 	}
 	_ = c.SetReadDeadline(time.Now())
-}
-
-// DialOutbound connects directly or via an outbound SOCKS5/HTTP proxy specified by ACL routing.
-func DialOutbound(network, targetAddr string, route acl.OutboundTarget, timeout time.Duration) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   timeout,
-		KeepAlive: 45 * time.Second,
-	}
-	if route.Action == acl.ActionBlock {
-		return nil, errors.New("blocked by ACL/audit rule")
-	}
-	if route.Action != acl.ActionProxy || route.Address == "" || network != "tcp" {
-		return dialer.Dial(network, targetAddr)
-	}
-
-	u, err := url.Parse(route.Address)
-	if err != nil {
-		return nil, err
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "socks5", "socks5h":
-		return dialSOCKS5(dialer, u, targetAddr, timeout)
-	case "http":
-		return dialHTTPConnect(dialer, u, targetAddr, timeout)
-	default:
-		return dialer.Dial(network, targetAddr)
-	}
-}
-
-func dialSOCKS5(d *net.Dialer, proxyURL *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	c, err := d.Dial("tcp", proxyURL.Host)
-	if err != nil {
-		return nil, err
-	}
-	_ = c.SetDeadline(time.Now().Add(timeout))
-
-	var user, pass string
-	if proxyURL.User != nil {
-		user = proxyURL.User.Username()
-		pass, _ = proxyURL.User.Password()
-	}
-	if user != "" {
-		_, err = c.Write([]byte{0x05, 0x02, 0x00, 0x02})
-	} else {
-		_, err = c.Write([]byte{0x05, 0x01, 0x00})
-	}
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-	var resp [2]byte
-	if _, err := io.ReadFull(c, resp[:]); err != nil || resp[0] != 0x05 {
-		c.Close()
-		return nil, errors.New("socks5 greeting failed")
-	}
-	if resp[1] == 0x02 {
-		auth := make([]byte, 0, 3+len(user)+len(pass))
-		auth = append(auth, 0x01, byte(len(user)))
-		auth = append(auth, user...)
-		auth = append(auth, byte(len(pass)))
-		auth = append(auth, pass...)
-		if _, err := c.Write(auth); err != nil {
-			c.Close()
-			return nil, err
-		}
-		if _, err := io.ReadFull(c, resp[:]); err != nil || resp[1] != 0x00 {
-			c.Close()
-			return nil, errors.New("socks5 auth rejected")
-		}
-	} else if resp[1] != 0x00 {
-		c.Close()
-		return nil, errors.New("socks5 unsupported auth")
-	}
-
-	host, portStr, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-	portNum, err := net.LookupPort("tcp", portStr)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-
-	req := make([]byte, 0, 7+len(host))
-	req = append(req, 0x05, 0x01, 0x00)
-	if ip, err := netip.ParseAddr(host); err == nil {
-		ip = ip.Unmap()
-		if ip.Is4() {
-			req = append(req, 0x01)
-			a4 := ip.As4()
-			req = append(req, a4[:]...)
-		} else {
-			req = append(req, 0x04)
-			a16 := ip.As16()
-			req = append(req, a16[:]...)
-		}
-	} else {
-		req = append(req, 0x03, byte(len(host)))
-		req = append(req, host...)
-	}
-	var pb [2]byte
-	binary.BigEndian.PutUint16(pb[:], uint16(portNum))
-	req = append(req, pb[:]...)
-	if _, err := c.Write(req); err != nil {
-		c.Close()
-		return nil, err
-	}
-
-	var rhead [4]byte
-	if _, err := io.ReadFull(c, rhead[:]); err != nil || rhead[1] != 0x00 {
-		c.Close()
-		return nil, errors.New("socks5 connect failed")
-	}
-	var skip int
-	switch rhead[3] {
-	case 0x01:
-		skip = 4 + 2
-	case 0x04:
-		skip = 16 + 2
-	case 0x03:
-		var l [1]byte
-		if _, err := io.ReadFull(c, l[:]); err != nil {
-			c.Close()
-			return nil, err
-		}
-		skip = int(l[0]) + 2
-	}
-	if skip > 0 {
-		var discard [260]byte
-		if _, err := io.ReadFull(c, discard[:skip]); err != nil {
-			c.Close()
-			return nil, err
-		}
-	}
-	_ = c.SetDeadline(time.Time{})
-	return c, nil
-}
-
-func dialHTTPConnect(d *net.Dialer, proxyURL *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	c, err := d.Dial("tcp", proxyURL.Host)
-	if err != nil {
-		return nil, err
-	}
-	_ = c.SetDeadline(time.Now().Add(timeout))
-	req := "CONNECT " + targetAddr + " HTTP/1.1\r\nHost: " + targetAddr + "\r\n\r\n"
-	if _, err := c.Write([]byte(req)); err != nil {
-		c.Close()
-		return nil, err
-	}
-	br := bufio.NewReader(c)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(status, " 200") {
-		c.Close()
-		return nil, errors.New("http connect proxy failed")
-	}
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			c.Close()
-			return nil, err
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	_ = c.SetDeadline(time.Time{})
-	if br.Buffered() > 0 {
-		return &PrependConn{Conn: c, Reader: br}, nil
-	}
-	return c, nil
 }
 
 // PrependConn wraps a net.Conn when bytes have already been buffered/peeked during handshake or sniffing.

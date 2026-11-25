@@ -2,11 +2,11 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -150,7 +150,13 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		return
 	}
 
-	targetUDP, err := net.Dial("udp", net.JoinHostPort(destHost, strconv.Itoa(int(destPort))))
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	udpAddr, err := relay.ResolveUDPTarget(rctx, destHost, destPort, s.dnsRes)
+	rcancel()
+	if err != nil {
+		return
+	}
+	targetUDP, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		return
 	}

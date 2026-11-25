@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
 	"github.com/xmg665/xoga/internal/config"
+	"github.com/xmg665/xoga/internal/dns"
 	"github.com/xmg665/xoga/internal/logger"
 	"github.com/xmg665/xoga/internal/panel"
 	"github.com/xmg665/xoga/internal/relay"
@@ -36,11 +39,12 @@ type SSUserEntry struct {
 	EIHHash   [16]byte // BLAKE3("shadowsocks 2022 identity subkey", userKey)[:16] for SS2022 EIH
 }
 
-// VMessUserEntry precomputes VMess cmdKey (`MD5(UUID + magic)`) once on user sync.
+// VMessUserEntry precomputes VMess cmdKey (`MD5(UUID + magic)`) and AuthID AES-128 block cipher
+// once on user sync so 5,000+ user VMess nodes perform zero KDF or heap allocations per handshake.
 type VMessUserEntry struct {
-	User   *stats.UserEntry
-	CmdKey [16]byte
-	Block  cipher.Block // AES-128 block cipher for AuthID verification
+	User      *stats.UserEntry
+	CmdKey    [16]byte
+	AuthBlock cipher.Block // AES-128 block cipher for `KDF16(cmdKey, "AES Auth ID Encryption")`
 }
 
 // UserIndex is an immutable snapshot swapped atomically via atomic.Pointer[UserIndex] (RCU pattern).
@@ -71,11 +75,12 @@ func BuildUserIndex(users []*stats.UserEntry, ssKeyLen int) *UserIndex {
 		if u.HasUUID {
 			idx.ByUUID[u.UUIDBytes] = u
 			cmdKey := vmessCmdKey(u.UUIDBytes)
-			if blk, err := aes.NewCipher(cmdKey[:]); err == nil {
+			authKey := vmessKDF(cmdKey[:], "AES Auth ID Encryption")[:16]
+			if blk, err := aes.NewCipher(authKey); err == nil {
 				idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
-					User:   u,
-					CmdKey: cmdKey,
-					Block:  blk,
+					User:      u,
+					CmdKey:    cmdKey,
+					AuthBlock: blk,
 				})
 			}
 		}
@@ -126,6 +131,7 @@ type Server struct {
 	cfg      *config.Config
 	spec     *panel.NodeSpec
 	tracker  *stats.Tracker
+	dnsRes   *dns.Resolver
 	ssSpec   ssCipherSpec
 	ssPSK    []byte
 	ssPSKBlk cipher.Block
@@ -141,11 +147,18 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker, initialIdx *UserIndex, initialACL *acl.Engine) (*Server, error) {
+func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker, initialIdx *UserIndex, initialACL *acl.Engine, dnsResolver ...*dns.Resolver) (*Server, error) {
+	var res *dns.Resolver
+	if len(dnsResolver) > 0 && dnsResolver[0] != nil {
+		res = dnsResolver[0]
+	} else {
+		res = dns.NewResolver(cfg.DNSConfigPath, cfg.DNSConfigURL, cfg.DefaultDNS, cfg.DNSStrategy)
+	}
 	s := &Server{
 		cfg:     cfg,
 		spec:    spec,
 		tracker: tracker,
+		dnsRes:  res,
 	}
 	s.userIdx.Store(initialIdx)
 	s.aclEng.Store(initialACL)
@@ -343,16 +356,29 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 	}
 
 	sn := sniff.Inspect(peeked)
-	route := s.aclEng.Load().Decide(destHost, sn.Domain, sn.Protocol)
+	aclEng := s.aclEng.Load()
+	route := aclEng.DecideWithPort(destHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
-		logger.Debugf("blocked user=%d dest=%s:%d sni=%s proto=%s", user.ID, destHost, destPort, sn.Domain, sn.Protocol)
+		logger.Debugf("blocked user=%d dest=%s:%d sni=%s proto=%s rule=%s", user.ID, destHost, destPort, sn.Domain, sn.Protocol, route.RuleName)
 		return
 	}
 
-	targetAddr := net.JoinHostPort(destHost, strconv.Itoa(int(destPort)))
-	remoteConn, err := relay.DialOutbound("tcp", targetAddr, route, 10*time.Second)
+	// Domain Sniff Override: if client sent a pre-resolved IP, rewrite destination to the
+	// sniffed TLS SNI / HTTP Host when matching a DNS unlock rule, route unlock rule, or force_domain_sniff.
+	effectiveHost := destHost
+	if sn.Domain != "" && s.cfg.DomainSniff {
+		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
+			if s.cfg.ForceDomainSniff || route.Action == acl.ActionProxy || s.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
+				effectiveHost = sn.Domain
+			}
+		}
+	}
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	remoteConn, err := relay.DialOutbound(dialCtx, effectiveHost, destPort, route, s.dnsRes, 10*time.Second)
+	cancel()
 	if err != nil {
-		logger.Debugf("dial %s failed: %v", targetAddr, err)
+		logger.Debugf("dial %s:%d (rule=%s) failed: %v", effectiveHost, destPort, route.RuleName, err)
 		return
 	}
 	defer remoteConn.Close()

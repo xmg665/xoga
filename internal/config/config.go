@@ -69,10 +69,20 @@ type Config struct {
 	UserSpeedLimit      float64 // Mbps static per-user cap (0 = follow panel speed_limit)
 	UserTCPLimit        int     // max concurrent TCP streams per user (0 = unlimited)
 	NodeSpeedLimit      float64 // Mbps total node cap (0 = unlimited)
-	CheckInterval       int     // seconds between panel config/user pulls
-	SubmitInterval      int     // seconds between traffic/alive pushes
+	CheckInterval       int      // seconds between panel config/user pulls
+	SubmitInterval      int      // seconds between traffic/alive pushes
 	ForbiddenBitTorrent bool
+	ForbiddenPorts      string   // e.g. "25,26,6881-6999" (soga forbidden_ports)
+	BanPrivateIP        bool     // block RFC1918/loopback targets when true
+	VLESS               bool     // soga `vless=true` when `server_type=v2ray`
+	VLESSFlow           string   // soga `vless_flow=`
+	V2rayReduceMemory   bool     // soga `v2ray_reduce_memory=true`
 	DefaultDNS          []string
+	DNSStrategy         string // ipv4_first, ipv6_first, ipv4_only, ipv6_only
+	DNSCacheTime        int    // minutes (soga `dns_cache_time=10`)
+	DNSConfigURL        string // optional remote URL to fetch dns.yml
+	DomainSniff         bool   // rewrite target IP with sniffed SNI/Host when matching DNS/route unlock rules
+	ForceDomainSniff    bool   // always rewrite target IP with sniffed SNI/Host
 	LogLevel            string
 
 	// Rule file paths
@@ -107,6 +117,8 @@ func Default() *Config {
 		CheckInterval:       60,
 		SubmitInterval:      60,
 		ForbiddenBitTorrent: true,
+		DNSStrategy:         "ipv4_first",
+		DomainSniff:         true,
 		LogLevel:            "info",
 		EnableZeroCopy:      true,
 		MemLimitMB:          128,
@@ -202,17 +214,17 @@ func (c *Config) ApplyKV(key, val string) {
 		c.ListenIP = val
 	case "listen_port":
 		c.ListenPort, _ = strconv.Atoi(val)
-	case "redis_ip_limit_enable":
+	case "redis_ip_limit_enable", "redis_enable":
 		c.RedisIPLimitEnable = parseBool(val, false)
-	case "redis_ip_limit_addr":
+	case "redis_ip_limit_addr", "redis_addr":
 		c.RedisIPLimitAddr = val
-	case "redis_ip_limit_password":
+	case "redis_ip_limit_password", "redis_password":
 		c.RedisIPLimitPassword = val
-	case "redis_ip_limit_db":
+	case "redis_ip_limit_db", "redis_db":
 		c.RedisIPLimitDB, _ = strconv.Atoi(val)
-	case "redis_ip_limit_tls":
+	case "redis_ip_limit_tls", "redis_tls":
 		c.RedisIPLimitTLS = parseBool(val, false)
-	case "redis_ip_limit_expiry":
+	case "redis_ip_limit_expiry", "conn_limit_expiry":
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			c.RedisIPLimitExpiry = n
 		}
@@ -261,6 +273,23 @@ func (c *Config) ApplyKV(key, val string) {
 		}
 	case "forbidden_bit_torrent":
 		c.ForbiddenBitTorrent = parseBool(val, true)
+	case "forbidden_ports":
+		c.ForbiddenPorts = strings.TrimSpace(val)
+	case "ban_private_ip":
+		c.BanPrivateIP = parseBool(val, false)
+	case "vless":
+		c.VLESS = parseBool(val, false)
+	case "vless_flow":
+		c.VLESSFlow = strings.TrimSpace(val)
+	case "v2ray_reduce_memory":
+		c.V2rayReduceMemory = parseBool(val, false)
+		if c.V2rayReduceMemory && c.GCPercent == 50 {
+			c.GCPercent = 35
+		}
+	case "dns_cache_time":
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			c.DNSCacheTime = n
+		}
 	case "default_dns":
 		c.DefaultDNS = nil
 		for _, d := range strings.Split(val, ",") {
@@ -269,6 +298,18 @@ func (c *Config) ApplyKV(key, val string) {
 				c.DefaultDNS = append(c.DefaultDNS, d)
 			}
 		}
+	case "dns_strategy":
+		if val != "" {
+			c.DNSStrategy = strings.ToLower(val)
+		}
+	case "dns_config_url":
+		c.DNSConfigURL = strings.TrimSpace(val)
+	case "domain_sniff":
+		c.DomainSniff = parseBool(val, true)
+	case "force_domain_sniff":
+		c.ForceDomainSniff = parseBool(val, false)
+	case "dns_file", "dns_config_file":
+		c.DNSConfigPath = val
 	case "log_level":
 		if val != "" {
 			c.LogLevel = strings.ToLower(val)
@@ -337,6 +378,9 @@ func (c *Config) NormalizedPanelType() string {
 func (c *Config) NormalizedServerType() string {
 	switch strings.ToLower(c.ServerType) {
 	case "v2ray", "vmess":
+		if c.VLESS {
+			return "vless"
+		}
 		return "vmess"
 	case "vless":
 		return "vless"
@@ -459,6 +503,10 @@ node_speed_limit=0
 check_interval=60
 submit_interval=60
 forbidden_bit_torrent=true
+default_dns=
+dns_strategy=ipv4_first
+dns_config_url=
+domain_sniff=true
 log_level=info
 
 # ==================== CPU & 内存深度优化配置 ====================

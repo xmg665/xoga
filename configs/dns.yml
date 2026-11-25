@@ -1,4 +1,25 @@
-# 自定义 DNS 配置 (可选)
-servers:
-  - 1.1.1.1
-  - 8.8.8.8
+# DNS 分流与流媒体解锁配置 (支持保存后 5 秒内自动热重载，无需重启 xoga)
+#
+# 写法一：UDP / TCP 解锁 DNS (如自建 dnsmasq / SmartDNS 解锁机 IP)
+# "154.12.xx.xx":
+#   strategy: ipv4_only
+#   rules:
+#     - geosite:netflix
+#     - geosite:disney
+#     - geosite:bahamut
+#     - domain:dazn.com
+#
+# 写法二：DoH (DNS over HTTPS) 解锁服务商 (如 1Stream / AdGuard / NextDNS)
+# "https://your-unlock-dns.example.com/dns-query":
+#   strategy: ipv4_only
+#   rules:
+#     - geosite:netflix
+#     - geosite:disney
+#     - geosite:hbo
+#     - geosite:hulu
+#     - geosite:openai
+
+# 默认兜底上游 DNS (留空则使用系统默认 DNS)
+# servers:
+#   - 1.1.1.1
+#   - 8.8.8.8

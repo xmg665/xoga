@@ -31,6 +31,12 @@
   - WebSocket（RFC 6455 零依赖升级、支持 `?ed=2048` `Sec-WebSocket-Protocol` Early Data、自动透传 `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For` 真实客户端 IP）
   - HAProxy **PROXY Protocol v1 & v2**（`proxy_protocol=true` 中转真实 IP 识别）
   - 零分配首包协议嗅探（TLS ClientHello SNI、HTTP Host、BitTorrent / DHT / uTP / Tracker 协议自动封禁）与审计/分流路由（`blockList`、`whiteList`、`routes.toml`、面板下发动态路由）
+  - **流媒体 DNS 解锁与多协议路由分流解锁（支持 5 秒自动热重载，无需重启）**：
+    - `dns.yml`：支持 UDP / TCP / **DoH (`https://.../dns-query`)** 分流解析、支持 `ipv4_only` / `ipv6_only` / `ipv4_first` 策略与远程 `dns_config_url`
+    - `routes.toml`：100% 兼容 `soga` 原生 `[[routes]]` + `[[routes.Outs]]`（支持本机 **WARP `socks` `:40000`**、`socks5`、`http`、`ss`、`trojan`、`vless` 落地机轮询/主备容灾及双栈 `ipv6_only` / 指定网卡源 IP 直连）
+    - 内置零内存流媒体/AI `geosite:` 规则集（`netflix`、`disney`、`openai`、`claude`、`gemini`、`perplexity`、`grok`、`tiktok`、`bahamut` 等开箱即用，无需几十 MB 的 `.dat` 文件）
+    - 默认开启 `domain_sniff=true` 自动识别客户端预解析 IP 并还原真实 SNI/Host 域名，杜绝客户端本地 DNS 污染导致漏解锁
+    - 完整实战配置见 👉 **[《流媒体 DNS 解锁与路由分流解锁完整教程 (docs/UNLOCK_GUIDE.md)》](docs/UNLOCK_GUIDE.md)**
 
 ---
 
