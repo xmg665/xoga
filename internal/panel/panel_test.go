@@ -96,4 +96,11 @@ func TestSSPanelMetronStringParser(t *testing.T) {
 	if spec.ServerPort != 18443 || spec.Network != "ws" || spec.TLSMode != 1 || spec.WSPath != "/trojan-ws" || spec.ServerName != "cdn.node.com" {
 		t.Fatalf("unexpected parsed Metron spec: %+v", spec)
 	}
+
+	// Real SSPanel-UIM v3 mod_Uim sort=11 pipe-separated server string
+	specUIM := &NodeSpec{Protocol: "vmess", Network: "tcp"}
+	parseMetronServerString("hk5.v2api.xyz;2001;0;ws;;path=/mm|server=news2.help600.com|host=aomen.kugou.com|outside_port=20001", specUIM)
+	if specUIM.ServerPort != 2001 || specUIM.Network != "ws" || specUIM.WSPath != "/mm" || specUIM.WSHost != "aomen.kugou.com" {
+		t.Fatalf("unexpected parsed SSPanel-UIM pipe spec: %+v", specUIM)
+	}
 }

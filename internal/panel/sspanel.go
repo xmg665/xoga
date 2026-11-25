@@ -108,18 +108,17 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	c.mu.Unlock()
 
 	spec := &NodeSpec{
-		Protocol:   c.cfg.NormalizedServerType(),
-		ListenIP:   "0.0.0.0",
-		Network:    "tcp",
-		Cipher:     strings.ToLower(resp.Data.Method),
-		ServerPort: c.cfg.ListenPort,
+		Protocol: c.cfg.NormalizedServerType(),
+		ListenIP: "0.0.0.0",
+		Network:  "tcp",
+		Cipher:   strings.ToLower(resp.Data.Method),
 	}
 	if spec.Cipher == "" {
 		spec.Cipher = "aes-256-gcm"
 	}
 
-	// Parse SSPanel-Metron / legacy semicolon server string:
-	// e.g. "hk.example.com;port=443#12443;ws;tls;path=/ws;host=hk.example.com"
+	// Parse SSPanel-UIM / Metron semicolon & pipe-delimited server string:
+	// e.g. "hk5.v2api.xyz;2001;0;ws;;path=/mm|server=news2.help600.com|host=aomen.kugou.com|outside_port=20001"
 	parseMetronServerString(resp.Data.Server, spec)
 
 	// Override with SSPanel-UIM structured custom_config JSON when present
@@ -157,7 +156,15 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 			if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true {
 				spec.TLSMode = 1
 			}
+			if cc["enable_vless"] == "1" || cc["enable_vless"] == true || cc["vless"] == "1" || cc["vless"] == true {
+				spec.Protocol = "vless"
+			}
 		}
+	}
+
+	// Local `listen_port` override in xoga.conf always takes final precedence when > 0
+	if c.cfg.ListenPort > 0 {
+		spec.ServerPort = c.cfg.ListenPort
 	}
 
 	// Optionally pull SSPanel-UIM dynamic audit rules (`/mod_mu/func/detect_rules`)
@@ -220,62 +227,87 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 		return
 	}
 	parts := strings.Split(srv, ";")
-	for i, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	for i, rawPart := range parts {
+		rawPart = strings.TrimSpace(rawPart)
+		if rawPart == "" {
 			continue
 		}
 		if i == 0 {
 			// Sometimes host:port#listenPort
-			if idx := strings.IndexByte(part, '#'); idx > 0 {
-				if p, err := strconv.Atoi(part[idx+1:]); err == nil && p > 0 {
+			if idx := strings.IndexByte(rawPart, '#'); idx > 0 {
+				if p, err := strconv.Atoi(rawPart[idx+1:]); err == nil && p > 0 {
 					spec.ServerPort = p
 				}
-			} else if _, portStr, err := strings.Cut(part, ":"); err {
+			} else if _, portStr, hasColon := strings.Cut(rawPart, ":"); hasColon {
 				if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 && spec.ServerPort == 0 {
 					spec.ServerPort = p
 				}
 			}
 			continue
 		}
-		lower := strings.ToLower(part)
-		switch lower {
-		case "ws":
-			spec.Network = "ws"
-		case "tls":
-			spec.TLSMode = 1
-		default:
-			k, v, ok := strings.Cut(part, "=")
-			if !ok {
-				if p, err := strconv.Atoi(part); err == nil && p > 0 && spec.ServerPort == 0 {
-					spec.ServerPort = p
-				}
+
+		// SSPanel-UIM V2Ray/Trojan strings pack pipe-separated `k1=v1|k2=v2` inside semicolon fields:
+		// e.g. `hk5.v2api.xyz;2001;0;ws;;path=/mm|server=news2.help600.com|host=aomen.kugou.com|outside_port=20001`
+		for _, sub := range strings.Split(rawPart, "|") {
+			part := strings.TrimSpace(sub)
+			if part == "" {
 				continue
 			}
-			switch strings.ToLower(strings.TrimSpace(k)) {
-			case "port":
-				if _, right, hasHash := strings.Cut(v, "#"); hasHash {
-					if p, err := strconv.Atoi(right); err == nil && p > 0 {
+			lower := strings.ToLower(part)
+			switch lower {
+			case "ws":
+				spec.Network = "ws"
+			case "tcp":
+				spec.Network = "tcp"
+			case "tls":
+				spec.TLSMode = 1
+			case "vless":
+				spec.Protocol = "vless"
+			default:
+				k, v, ok := strings.Cut(part, "=")
+				if !ok {
+					// Positional port at index 1 (`addr;2001;0;ws;...`); ignore index 2 (`alterId`)
+					if i == 1 && spec.ServerPort == 0 {
+						if p, err := strconv.Atoi(part); err == nil && p > 0 {
+							spec.ServerPort = p
+						}
+					}
+					continue
+				}
+				v = strings.TrimSpace(v)
+				switch strings.ToLower(strings.TrimSpace(k)) {
+				case "port":
+					if _, right, hasHash := strings.Cut(v, "#"); hasHash {
+						if p, err := strconv.Atoi(right); err == nil && p > 0 {
+							spec.ServerPort = p
+						}
+					} else if p, err := strconv.Atoi(v); err == nil && p > 0 {
 						spec.ServerPort = p
 					}
-				} else if p, err := strconv.Atoi(v); err == nil && p > 0 {
-					spec.ServerPort = p
+				case "server_port", "inside_port", "offset_port_node":
+					if p, err := strconv.Atoi(v); err == nil && p > 0 {
+						spec.ServerPort = p
+					}
+				case "path":
+					spec.WSPath = v
+				case "host", "sni", "peer":
+					spec.WSHost = v
+					if spec.ServerName == "" {
+						spec.ServerName = v
+					}
+				case "net", "network":
+					spec.Network = strings.ToLower(v)
+				case "tls", "security":
+					if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "tls") {
+						spec.TLSMode = 1
+					}
+				case "vless", "enable_vless":
+					if v == "1" || strings.EqualFold(v, "true") {
+						spec.Protocol = "vless"
+					}
+				case "server_key":
+					spec.ServerKey = v
 				}
-			case "server_port", "inside_port":
-				if p, err := strconv.Atoi(v); err == nil && p > 0 {
-					spec.ServerPort = p
-				}
-			case "path":
-				spec.WSPath = v
-			case "host", "sni", "peer":
-				spec.WSHost = v
-				if spec.ServerName == "" {
-					spec.ServerName = v
-				}
-			case "net", "network":
-				spec.Network = strings.ToLower(v)
-			case "server_key":
-				spec.ServerKey = v
 			}
 		}
 	}
@@ -284,12 +316,29 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 type sspanelUsersResp struct {
 	Ret  int `json:"ret"`
 	Data []struct {
-		ID             int     `json:"id"`
-		UUID           string  `json:"uuid"`
-		Passwd         string  `json:"passwd"`
-		NodeSpeedlimit float64 `json:"node_speedlimit"`
-		NodeConnector  int     `json:"node_connector"`
+		ID             int    `json:"id"`
+		UUID           string `json:"uuid"`
+		Passwd         string `json:"passwd"`
+		NodeSpeedlimit any    `json:"node_speedlimit"`
+		NodeConnector  any    `json:"node_connector"`
+		V2rayUser      *struct {
+			UUID string `json:"uuid"`
+		} `json:"v2ray_user"`
 	} `json:"data"`
+}
+
+func parseAnyFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case int:
+		return float64(x)
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return f
+	default:
+		return 0
+	}
 }
 
 func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
@@ -324,20 +373,24 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	needUUID := c.cfg.NormalizedServerType() == "vless" || c.cfg.NormalizedServerType() == "vmess"
 	out := make([]stats.SyncUserSpec, 0, len(resp.Data))
 	for _, item := range resp.Data {
+		uuid := item.UUID
+		if uuid == "" && item.V2rayUser != nil {
+			uuid = item.V2rayUser.UUID
+		}
 		cred := item.Passwd
-		if needUUID && item.UUID != "" {
-			cred = item.UUID
+		if needUUID && uuid != "" {
+			cred = uuid
 		} else if cred == "" {
-			cred = item.UUID
+			cred = uuid
 		}
 		if item.ID <= 0 || cred == "" {
 			continue
 		}
-		mbps := item.NodeSpeedlimit
+		mbps := parseAnyFloat(item.NodeSpeedlimit)
 		if nodeSpeed > 0 && (mbps <= 0 || nodeSpeed < mbps) {
 			mbps = nodeSpeed
 		}
-		dev := item.NodeConnector
+		dev := parseAnyInt(item.NodeConnector)
 		if nodeConn > 0 && (dev <= 0 || nodeConn < dev) {
 			dev = nodeConn
 		}
