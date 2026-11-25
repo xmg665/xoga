@@ -122,8 +122,8 @@ func Default() *Config {
 		DomainSniff:         true,
 		LogLevel:            "info",
 		EnableZeroCopy:      true,
-		MemLimitMB:          128,
-		GCPercent:           50,
+		MemLimitMB:          512,
+		GCPercent:           80,
 		ConnIdleSec:         300,
 		UDPIdleSec:          60,
 	}
@@ -289,8 +289,8 @@ func (c *Config) ApplyKV(key, val string) {
 		c.VLESSFlow = strings.TrimSpace(val)
 	case "v2ray_reduce_memory":
 		c.V2rayReduceMemory = parseBool(val, false)
-		if c.V2rayReduceMemory && c.GCPercent == 50 {
-			c.GCPercent = 35
+		if c.V2rayReduceMemory && c.GCPercent == 80 {
+			c.GCPercent = 65
 		}
 	case "dns_cache_time":
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {

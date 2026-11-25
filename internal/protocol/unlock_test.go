@@ -645,8 +645,11 @@ func BenchmarkVMess5146UsersAuthScan(b *testing.B) {
 	b.Run("ColdLinearScan_5146Users", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
+			var scratch [16]byte
+			sc := scratch[:]
+			au := authID[:]
 			for j := range idx.VMessUsers {
-				if checkVMessCandidate(&idx.VMessUsers[j], &authID, now) {
+				if checkVMessCandidate(&idx.VMessUsers[j], au, sc, now) {
 					break
 				}
 			}
@@ -656,8 +659,9 @@ func BenchmarkVMess5146UsersAuthScan(b *testing.B) {
 	b.Run("O1_IPHintCache_5146Users", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
+			var scratch [16]byte
 			if h, ok := hints.Lookup(clientIP); ok {
-				if !checkVMessCandidate(&idx.VMessUsers[h], &authID, now) {
+				if !checkVMessCandidate(&idx.VMessUsers[h], authID[:], scratch[:], now) {
 					b.Fatal("expected O(1) hint hit")
 				}
 			}

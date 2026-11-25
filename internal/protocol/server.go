@@ -137,6 +137,7 @@ type Server struct {
 	ssPSKBlk cipher.Block
 
 	ipHints ipHintCache
+	hotRing hotUserRing
 	replay  replayFilter
 
 	userIdx atomic.Pointer[UserIndex]
@@ -200,6 +201,7 @@ func (s *Server) SSKeySize() int {
 
 func (s *Server) UpdateUsers(idx *UserIndex) {
 	s.userIdx.Store(idx)
+	s.hotRing.Reset()
 }
 
 func (s *Server) UpdateACL(eng *acl.Engine) {

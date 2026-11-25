@@ -5,18 +5,20 @@ import (
 	"sync/atomic"
 )
 
-const ipHintSlots = 4096 // power of two; 4096 * 8 bytes = 32 KiB fixed lock-free table
+const (
+	ipHintSlots = 4096 // power of two; 4096 * 8 bytes = 32 KiB fixed lock-free table
+	hotRingSize = 256  // 256 * 4 bytes = 1 KiB L1-resident active user index ring
+)
 
-// ipHintCache is a zero-allocation, lock-free direct-mapped cache mapping client IP -> user slice index
-// (inspired by soga's `ip-user-cache-vmess` & shadowsocks-rust session hints, but 100% in-memory with zero disk I/O).
-// On 5,000+ user VMess / Classic-SS nodes, repeat connections from active IPs authenticate in O(1) (1 cipher op).
+// ipHintCache is a zero-allocation, lock-free direct-mapped cache mapping client IP -> user slice index.
+// When unique client IPs are visible (direct / ProxyProtocol / X-Forwarded-For), repeat connections
+// authenticate in O(1) (1 cipher op).
 type ipHintCache struct {
 	slots [ipHintSlots]atomic.Uint64
 }
 
 func ipTag32(ip netip.Addr) uint32 {
 	b := ip.As16()
-	// Fast FNV-1a 32-bit over 16-byte stack value (0 heap allocations)
 	var h uint32 = 2166136261
 	for i := 0; i < 16; i++ {
 		h ^= uint32(b[i])
@@ -47,4 +49,39 @@ func (c *ipHintCache) Store(ip netip.Addr, idx int) {
 	tag := ipTag32(ip)
 	packed := (uint64(tag) << 32) | uint64(uint32(idx))
 	c.slots[tag&(ipHintSlots-1)].Store(packed)
+}
+
+// hotUserRing caches up to 256 recently active user indices in a 1 KiB L1-cache-resident lock-free array.
+// Crucial for L4 TCP transit relays where thousands of connections from 50-150 active users arrive
+// sharing the exact same relay source IP (so IP-based hints collide): reduces 5,000+ user scans to ~25 checks
+// with zero atomic writes once active users are resident in the ring.
+type hotUserRing struct {
+	slots  [hotRingSize]atomic.Int32 // stores idx+1 (0 means empty)
+	cursor atomic.Uint32
+}
+
+func (r *hotUserRing) Promote(idx int) {
+	if idx < 0 {
+		return
+	}
+	target := int32(idx + 1)
+	for i := 0; i < hotRingSize; i++ {
+		v := r.slots[i].Load()
+		if v == target {
+			return // already resident -> avoid cache-line write invalidation across cores!
+		}
+		if v == 0 {
+			if r.slots[i].CompareAndSwap(0, target) {
+				return
+			}
+		}
+	}
+	pos := r.cursor.Add(1) & (hotRingSize - 1)
+	r.slots[pos].Store(target)
+}
+
+func (r *hotUserRing) Reset() {
+	for i := 0; i < hotRingSize; i++ {
+		r.slots[i].Store(0)
+	}
 }

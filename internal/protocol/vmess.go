@@ -188,20 +188,20 @@ func vmessKDF(key []byte, path ...string) []byte {
 	return h.Sum(nil)
 }
 
-func checkVMessCandidate(cand *VMessUserEntry, authID *[16]byte, now int64) bool {
-	var plainAuth [16]byte
-	cand.AuthBlock.Decrypt(plainAuth[:], authID[:])
-	if crc32.ChecksumIEEE(plainAuth[:12]) != binary.BigEndian.Uint32(plainAuth[12:16]) {
+func checkVMessCandidate(cand *VMessUserEntry, authID, scratch []byte, now int64) bool {
+	cand.AuthBlock.Decrypt(scratch, authID)
+	if crc32.ChecksumIEEE(scratch[:12]) != binary.BigEndian.Uint32(scratch[12:16]) {
 		return false
 	}
-	ts := int64(binary.BigEndian.Uint64(plainAuth[:8]))
+	ts := int64(binary.BigEndian.Uint64(scratch[:8]))
 	return math.Abs(float64(now-ts)) <= 120
 }
 
 // handleVMess implements VMess AEAD (`AuthID` + AEAD request header + AES-128-GCM / ChaCha20-Poly1305 / Zero body)
-// for both TCP (`cmd=0x01`) and UDP-over-stream (`cmd=0x02`), with O(1) client-IP user hinting & anti-replay.
+// for both TCP (`cmd=0x01`) and UDP-over-stream (`cmd=0x02`), with O(1) client-IP user hinting,
+// L1-cached hot-user ring (for L4 transit relays sharing 1 IP across thousands of streams), & anti-replay.
 func (s *Server) handleVMess(conn net.Conn) {
-	br := bufio.NewReaderSize(conn, 4096)
+	br := bufio.NewReaderSize(conn, 1024)
 
 	var authID [16]byte
 	if _, err := io.ReadFull(br, authID[:]); err != nil {
@@ -216,21 +216,51 @@ func (s *Server) handleVMess(conn net.Conn) {
 	now := time.Now().Unix()
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
 
+	// Single 16-byte scratch buffer reused across all candidate checks (eliminates 5,000+ heap allocs/scan!)
+	var scratchArr [16]byte
+	scratch := scratchArr[:]
+	authSlice := authID[:]
+
 	var matched *VMessUserEntry
-	// 1. O(1) lock-free IP->User hint fast path (1 AES block decrypt instead of scanning 5,000+ users!)
-	if hintIdx, ok := s.ipHints.Lookup(clientIP); ok && hintIdx < len(idx.VMessUsers) {
-		cand := &idx.VMessUsers[hintIdx]
-		if checkVMessCandidate(cand, &authID, now) {
+	hintIdx := -1
+	// 1. O(1) lock-free IP->User hint fast path (1 AES block decrypt when client IP is distinct)
+	if h, ok := s.ipHints.Lookup(clientIP); ok && h < len(idx.VMessUsers) {
+		hintIdx = h
+		cand := &idx.VMessUsers[h]
+		if checkVMessCandidate(cand, authSlice, scratch, now) {
 			matched = cand
 		}
 	}
-	// 2. Fallback scan when IP is new or shared across multiple NAT users
+	// 2. L1-cached active hot-user ring (256 slots -> ~25 checks when 4,000+ streams share 1 L4 transit IP!)
+	if matched == nil {
+		for slot := 0; slot < hotRingSize; slot++ {
+			enc := int(s.hotRing.slots[slot].Load())
+			if enc == 0 {
+				break
+			}
+			uIdx := enc - 1
+			if uIdx == hintIdx || uIdx < 0 || uIdx >= len(idx.VMessUsers) {
+				continue
+			}
+			cand := &idx.VMessUsers[uIdx]
+			if checkVMessCandidate(cand, authSlice, scratch, now) {
+				matched = cand
+				s.ipHints.Store(clientIP, uIdx)
+				break
+			}
+		}
+	}
+	// 3. Full fallback scan only when a cold user connects for the first time
 	if matched == nil {
 		for i := range idx.VMessUsers {
+			if i == hintIdx {
+				continue
+			}
 			cand := &idx.VMessUsers[i]
-			if checkVMessCandidate(cand, &authID, now) {
+			if checkVMessCandidate(cand, authSlice, scratch, now) {
 				matched = cand
 				s.ipHints.Store(clientIP, i)
+				s.hotRing.Promote(i)
 				break
 			}
 		}
