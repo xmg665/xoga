@@ -299,7 +299,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 			}
 		}
 	}
-	if matched == nil {
+	if matched == nil || matched.User.IsDisabled() {
 		return nil, nil, "", 0, 0, false
 	}
 
@@ -437,6 +437,9 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 			n, err := targetUDP.Read(buf)
 			if err != nil {
 				return
+			}
+			if n <= 0 || n > 65535-80 {
+				continue
 			}
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
@@ -702,6 +705,9 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 	padLen := 0
 	if v.optGlobalPad {
 		padLen = int(v.nextMask(v.writeMask) % 64)
+	}
+	if len(part)+16+padLen > 65535 {
+		return io.ErrShortBuffer
 	}
 	sizeMask := v.nextMask(v.writeMask)
 

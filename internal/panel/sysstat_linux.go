@@ -9,27 +9,39 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var (
-	cpuMu     sync.Mutex
-	prevTotal uint64
-	prevIdle  uint64
+	cpuMu      sync.Mutex
+	prevTotal  uint64
+	prevIdle   uint64
+	cachedStat SystemStatus
+	cachedAt   time.Time
 )
 
 // CollectSystemStatus reads /proc/stat, /proc/meminfo, /proc/loadavg, /proc/uptime, and statfs("/")
-// directly on Linux with zero CGO and zero external gopsutil bloat.
+// directly on Linux with zero CGO and zero external gopsutil bloat, caching snapshots for 2s so
+// multi-node workers polling at 120ms stagger share accurate CPU deltas without redundant syscalls.
 func CollectSystemStatus() SystemStatus {
+	cpuMu.Lock()
+	defer cpuMu.Unlock()
+	now := time.Now()
+	if !cachedAt.IsZero() && now.Sub(cachedAt) < 2*time.Second {
+		return cachedStat
+	}
 	var st SystemStatus
-	st.CPU = readCPUPercent()
+	st.CPU = readCPUPercentLocked()
 	st.MemTotal, st.MemUsed, st.SwapTotal, st.SwapUsed = readMemInfo()
 	st.DiskTotal, st.DiskUsed = readRootDisk()
 	st.LoadAvg = readLoadAvg()
 	st.UptimeSec = readUptime()
+	cachedStat = st
+	cachedAt = now
 	return st
 }
 
-func readCPUPercent() float64 {
+func readCPUPercentLocked() float64 {
 	f, err := os.Open("/proc/stat")
 	if err != nil {
 		return 0
@@ -53,14 +65,12 @@ func readCPUPercent() float64 {
 		}
 	}
 
-	cpuMu.Lock()
-	defer cpuMu.Unlock()
 	dTotal := total - prevTotal
 	dIdle := idle - prevIdle
 	prevTotal = total
 	prevIdle = idle
 	if dTotal == 0 || dIdle > dTotal {
-		return 0
+		return cachedStat.CPU
 	}
 	pct := float64(dTotal-dIdle) * 100.0 / float64(dTotal)
 	if pct > 100 {

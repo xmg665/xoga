@@ -96,3 +96,50 @@ func TestPipeBidirectionalZeroBufferIdleAndBurst(t *testing.T) {
 		t.Fatalf("echoed payload mismatch: got %d bytes, want %d bytes", len(got), len(payload))
 	}
 }
+
+func TestDisableAndKickSeversStalledRemoteImmediately(t *testing.T) {
+	// Stalled remote server that never sends FIN or data
+	stallLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stallLn.Close()
+	go func() {
+		c, err := stallLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		time.Sleep(10 * time.Second)
+	}()
+
+	cliSrv, cliPeer := net.Pipe()
+	defer cliPeer.Close()
+
+	rem, err := net.Dial("tcp", stallLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rem.Close()
+
+	user := stats.NewUserEntry(202, "b831381d-6324-4d53-ad4f-8cda48b30811", 0, 0, 0, false)
+	_, err = user.AcquireSession(ExtractClientIP(rem.RemoteAddr()), 60, nil, cliSrv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		PipeBidirectional(cliSrv, rem, nil, user, limiter.NewBucketMbps(0), 30*time.Second, false)
+	}()
+
+	time.Sleep(40 * time.Millisecond)
+	user.DisableAndKick()
+
+	select {
+	case <-done:
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("PipeBidirectional lingered on stalled remoteConn after DisableAndKick()")
+	}
+}

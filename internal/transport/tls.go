@@ -9,9 +9,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,10 +23,81 @@ import (
 	"github.com/xmg665/xoga/internal/logger"
 )
 
+var (
+	acmeHubMu   sync.RWMutex
+	acmeManagers = make(map[string]*autocert.Manager)
+	acmeServer  *http.Server
+	acmeRefCnt  int
+)
+
+func registerACMEManager(domain string, mgr *autocert.Manager) {
+	key := strings.ToLower(strings.TrimSpace(domain))
+	acmeHubMu.Lock()
+	acmeManagers[key] = mgr
+	acmeRefCnt++
+	needStart := acmeServer == nil
+	var srv *http.Server
+	if needStart {
+		srv = &http.Server{
+			Addr: ":80",
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				host := r.Host
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				host = strings.ToLower(strings.TrimSpace(host))
+				acmeHubMu.RLock()
+				m := acmeManagers[host]
+				if m == nil {
+					for _, cand := range acmeManagers {
+						m = cand
+						break
+					}
+				}
+				acmeHubMu.RUnlock()
+				if m != nil {
+					m.HTTPHandler(nil).ServeHTTP(w, r)
+					return
+				}
+				http.NotFound(w, r)
+			}),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		acmeServer = srv
+	}
+	acmeHubMu.Unlock()
+
+	if needStart && srv != nil {
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Warnf("ACME HTTP-01 challenge listener (:80) stopped: %v", err)
+			}
+		}()
+	}
+}
+
+func unregisterACMEManager(domain string) {
+	key := strings.ToLower(strings.TrimSpace(domain))
+	acmeHubMu.Lock()
+	delete(acmeManagers, key)
+	if acmeRefCnt > 0 {
+		acmeRefCnt--
+	}
+	var srv *http.Server
+	if acmeRefCnt == 0 && acmeServer != nil {
+		srv = acmeServer
+		acmeServer = nil
+	}
+	acmeHubMu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+	}
+}
+
 // TLSProvider manages manual PEM reload, ACME HTTP-01 autocert, or ephemeral ECDSA P-256 certificates.
 type TLSProvider struct {
 	tlsConfig  *tls.Config
-	httpServer *http.Server
+	acmeDomain string
 }
 
 func BuildTLSConfig(cfg *config.Config, serverName string) (*TLSProvider, error) {
@@ -70,22 +143,13 @@ func BuildTLSConfigWithALPN(cfg *config.Config, serverName string, nextProtos []
 			HostPolicy: autocert.HostWhitelist(domain),
 			Cache:      autocert.DirCache(cacheDir),
 		}
-		httpSrv := &http.Server{
-			Addr:              ":80",
-			Handler:           mgr.HTTPHandler(nil),
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-		go func() {
-			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logger.Warnf("ACME HTTP-01 challenge listener (:80) stopped: %v", err)
-			}
-		}()
+		registerACMEManager(domain, mgr)
 		tc := mgr.TLSConfig()
 		tc.MinVersion = tls.VersionTLS12
 		tc.NextProtos = append(tc.NextProtos, nextProtos...)
 		return &TLSProvider{
 			tlsConfig:  tc,
-			httpServer: httpSrv,
+			acmeDomain: domain,
 		}, nil
 	}
 
@@ -112,8 +176,9 @@ func (p *TLSProvider) Config() *tls.Config {
 }
 
 func (p *TLSProvider) Close() {
-	if p != nil && p.httpServer != nil {
-		_ = p.httpServer.Close()
+	if p != nil && p.acmeDomain != "" {
+		unregisterACMEManager(p.acmeDomain)
+		p.acmeDomain = ""
 	}
 }
 

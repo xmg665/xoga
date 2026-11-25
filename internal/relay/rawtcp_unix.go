@@ -4,6 +4,7 @@ package relay
 
 import (
 	"net"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ func tryCopyFromRawTCP(
 	nodeLim *limiter.Bucket,
 	isUpload bool,
 	idleTimeout time.Duration,
+	abortPeer *atomic.Bool,
 ) bool {
 	rawConn, err := srcTCP.SyscallConn()
 	if err != nil {
@@ -34,10 +36,14 @@ func tryCopyFromRawTCP(
 	}()
 
 	for {
-		if user != nil && user.IsDisabled() {
+		if (user != nil && user.IsDisabled()) || (abortPeer != nil && abortPeer.Load()) {
 			return true
 		}
 		_ = srcTCP.SetReadDeadline(time.Now().Add(idleTimeout))
+		if abortPeer != nil && abortPeer.Load() {
+			_ = srcTCP.SetReadDeadline(time.Now())
+			return true
+		}
 		var nr int
 		var readErr error
 		var eof bool

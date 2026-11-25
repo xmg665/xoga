@@ -73,11 +73,11 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Time{})
 
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
-	sessConnID, err := user.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
+	sessConnID, err := user.AcquireMuxSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
 	if err != nil {
 		return
 	}
-	defer user.ReleaseSession(sessConnID)
+	defer user.ReleaseMuxSession(sessConnID)
 
 	sess := &anytlsSession{
 		srv:     s,
@@ -295,6 +295,14 @@ func (s *anytlsSession) closeAllStreams() {
 func (s *anytlsSession) serveStream(st *anytlsStream) {
 	defer st.Close()
 
+	if err := s.user.AcquireSubStream(); err != nil {
+		if s.peerVersion.Load() >= 2 {
+			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte(err.Error()))
+		}
+		return
+	}
+	defer s.user.ReleaseSubStream()
+
 	_ = st.SetReadDeadline(time.Now().Add(12 * time.Second))
 	destHost, destPort, err := parseSOCKS5Addr(st)
 	if err != nil {
@@ -347,7 +355,15 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 	}
 
-	udpConn, err := net.ListenUDP("udp", nil)
+	var localUDP *net.UDPAddr
+	if isConnect && fixedHost != "" {
+		initRoute := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, fixedHost, fixedPort, "", "")
+		localUDP = relay.LocalUDPAddrForRoute(initRoute, false)
+	} else {
+		nodeRoute := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, "0.0.0.0", 53, "", "")
+		localUDP = relay.LocalUDPAddrForRoute(nodeRoute, false)
+	}
+	udpConn, err := net.ListenUDP("udp", localUDP)
 	if err != nil {
 		return
 	}
@@ -526,15 +542,25 @@ func newAnyTLSStream(sess *anytlsSession, id uint32) *anytlsStream {
 }
 
 func (s *anytlsStream) pushRx(data []byte) {
+	var overflow bool
 	s.rxMu.Lock()
 	if !s.peerEOF && !s.localClose {
-		// Cap per-stream unread buffer at 4 MiB to prevent memory exhaustion if remote stalls
-		if s.rxBuf.Len()+len(data) <= 4*1024*1024 {
+		// Cap per-stream unread buffer at 8 MiB; abort stream cleanly on overflow instead of silently corrupting middle bytes!
+		if s.rxBuf.Len()+len(data) <= 8*1024*1024 {
 			_, _ = s.rxBuf.Write(data)
+		} else {
+			s.peerEOF = true
+			s.localClose = true
+			s.rxBuf.Reset()
+			overflow = true
 		}
 	}
 	s.rxCond.Broadcast()
 	s.rxMu.Unlock()
+	if overflow {
+		s.sess.removeStream(s.id)
+		_ = s.sess.writeFrame(anytlsCmdFIN, s.id, nil)
+	}
 }
 
 func (s *anytlsStream) markPeerEOF() {
@@ -560,7 +586,11 @@ func (s *anytlsStream) Read(p []byte) (int, error) {
 		}
 		s.rxCond.Wait()
 	}
-	return s.rxBuf.Read(p)
+	n, err := s.rxBuf.Read(p)
+	if s.rxBuf.Len() == 0 && s.rxBuf.Cap() > 16384 {
+		s.rxBuf = bytes.Buffer{}
+	}
+	return n, err
 }
 
 func (s *anytlsStream) Write(p []byte) (int, error) {

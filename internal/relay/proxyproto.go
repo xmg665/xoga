@@ -48,6 +48,11 @@ func (p *proxyProtoConn) NetConn() net.Conn {
 	return p.Conn
 }
 
+// RawWriteConn exposes the underlying net.Conn for transparent write unwrapping (unlike *tls.Conn whose NetConn bypasses encryption).
+func (p *proxyProtoConn) RawWriteConn() net.Conn {
+	return p.Conn
+}
+
 // UnwrapTCP exposes the raw *net.TCPConn once any peeked PROXY header leftover bytes are drained,
 // enabling Linux kernel `splice(2)` zero-copy even when `proxy_protocol=true`!
 func (p *proxyProtoConn) UnwrapTCP() (*net.TCPConn, bool) {

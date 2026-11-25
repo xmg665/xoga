@@ -37,7 +37,7 @@ func (s *Server) handleTrojan(conn net.Conn) {
 		return
 	}
 	user, ok := idx.ByTrojan[key]
-	if !ok {
+	if !ok || user.IsDisabled() {
 		return
 	}
 
@@ -80,7 +80,12 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	}
 	defer user.ReleaseSession(connID)
 
-	udpConn, err := net.ListenPacket("udp", "")
+	localBind := ""
+	nodeRoute := s.aclEng.Load().DecideForNode(s.cfg.NodeID, "0.0.0.0", 53, "", "")
+	if lu := relay.LocalUDPAddrForRoute(nodeRoute, false); lu != nil {
+		localBind = net.JoinHostPort(lu.IP.String(), "0")
+	}
+	udpConn, err := net.ListenPacket("udp", localBind)
 	if err != nil {
 		return
 	}

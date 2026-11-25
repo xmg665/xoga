@@ -10,6 +10,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/xtls/reality"
@@ -87,9 +88,12 @@ type visionConn struct {
 	reader        io.Reader
 	withinPadding bool
 	checkedInit   bool
+	needNextBlock bool
 	remContent    int
 	remPadding    int
 	curCmd        byte
+	hdrBuf        [5]byte
+	hdrRead       int
 	leftover      []byte
 
 	writeMu           sync.Mutex
@@ -122,7 +126,7 @@ func (v *visionConn) CloseWrite() error {
 	if cw, ok := v.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return nil
+	return v.Conn.SetReadDeadline(time.Now())
 }
 
 func (v *visionConn) Read(p []byte) (int, error) {
@@ -173,6 +177,14 @@ func (v *visionConn) Read(p []byte) (int, error) {
 			return v.reader.Read(p)
 		}
 
+		if v.needNextBlock {
+			if err := v.finishReadBlockLocked(); err != nil {
+				return 0, err
+			}
+			v.needNextBlock = false
+			continue
+		}
+
 		if v.remContent > 0 {
 			toRead := len(p)
 			if toRead > v.remContent {
@@ -181,7 +193,11 @@ func (v *visionConn) Read(p []byte) (int, error) {
 			n, err := v.reader.Read(p[:toRead])
 			v.remContent -= n
 			if v.remContent == 0 && v.remPadding == 0 {
-				if finErr := v.finishReadBlockLocked(); finErr != nil && n == 0 {
+				if v.curCmd == visionCmdContinue {
+					// Defer reading the next 5-byte Vision header until the next Read() call
+					// so `n` payload bytes (e.g. ClientHello) are returned immediately without blocking!
+					v.needNextBlock = true
+				} else if finErr := v.finishReadBlockLocked(); finErr != nil && n == 0 {
 					return 0, finErr
 				}
 			}
@@ -195,8 +211,8 @@ func (v *visionConn) Read(p []byte) (int, error) {
 		}
 
 		if v.remPadding > 0 {
-			_, err := io.CopyN(io.Discard, v.reader, int64(v.remPadding))
-			v.remPadding = 0
+			nPad, err := io.CopyN(io.Discard, v.reader, int64(v.remPadding))
+			v.remPadding -= int(nPad)
 			if err != nil {
 				return 0, err
 			}
@@ -211,13 +227,17 @@ func (v *visionConn) Read(p []byte) (int, error) {
 func (v *visionConn) finishReadBlockLocked() error {
 	switch v.curCmd {
 	case visionCmdContinue:
-		var hdr [5]byte
-		if _, err := io.ReadFull(v.reader, hdr[:]); err != nil {
-			return err
+		for v.hdrRead < 5 {
+			n, err := v.reader.Read(v.hdrBuf[v.hdrRead:5])
+			v.hdrRead += n
+			if err != nil {
+				return err
+			}
 		}
-		v.curCmd = hdr[0]
-		v.remContent = int(binary.BigEndian.Uint16(hdr[1:3]))
-		v.remPadding = int(binary.BigEndian.Uint16(hdr[3:5]))
+		v.hdrRead = 0
+		v.curCmd = v.hdrBuf[0]
+		v.remContent = int(binary.BigEndian.Uint16(v.hdrBuf[1:3]))
+		v.remPadding = int(binary.BigEndian.Uint16(v.hdrBuf[3:5]))
 		return nil
 	case visionCmdEnd:
 		v.withinPadding = false

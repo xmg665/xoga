@@ -81,7 +81,15 @@ install_xoga() {
         exit 1
     fi
 
+    local active_tpl_units=()
+    while IFS= read -r u; do
+        [[ -n "${u}" ]] && active_tpl_units+=("${u}")
+    done < <(systemctl list-units --type=service --state=active 'xoga@*.service' --no-legend --plain 2>/dev/null | awk '{print $1}')
+
     systemctl stop xoga >/dev/null 2>&1 || true
+    for u in "${active_tpl_units[@]}"; do
+        systemctl stop "${u}" >/dev/null 2>&1 || true
+    done
 
     rm -rf /usr/local/xoga
     mkdir -p /usr/local/xoga /etc/xoga
@@ -117,6 +125,9 @@ install_xoga() {
         echo -e "${yellow}首次全新安装，已生成默认配置 /etc/xoga/xoga.conf${plain}"
     else
         systemctl restart xoga
+        for u in "${active_tpl_units[@]}"; do
+            systemctl restart "${u}" >/dev/null 2>&1 || true
+        done
         sleep 1
         if check_status; then
             echo -e "${green}xoga 服务已自动重启成功${plain}"

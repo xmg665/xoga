@@ -135,7 +135,7 @@ type hy2ConnState struct {
 	clientIP   netip.Addr
 	authMu     sync.Mutex
 	authed     atomic.Bool
-	user       *stats.UserEntry
+	user       atomic.Pointer[stats.UserEntry]
 	sessConnID uint64
 	udpOnce    sync.Once
 }
@@ -145,7 +145,7 @@ func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.authMu.Lock()
 		defer h.authMu.Unlock()
 
-		if h.authed.Load() && h.user != nil && !h.user.IsDisabled() {
+		if cur := h.user.Load(); h.authed.Load() && cur != nil && !cur.IsDisabled() {
 			h.writeAuthOK(w)
 			return
 		}
@@ -161,13 +161,13 @@ func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cid, err := user.AcquireSession(h.clientIP, h.srv.tracker.IPTTLSeconds(), h.srv.tracker.RedisLimiter(), &hy2QuicCloser{qconn: h.qconn})
+		cid, err := user.AcquireMuxSession(h.clientIP, h.srv.tracker.IPTTLSeconds(), h.srv.tracker.RedisLimiter(), &hy2QuicCloser{qconn: h.qconn})
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
 
-		h.user = user
+		h.user.Store(user)
 		h.sessConnID = cid
 		h.authed.Store(true)
 		h.writeAuthOK(w)
@@ -203,13 +203,12 @@ func (s *Server) handleHy2Conn(qconn *quic.Conn) {
 	defer func() {
 		_ = qconn.CloseWithError(0, "")
 		state.authMu.Lock()
-		u := state.user
+		u := state.user.Swap(nil)
 		cid := state.sessConnID
-		state.user = nil
 		state.sessConnID = 0
 		state.authMu.Unlock()
 		if u != nil {
-			u.ReleaseSession(cid)
+			u.ReleaseMuxSession(cid)
 		}
 	}()
 
@@ -258,10 +257,14 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	}
 	defer sc.Close()
 
-	user := h.user
+	user := h.user.Load()
 	if user == nil || user.IsDisabled() {
 		return
 	}
+	if err := user.AcquireSubStream(); err != nil {
+		return
+	}
+	defer user.ReleaseSubStream()
 
 	_ = sc.SetReadDeadline(time.Now().Add(12 * time.Second))
 	vr := quicvarint.NewReader(sc)
@@ -361,7 +364,7 @@ type hy2FragAssembly struct {
 }
 
 func (h *hy2ConnState) serveDatagrams() {
-	user := h.user
+	user := h.user.Load()
 	if user == nil {
 		return
 	}
@@ -406,6 +409,20 @@ func (h *hy2ConnState) serveDatagrams() {
 			mu.Lock()
 			fa, ok := frags[sessID]
 			if !ok || fa.pktID != pktID || fa.count != fragCnt || time.Since(fa.created) > 5*time.Second {
+				if !ok && len(frags) >= 128 {
+					now := time.Now()
+					for k, old := range frags {
+						if now.Sub(old.created) > 5*time.Second {
+							delete(frags, k)
+						}
+					}
+					if len(frags) >= 128 {
+						for k := range frags {
+							delete(frags, k)
+							break
+						}
+					}
+				}
 				fa = &hy2FragAssembly{
 					pktID:   pktID,
 					count:   fragCnt,
@@ -470,7 +487,7 @@ func (h *hy2ConnState) serveDatagrams() {
 				mu.Unlock()
 				continue
 			}
-			localUDP := relay.LocalUDPAddrForRoute(route, false)
+			localUDP := relay.LocalUDPAddrForRoute(route, dstUDP.IP.To4() == nil)
 			uconn, lerr := net.ListenUDP("udp", localUDP)
 			if lerr != nil {
 				mu.Unlock()

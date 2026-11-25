@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -344,8 +345,11 @@ func listenerNeedsRestart(oldSpec, newSpec *panel.NodeSpec) bool {
 		oldSpec.Flow != newSpec.Flow ||
 		oldSpec.RealityDest != newSpec.RealityDest ||
 		oldSpec.RealityPrivateKey != newSpec.RealityPrivateKey ||
+		!slices.Equal(oldSpec.RealityShortIDs, newSpec.RealityShortIDs) ||
+		!slices.Equal(oldSpec.RealityServerNames, newSpec.RealityServerNames) ||
 		oldSpec.Hy2Obfs != newSpec.Hy2Obfs ||
 		oldSpec.Hy2ObfsPassword != newSpec.Hy2ObfsPassword ||
 		oldSpec.Hy2DownMbps != newSpec.Hy2DownMbps ||
+		oldSpec.Hy2IgnoreClientBW != newSpec.Hy2IgnoreClientBW ||
 		oldSpec.AnyTLSPaddingScheme != newSpec.AnyTLSPaddingScheme
 }

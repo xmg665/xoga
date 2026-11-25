@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -42,16 +43,18 @@ type SSPanelClient struct {
 	usersETag     string
 	lastUsersHash [32]byte
 	hasUsersHash  bool
-	lastUsersLen  int
+	lastUsersLen  atomic.Int64
 	nodeSpeed     float64
 	nodeConn      int
+	nodeRate      float64
 }
 
 func NewSSPanelClient(cfg *config.Config, httpCli *http.Client) *SSPanelClient {
 	return &SSPanelClient{
-		cfg:     cfg,
-		http:    httpCli,
-		baseURL: strings.TrimRight(cfg.WebAPIURL, "/"),
+		cfg:      cfg,
+		http:     httpCli,
+		baseURL:  strings.TrimRight(cfg.WebAPIURL, "/"),
+		nodeRate: 1.0,
 	}
 }
 
@@ -73,6 +76,7 @@ type sspanelNodeResp struct {
 	Data struct {
 		NodeSpeedlimit float64         `json:"node_speedlimit"`
 		NodeConnector  int             `json:"node_connector"`
+		TrafficRate    *float64        `json:"traffic_rate"`
 		Server         string          `json:"server"`
 		Method         string          `json:"method"`
 		Sort           int             `json:"sort"`
@@ -102,12 +106,21 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 		return nil, fmt.Errorf("SSPanel node info returned ret=%d", resp.Ret)
 	}
 
+	rate := 1.0
+	if resp.Data.TrafficRate != nil && *resp.Data.TrafficRate >= 0 {
+		rate = *resp.Data.TrafficRate
+	}
 	c.mu.Lock()
 	if newETag != "" {
 		c.nodeETag = newETag
 	}
+	if c.nodeSpeed != resp.Data.NodeSpeedlimit || c.nodeConn != resp.Data.NodeConnector || c.nodeRate != rate {
+		c.usersETag = ""
+		c.hasUsersHash = false
+	}
 	c.nodeSpeed = resp.Data.NodeSpeedlimit
 	c.nodeConn = resp.Data.NodeConnector
+	c.nodeRate = rate
 	c.mu.Unlock()
 
 	spec := &NodeSpec{
@@ -226,14 +239,21 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	}
 
 	// Optionally pull SSPanel-UIM dynamic audit rules (`/mod_mu/func/detect_rules`)
-	if rules := c.fetchDetectRules(ctx); len(rules) > 0 {
+	rules := c.fetchDetectRules(ctx)
+	if len(rules) > 0 {
 		spec.Routes = append(spec.Routes, acl.DynamicRoute{
 			Matches: rules,
 			Action:  "block",
 		})
 	}
 
-	sum := sha256.Sum256(body)
+	chk := sha256.New()
+	_, _ = chk.Write(body)
+	for _, r := range rules {
+		_, _ = chk.Write([]byte{0})
+		_, _ = chk.Write([]byte(r))
+	}
+	sum := chk.Sum(nil)
 	spec.ConfigChecksum = hex.EncodeToString(sum[:16])
 	return spec, nil
 }
@@ -432,6 +452,7 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	hasPrevHash := c.hasUsersHash
 	nodeSpeed := c.nodeSpeed
 	nodeConn := c.nodeConn
+	nodeRate := c.nodeRate
 	c.mu.Unlock()
 
 	u := c.modURL("/mod_mu/users", true)
@@ -473,9 +494,23 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 		}
 		var remain int64 = -1
 		if item.TransferEnable > 0 {
-			remain = item.TransferEnable - (item.U + item.D)
-			if remain <= 0 {
+			rawRemain := item.TransferEnable - (item.U + item.D)
+			if rawRemain <= 0 {
 				continue
+			}
+			if nodeRate == 0 {
+				// 0x free-traffic node: allowed while user has positive panel balance, without burning quota locally
+				remain = -1
+			} else if nodeRate > 0 {
+				scaled := float64(rawRemain) / nodeRate
+				if scaled >= float64(1<<60) {
+					remain = 1 << 60
+				} else {
+					remain = int64(scaled)
+					if remain <= 0 {
+						remain = 1
+					}
+				}
 			}
 		}
 		uuid := item.UUID
@@ -597,14 +632,18 @@ func (c *SSPanelClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) 
 	return body, resp.Header.Get("ETag"), resp.StatusCode, nil
 }
 
-func readResponseBody(resp *http.Response, sizeHint *int) ([]byte, error) {
+func readResponseBody(resp *http.Response, sizeHint *atomic.Int64) ([]byte, error) {
 	const maxBody = 32 * 1024 * 1024
 	lr := io.LimitReader(resp.Body, maxBody)
 	initCap := 0
+	hint := int64(0)
+	if sizeHint != nil {
+		hint = sizeHint.Load()
+	}
 	if resp.ContentLength > 0 && resp.ContentLength <= maxBody {
 		initCap = int(resp.ContentLength) + 64
-	} else if sizeHint != nil && *sizeHint > 4096 && *sizeHint <= maxBody {
-		initCap = *sizeHint + 4096
+	} else if hint > 4096 && hint <= maxBody {
+		initCap = int(hint) + 4096
 	}
 	if initCap > 0 {
 		var buf bytes.Buffer
@@ -614,13 +653,13 @@ func readResponseBody(resp *http.Response, sizeHint *int) ([]byte, error) {
 		}
 		b := buf.Bytes()
 		if sizeHint != nil && len(b) > 4096 {
-			*sizeHint = len(b)
+			sizeHint.Store(int64(len(b)))
 		}
 		return b, nil
 	}
 	b, err := io.ReadAll(lr)
 	if err == nil && sizeHint != nil && len(b) > 4096 {
-		*sizeHint = len(b)
+		sizeHint.Store(int64(len(b)))
 	}
 	return b, err
 }

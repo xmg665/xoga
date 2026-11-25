@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -30,14 +31,15 @@ type UniProxyClient struct {
 	baseURL  string
 	nodeType string
 
-	mu            sync.Mutex
-	configETag    string
-	usersETag     string
-	lastUsersHash [32]byte
-	hasUsersHash  bool
-	lastBodyLen   int
-	legacyV2      bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
-	legacyHy      bool // fallback node_type="hysteria" when Xboard/V2Board uses "hysteria" (v2) instead of "hysteria2"
+	mu             sync.Mutex
+	configETag     string
+	usersETag      string
+	lastUsersHash  [32]byte
+	hasUsersHash   bool
+	nextUserExpiry int64 // earliest upcoming ExpiredAt Unix timestamp among active users
+	lastBodyLen    atomic.Int64
+	legacyV2       bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
+	legacyHy       bool // fallback node_type="hysteria" when Xboard/V2Board uses "hysteria" (v2) instead of "hysteria2"
 }
 
 func NewUniProxyClient(cfg *config.Config, httpCli *http.Client) *UniProxyClient {
@@ -69,7 +71,10 @@ func (c *UniProxyClient) endpoint(action string) string {
 		nt = "hysteria"
 	}
 	c.mu.Unlock()
+	return c.endpointWithType(action, nt)
+}
 
+func (c *UniProxyClient) endpointWithType(action, nt string) string {
 	q := url.Values{}
 	q.Set("node_id", strconv.Itoa(c.cfg.NodeID))
 	q.Set("node_type", nt)
@@ -114,21 +119,27 @@ type uniConfigResp struct {
 func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) {
 	c.mu.Lock()
 	etag := c.configETag
+	alreadyLegacyV2 := c.legacyV2
+	alreadyLegacyHy := c.legacyHy
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpoint("config"), etag)
 	if err != nil && (status == 400 || status == 404 || status == 422 || status == 500) {
-		if c.nodeType == "vmess" {
-			c.mu.Lock()
-			c.legacyV2 = true
-			c.mu.Unlock()
-			body, newETag, status, err = c.doGet(ctx, c.endpoint("config"), "")
-		} else if c.nodeType == "hysteria2" {
-			// Xboard registers Hysteria v2 under `node_type=hysteria` with `"version": 2`
-			c.mu.Lock()
-			c.legacyHy = true
-			c.mu.Unlock()
-			body, newETag, status, err = c.doGet(ctx, c.endpoint("config"), "")
+		// Only latch legacyV2/legacyHy if the fallback node_type actually succeeds, so a transient HTTP 500 never poisons modern Xboard!
+		if c.nodeType == "vmess" && !alreadyLegacyV2 {
+			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", "v2ray"), ""); altErr == nil {
+				c.mu.Lock()
+				c.legacyV2 = true
+				c.mu.Unlock()
+				body, newETag, status, err = altBody, altETag, altStatus, nil
+			}
+		} else if c.nodeType == "hysteria2" && !alreadyLegacyHy {
+			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", "hysteria"), ""); altErr == nil {
+				c.mu.Lock()
+				c.legacyHy = true
+				c.mu.Unlock()
+				body, newETag, status, err = altBody, altETag, altStatus, nil
+			}
 		}
 	}
 	if errors.Is(err, ErrNotModified) {
@@ -370,10 +381,16 @@ func applyConfigProtocolOverrides(cfg *config.Config, spec *NodeSpec) {
 }
 
 func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
+	nowUnix := time.Now().Unix()
 	c.mu.Lock()
 	etag := c.usersETag
 	prevHash := c.lastUsersHash
 	hasPrevHash := c.hasUsersHash
+	if c.nextUserExpiry > 0 && nowUnix >= c.nextUserExpiry {
+		// At least one active user's wall-clock `expired_at` has arrived -> bypass ETag & hash short-circuit so they get kicked!
+		etag = ""
+		hasPrevHash = false
+	}
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpoint("user"), etag)
@@ -394,15 +411,8 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 		return nil, fmt.Errorf("decode UniProxy users: %w", err)
 	}
 
-	c.mu.Lock()
-	c.lastUsersHash = bodyHash
-	c.hasUsersHash = true
-	if newETag != "" {
-		c.usersETag = newETag
-	}
-	c.mu.Unlock()
-
-	nowUnix := time.Now().Unix()
+	nowUnix = time.Now().Unix()
+	var earliestExp int64
 	out := make([]stats.SyncUserSpec, 0, len(resp.Users))
 	for _, u := range resp.Users {
 		if u.ID <= 0 || u.UUID == "" {
@@ -411,8 +421,13 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 		if u.Banned != nil && *u.Banned != 0 {
 			continue
 		}
-		if u.ExpiredAt != nil && *u.ExpiredAt > 0 && *u.ExpiredAt <= nowUnix {
-			continue
+		if u.ExpiredAt != nil && *u.ExpiredAt > 0 {
+			if *u.ExpiredAt <= nowUnix {
+				continue
+			}
+			if earliestExp == 0 || *u.ExpiredAt < earliestExp {
+				earliestExp = *u.ExpiredAt
+			}
 		}
 		var remain int64 = -1
 		if u.TransferEnable != nil && *u.TransferEnable > 0 {
@@ -445,6 +460,14 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 			RemainBytes: remain,
 		})
 	}
+	c.mu.Lock()
+	c.lastUsersHash = bodyHash
+	c.hasUsersHash = true
+	c.nextUserExpiry = earliestExp
+	if newETag != "" {
+		c.usersETag = newETag
+	}
+	c.mu.Unlock()
 	return out, nil
 }
 

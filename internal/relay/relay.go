@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/bufpool"
@@ -46,17 +47,41 @@ func PipeBidirectional(
 	}
 
 	uploadDone := make(chan struct{})
+	var abortUpload atomic.Bool
+	var abortDownload atomic.Bool
 
 	// Upload: client -> remote (1 child goroutine)
 	go func() {
 		defer close(uploadDone)
-		copyOneWay(remoteConn, clientConn, user, nodeLim, true, idleTimeout, enableZeroCopy)
-		closeWrite(remoteConn)
+		copyOneWay(remoteConn, clientConn, user, nodeLim, true, idleTimeout, enableZeroCopy, &abortUpload)
+		if user != nil && user.IsDisabled() {
+			// User was disabled/kicked mid-stream -> immediately sever remoteConn too so download never lingers!
+			abortDownload.Store(true)
+			_ = remoteConn.Close()
+			_ = clientConn.Close()
+			return
+		}
+		if !tryHalfCloseWrite(remoteConn) {
+			abortDownload.Store(true)
+			_ = remoteConn.SetReadDeadline(time.Now())
+		}
 	}()
 
 	// Download: remote -> client (inline on current goroutine -> eliminates 1 goroutine + 4-8 KiB stack per connection!)
-	copyOneWay(clientConn, remoteConn, user, nodeLim, false, idleTimeout, enableZeroCopy)
-	closeWrite(clientConn)
+	copyOneWay(clientConn, remoteConn, user, nodeLim, false, idleTimeout, enableZeroCopy, &abortDownload)
+	if user != nil && user.IsDisabled() {
+		abortUpload.Store(true)
+		_ = clientConn.Close()
+		_ = remoteConn.Close()
+	} else if !tryHalfCloseWrite(clientConn) {
+		// Framing protocols without half-close (VMess, WS, SS) cannot notify peer via CloseWrite:
+		// atomically flag abortUpload BEFORE SetReadDeadline(now) so the upload loop can never clobber it back to +idleTimeout!
+		abortUpload.Store(true)
+		_ = clientConn.SetReadDeadline(time.Now())
+	} else {
+		// Bound half-closed client linger to at most 15s once remote has already closed.
+		_ = clientConn.SetReadDeadline(time.Now().Add(min(idleTimeout, 15*time.Second)))
+	}
 
 	<-uploadDone
 }
@@ -69,6 +94,7 @@ func copyOneWay(
 	isUpload bool,
 	idleTimeout time.Duration,
 	enableZeroCopy bool,
+	abortPeer *atomic.Bool,
 ) {
 	var userLim *limiter.Bucket
 	if user != nil {
@@ -81,12 +107,16 @@ func copyOneWay(
 	if enableZeroCopy && srcIsTCP && userLim == nil && nodeLim.IsUnlimited() {
 		if dstTCP, ok1 := unwrapTCP(dst); ok1 {
 			for {
-				if user != nil && user.IsDisabled() {
+				if (user != nil && user.IsDisabled()) || (abortPeer != nil && abortPeer.Load()) {
 					return
 				}
 				now := time.Now()
 				_ = srcTCP.SetReadDeadline(now.Add(idleTimeout))
 				_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout))
+				if abortPeer != nil && abortPeer.Load() {
+					_ = srcTCP.SetReadDeadline(now)
+					return
+				}
 				n, err := io.CopyN(dstTCP, srcTCP, spliceChunkSize)
 				if n > 0 && user != nil {
 					if isUpload {
@@ -110,7 +140,7 @@ func copyOneWay(
 	// Fast-path 2: when `src` is a raw *net.TCPConn (e.g. `remoteConn` download across all VMess/VLESS/Trojan/SS streams!),
 	// use `syscall.RawConn.Read` on Unix so `bp` is returned to `bufpool` BEFORE parking in epoll on `EAGAIN`.
 	// Active streams perform the exact same 1 `read(2)` syscall/chunk, while 4,000+ idle connections hold 0 B of heap!
-	if srcIsTCP && tryCopyFromRawTCP(dst, srcTCP, slabSize, user, nodeLim, isUpload, idleTimeout) {
+	if srcIsTCP && tryCopyFromRawTCP(dst, srcTCP, slabSize, user, nodeLim, isUpload, idleTimeout, abortPeer) {
 		return
 	}
 
@@ -119,10 +149,14 @@ func copyOneWay(
 	defer bufpool.Put(bp)
 
 	for {
-		if user != nil && user.IsDisabled() {
+		if (user != nil && user.IsDisabled()) || (abortPeer != nil && abortPeer.Load()) {
 			return
 		}
 		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		if abortPeer != nil && abortPeer.Load() {
+			_ = src.SetReadDeadline(time.Now())
+			return
+		}
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
 			if user != nil {
@@ -205,12 +239,12 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-func closeWrite(c net.Conn) {
+func tryHalfCloseWrite(c net.Conn) bool {
 	if cw, ok := c.(closeWriter); ok {
 		_ = cw.CloseWrite()
-		return
+		return true
 	}
-	_ = c.SetReadDeadline(time.Now())
+	return false
 }
 
 // PrependConn wraps a net.Conn when bytes have already been buffered/peeked during handshake or sniffing.
@@ -220,6 +254,10 @@ type PrependConn struct {
 }
 
 func (p *PrependConn) NetConn() net.Conn {
+	return p.Conn
+}
+
+func (p *PrependConn) RawWriteConn() net.Conn {
 	return p.Conn
 }
 

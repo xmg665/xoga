@@ -4,6 +4,7 @@ package relay
 
 import (
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/limiter"
@@ -18,6 +19,7 @@ func tryCopyFromRawTCP(
 	_ *limiter.Bucket,
 	_ bool,
 	_ time.Duration,
+	_ *atomic.Bool,
 ) bool {
 	return false
 }

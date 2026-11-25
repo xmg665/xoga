@@ -58,7 +58,8 @@ type UserEntry struct {
 	winBytes  atomic.Int64 // bytes accumulated during current dynamic limit tick
 	activeTCP atomic.Int32
 	disabled  atomic.Bool  // set true immediately when account expires or exceeds traffic quota
-	quotaRem  atomic.Int64 // <0: panel-polled quota; >=0: real-time remaining bytes before instant kick
+	hasQuota  atomic.Bool  // true when real-time byte quota enforcement is active
+	quotaRem  atomic.Int64 // real-time remaining bytes before instant kick when hasQuota == true
 
 	_ [64]byte
 
@@ -89,7 +90,6 @@ func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit in
 		Passwd:  uuidOrPass,
 		Limiter: limiter.NewBucketBps(speedLimitBps),
 	}
-	u.quotaRem.Store(-1)
 	u.baseSpeedBps.Store(speedLimitBps)
 	u.deviceLimit.Store(int32(deviceLimit))
 	u.tcpLimit.Store(int32(tcpLimit))
@@ -134,10 +134,12 @@ func (u *UserEntry) RefreshDualKeys(uuid, passwd string) {
 
 func (u *UserEntry) SetRemainingQuota(remainBytes int64) {
 	if remainBytes < 0 {
-		u.quotaRem.Store(-1)
+		u.hasQuota.Store(false)
+		u.quotaRem.Store(0)
 		return
 	}
 	u.quotaRem.Store(remainBytes)
+	u.hasQuota.Store(true)
 	if remainBytes == 0 {
 		u.DisableAndKick()
 	}
@@ -187,8 +189,8 @@ func (u *UserEntry) AddUpload(n int64) {
 	if n > 0 {
 		u.upBytes.Add(n)
 		u.winBytes.Add(n)
-		if u.quotaRem.Load() >= 0 {
-			if u.quotaRem.Add(-n) <= 0 {
+		if u.hasQuota.Load() {
+			if u.quotaRem.Add(-n) <= 0 && u.hasQuota.Load() {
 				u.DisableAndKick()
 			}
 		}
@@ -199,8 +201,8 @@ func (u *UserEntry) AddDownload(n int64) {
 	if n > 0 {
 		u.downBytes.Add(n)
 		u.winBytes.Add(n)
-		if u.quotaRem.Load() >= 0 {
-			if u.quotaRem.Add(-n) <= 0 {
+		if u.hasQuota.Load() {
+			if u.quotaRem.Add(-n) <= 0 && u.hasQuota.Load() {
 				u.DisableAndKick()
 			}
 		}
@@ -226,7 +228,7 @@ func (u *UserEntry) AcquireSession(clientIP netip.Addr, ipTTLSec int64, redisLim
 	if u == nil || u.disabled.Load() {
 		return 0, ErrUserDisabled
 	}
-	if rem := u.quotaRem.Load(); rem == 0 {
+	if u.hasQuota.Load() && u.quotaRem.Load() <= 0 {
 		return 0, ErrUserDisabled
 	}
 
@@ -264,6 +266,68 @@ func (u *UserEntry) AcquireSession(clientIP netip.Addr, ipTTLSec int64, redisLim
 	u.activeConns[cid] = closer
 	u.connsMu.Unlock()
 	return cid, nil
+}
+
+// AcquireMuxSession registers an outer multiplexed connection (AnyTLS / Hysteria2) for IP tracking
+// and instant DisableAndKick teardown while delegating per-stream TCP concurrency limits to AcquireSubStream.
+func (u *UserEntry) AcquireMuxSession(clientIP netip.Addr, ipTTLSec int64, redisLim *redisIPLimiter, closer io.Closer) (uint64, error) {
+	if u == nil || u.disabled.Load() {
+		return 0, ErrUserDisabled
+	}
+	if u.hasQuota.Load() && u.quotaRem.Load() <= 0 {
+		return 0, ErrUserDisabled
+	}
+	if err := u.checkAndTouchIP(clientIP, ipTTLSec, redisLim); err != nil {
+		return 0, err
+	}
+	if closer == nil {
+		return 0, nil
+	}
+	cid := u.nextConnID.Add(1)
+	u.connsMu.Lock()
+	if u.disabled.Load() {
+		u.connsMu.Unlock()
+		_ = closer.Close()
+		return 0, ErrUserDisabled
+	}
+	if u.activeConns == nil {
+		u.activeConns = make(map[uint64]io.Closer, 4)
+	}
+	u.activeConns[cid] = closer
+	u.connsMu.Unlock()
+	return cid, nil
+}
+
+func (u *UserEntry) ReleaseMuxSession(connID uint64) {
+	if u != nil && connID > 0 {
+		u.connsMu.Lock()
+		if u.activeConns != nil {
+			delete(u.activeConns, connID)
+		}
+		u.connsMu.Unlock()
+	}
+}
+
+func (u *UserEntry) AcquireSubStream() error {
+	if u == nil || u.disabled.Load() {
+		return ErrUserDisabled
+	}
+	maxTCP := u.tcpLimit.Load()
+	if maxTCP > 0 {
+		if u.activeTCP.Add(1) > maxTCP {
+			u.activeTCP.Add(-1)
+			return ErrTCPLimit
+		}
+	} else {
+		u.activeTCP.Add(1)
+	}
+	return nil
+}
+
+func (u *UserEntry) ReleaseSubStream() {
+	if u != nil {
+		u.activeTCP.Add(-1)
+	}
 }
 
 func (u *UserEntry) ReleaseConn() {
@@ -463,21 +527,30 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 		_, dyWhite := t.cfg.DyLimitWhiteUserIDs[sp.ID]
 
 		if existing, ok := t.users[sp.ID]; ok {
-			existing.Reenable()
+			wasDisabled := existing.IsDisabled()
 			prevUUID, prevPass := existing.UUID, existing.Passwd
 			if sp.AltPasswd != "" {
 				existing.RefreshDualKeys(sp.UUIDOrPass, sp.AltPasswd)
 			} else if existing.UUID != sp.UUIDOrPass {
 				existing.RefreshKeys(sp.UUIDOrPass)
 			}
-			if existing.UUID != prevUUID || existing.Passwd != prevPass {
-				updated++
-			}
 			existing.UpdateLimits(effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
 			if sp.RemainBytes > 0 {
-				existing.SetRemainingQuota(sp.RemainBytes)
+				// Subtract local unpushed bytes so a pull running before PushTraffic never re-enables an over-quota user!
+				unpushed := existing.upBytes.Load() + existing.downBytes.Load()
+				rem := sp.RemainBytes - unpushed
+				if rem <= 0 {
+					existing.SetRemainingQuota(0)
+				} else {
+					existing.Reenable()
+					existing.SetRemainingQuota(rem)
+				}
 			} else {
+				existing.Reenable()
 				existing.SetRemainingQuota(-1)
+			}
+			if existing.UUID != prevUUID || existing.Passwd != prevPass || wasDisabled != existing.IsDisabled() {
+				updated++
 			}
 			entries = append(entries, existing)
 		} else {
@@ -769,7 +842,8 @@ func (r *redisIPLimiter) execPipelineLocked(userID int, ip string, maxIPs int, e
 	if _, err := readRESPLine(r.br); err != nil {
 		return true, err
 	}
-	if _, err := readRESPLine(r.br); err != nil {
+	zaddLine, err := readRESPLine(r.br)
+	if err != nil {
 		return true, err
 	}
 	cardLine, err := readRESPLine(r.br)
@@ -782,6 +856,15 @@ func (r *redisIPLimiter) execPipelineLocked(userID int, ip string, maxIPs int, e
 	if strings.HasPrefix(cardLine, ":") {
 		cnt, _ := strconv.Atoi(strings.TrimSpace(cardLine[1:]))
 		if cnt > maxIPs {
+			// Remove newly inserted rejected IP immediately so it never pollutes the ZSET or locks out valid devices!
+			if strings.TrimSpace(zaddLine) == ":1" {
+				if _, werr := writeRESP(r.conn, "ZREM", key, ip); werr != nil {
+					return false, werr
+				}
+				if _, rerr := readRESPLine(r.br); rerr != nil {
+					return false, rerr
+				}
+			}
 			return false, nil
 		}
 	}
@@ -819,7 +902,7 @@ func readRESPLine(br *bufio.Reader) (string, error) {
 		n, _ := strconv.Atoi(strings.TrimSpace(line[1:]))
 		if n >= 0 {
 			buf := make([]byte, n+2)
-			_, err = br.Read(buf)
+			_, err = io.ReadFull(br, buf)
 			return string(buf[:n]), err
 		}
 	}

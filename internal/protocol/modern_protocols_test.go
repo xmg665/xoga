@@ -561,3 +561,169 @@ func TestVLESSVisionAndRealityBuilder(t *testing.T) {
 		t.Fatalf("vision echoed %q, want %q", gotContent, msg)
 	}
 }
+
+func TestWSSVLESSAndVisionZeroPadNoDeadlock(t *testing.T) {
+	echoTCP, _ := startEchoTCPAndUDP(t)
+
+	// 1. Regression test for WSS (WS + TLS): verify wsConn never bypasses *tls.Conn encryption on Write!
+	wssPort := freeLocalPort(t, "tcp")
+	cfg := config.Default()
+	cfg.ListenIP = "127.0.0.1"
+	cfg.ListenPort = wssPort
+	cfg.CertMode = "self"
+
+	tr := stats.NewTracker(cfg)
+	uuidStr := "b831381d-6324-4d53-ad4f-8cda48b30811"
+	users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{
+		{ID: 21, UUIDOrPass: uuidStr, RemainBytes: -1},
+	})
+
+	wssSpec := &panel.NodeSpec{
+		Protocol:   "vless",
+		ListenIP:   "127.0.0.1",
+		ServerPort: wssPort,
+		Network:    "ws",
+		WSPath:     "/wss-test",
+		TLSMode:    1,
+		ServerName: "localhost",
+	}
+	aclEng := acl.NewEngine(false, "", "", "", nil)
+	wssSrv, err := NewServer(cfg, wssSpec, tr, BuildUserIndexForProtocol("vless", users, 0), aclEng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wssSrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer wssSrv.Close()
+
+	tlsCli, err := tls.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(wssPort)), &tls.Config{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("tls dial WSS failed: %v", err)
+	}
+	defer tlsCli.Close()
+
+	// Perform RFC 6455 client upgrade over TLS
+	upgradeReq := "GET /wss-test HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	if _, err := tlsCli.Write([]byte(upgradeReq)); err != nil {
+		t.Fatal(err)
+	}
+	_ = tlsCli.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var respBuf [512]byte
+	rn, err := tlsCli.Read(respBuf[:])
+	if err != nil || !bytes.Contains(respBuf[:rn], []byte("101 Switching Protocols")) {
+		t.Fatalf("WSS upgrade failed: err=%v resp=%q", err, respBuf[:rn])
+	}
+
+	// Send masked client WS binary frame containing VLESS TCP request + payload
+	var vlessPayload bytes.Buffer
+	vlessPayload.WriteByte(0x00)
+	vlessPayload.Write(users[0].UUIDBytes[:])
+	vlessPayload.WriteByte(0x00)
+	vlessPayload.WriteByte(0x01)
+	_ = binary.Write(&vlessPayload, binary.BigEndian, echoTCP)
+	vlessPayload.WriteByte(0x01)
+	vlessPayload.Write([]byte{127, 0, 0, 1})
+	wantWSS := []byte("hello-over-encrypted-wss")
+	vlessPayload.Write(wantWSS)
+
+	rawFrame := vlessPayload.Bytes()
+	wsFrame := []byte{0x82, 0x80 | byte(len(rawFrame)), 0x11, 0x22, 0x33, 0x44}
+	for i, b := range rawFrame {
+		wsFrame = append(wsFrame, b^wsFrame[2+(i&3)])
+	}
+	if _, err := tlsCli.Write(wsFrame); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read server WS frame over TLS (previously failed with `tls: bad record MAC` when unwrapRawWriter bypassed TLS!)
+	var wsHdr [2]byte
+	if _, err := io.ReadFull(tlsCli, wsHdr[:]); err != nil {
+		t.Fatalf("read WSS server frame over TLS failed: %v", err)
+	}
+	frameLen := int(wsHdr[1] & 0x7F)
+	frameBody := make([]byte, frameLen)
+	if _, err := io.ReadFull(tlsCli, frameBody); err != nil {
+		t.Fatalf("read WSS server payload failed: %v", err)
+	}
+	if frameLen < 2 || !bytes.Equal(frameBody[2:], wantWSS) {
+		t.Fatalf("WSS echoed %q, want %q", frameBody, wantWSS)
+	}
+
+	// 2. Regression test for Vision `visionCmdContinue` with `padLen == 0`: must NOT deadlock waiting for next block!
+	visPort := freeLocalPort(t, "tcp")
+	cfgVis := config.Default()
+	cfgVis.ListenIP = "127.0.0.1"
+	cfgVis.ListenPort = visPort
+	visSpec := &panel.NodeSpec{
+		Protocol:   "vless",
+		ListenIP:   "127.0.0.1",
+		ServerPort: visPort,
+		Network:    "tcp",
+		Flow:       FlowVision,
+	}
+	visSrv, err := NewServer(cfgVis, visSpec, tr, BuildUserIndexForProtocol("vless", users, 0), aclEng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visSrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer visSrv.Close()
+
+	vc, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(visPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vc.Close()
+
+	addon := append([]byte{0x0a, byte(len(FlowVision))}, []byte(FlowVision)...)
+	var firstFlight bytes.Buffer
+	firstFlight.WriteByte(0x00)
+	firstFlight.Write(users[0].UUIDBytes[:])
+	firstFlight.WriteByte(byte(len(addon)))
+	firstFlight.Write(addon)
+	firstFlight.WriteByte(0x01)
+	_ = binary.Write(&firstFlight, binary.BigEndian, echoTCP)
+	firstFlight.WriteByte(0x01)
+	firstFlight.Write([]byte{127, 0, 0, 1})
+
+	// Vision Block 1: cmd=Continue(0), padLen=0! Client waits for server reply BEFORE sending Block 2!
+	flight1Msg := []byte("vision-zero-pad-continue-flight1")
+	firstFlight.Write(users[0].UUIDBytes[:])
+	firstFlight.WriteByte(visionCmdContinue)
+	_ = binary.Write(&firstFlight, binary.BigEndian, uint16(len(flight1Msg)))
+	_ = binary.Write(&firstFlight, binary.BigEndian, uint16(0)) // padLen == 0!
+	firstFlight.Write(flight1Msg)
+
+	start := time.Now()
+	if _, err := vc.Write(firstFlight.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	_ = vc.SetReadDeadline(time.Now().Add(1 * time.Second))
+	var vResp [2]byte
+	if _, err := io.ReadFull(vc, vResp[:]); err != nil {
+		t.Fatalf("vision zero-pad Continue deadlocked or failed: %v", err)
+	}
+	var vHdr [21]byte
+	if _, err := io.ReadFull(vc, vHdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	cLen := int(binary.BigEndian.Uint16(vHdr[17:19]))
+	pLen := int(binary.BigEndian.Uint16(vHdr[19:21]))
+	got1 := make([]byte, cLen)
+	if _, err := io.ReadFull(vc, got1); err != nil {
+		t.Fatal(err)
+	}
+	if pLen > 0 {
+		_, _ = io.CopyN(io.Discard, vc, int64(pLen))
+	}
+	if !bytes.Equal(got1, flight1Msg) {
+		t.Fatalf("vision flight1 echoed %q, want %q", got1, flight1Msg)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("vision zero-pad Continue stalled for %v", elapsed)
+	}
+}

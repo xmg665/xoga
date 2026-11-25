@@ -361,8 +361,8 @@ func (s *Server) Start() error {
 	s.wg.Add(1)
 	go s.acceptLoop()
 
-	// Start native UDP listener when running Shadowsocks over raw network
-	if s.spec.Protocol == "shadowsocks" && s.spec.Network != "ws" && !needTLS && !needReality {
+	// Start native UDP listener when running classic AEAD Shadowsocks over raw network
+	if s.spec.Protocol == "shadowsocks" && !s.ssSpec.is2022 && s.spec.Network != "ws" && !needTLS && !needReality {
 		udpConn, err := net.ListenPacket("udp", addr)
 		if err != nil {
 			logger.Warnf("Shadowsocks UDP listen %s failed (TCP still active): %v", addr, err)

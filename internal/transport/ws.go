@@ -26,8 +26,10 @@ func unwrapRawWriter(c net.Conn) io.Writer {
 		if tc, ok := cur.(*net.TCPConn); ok {
 			return tc
 		}
-		if w, ok := cur.(interface{ NetConn() net.Conn }); ok {
-			next := w.NetConn()
+		// Only unwrap transparent write pass-through wrappers (e.g. proxyProtoConn / PrependConn),
+		// NEVER *tls.Conn or *reality.Conn (which also implement NetConn() but must encrypt writes!).
+		if w, ok := cur.(interface{ RawWriteConn() net.Conn }); ok {
+			next := w.RawWriteConn()
 			if next != nil && next != cur {
 				cur = next
 				continue
@@ -38,13 +40,33 @@ func unwrapRawWriter(c net.Conn) io.Writer {
 	return c
 }
 
+func readLimitedWSLine(br *bufio.Reader, maxLen int) (string, error) {
+	var buf []byte
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if err != nil {
+			return "", err
+		}
+		if len(buf)+len(frag) > maxLen {
+			return "", errors.New("websocket HTTP header line too long")
+		}
+		if !isPrefix && len(buf) == 0 {
+			return string(frag), nil
+		}
+		buf = append(buf, frag...)
+		if !isPrefix {
+			return string(buf), nil
+		}
+	}
+}
+
 // AcceptWebSocket performs a zero-dependency RFC 6455 HTTP Upgrade handshake, supports
 // Xray/Sing-box `Sec-WebSocket-Protocol` base64url Early Data (`?ed=2048`), and extracts
 // real client IPs from CDN/reverse-proxy headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`).
 func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 	br := wsReaderPool.Get().(*bufio.Reader)
 	br.Reset(c)
-	reqLine, err := br.ReadString('\n')
+	reqLine, err := readLimitedWSLine(br, 4096)
 	if err != nil {
 		br.Reset(nil)
 		wsReaderPool.Put(br)
@@ -75,14 +97,25 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 	}
 
 	var wsKey, wsProto, realIPStr string
-	for {
-		line, err := br.ReadString('\n')
+	headerBytes := 0
+	for lineCount := 0; ; lineCount++ {
+		if lineCount >= 64 {
+			br.Reset(nil)
+			wsReaderPool.Put(br)
+			return nil, errors.New("too many websocket HTTP headers")
+		}
+		line, err := readLimitedWSLine(br, 8192)
 		if err != nil {
 			br.Reset(nil)
 			wsReaderPool.Put(br)
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
+		headerBytes += len(line)
+		if headerBytes > 32768 {
+			br.Reset(nil)
+			wsReaderPool.Put(br)
+			return nil, errors.New("websocket HTTP headers too large")
+		}
 		if line == "" {
 			break
 		}
@@ -263,6 +296,10 @@ func (w *wsConn) Read(p []byte) (int, error) {
 			}
 		}
 
+		if opcode >= 0x8 && payLen > 125 {
+			return 0, errors.New("websocket control frame exceeds 125 bytes")
+		}
+
 		var mkey [4]byte
 		if masked {
 			if _, err := io.ReadFull(w.br, mkey[:]); err != nil {
@@ -279,7 +316,8 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		case 0x8: // close
 			return 0, io.EOF
 		case 0x9: // ping -> reply pong
-			pingData := make([]byte, payLen)
+			var pingBuf [125]byte
+			pingData := pingBuf[:payLen]
 			if _, err := io.ReadFull(w.br, pingData); err != nil {
 				return 0, err
 			}
@@ -291,11 +329,15 @@ func (w *wsConn) Read(p []byte) (int, error) {
 			_ = w.writeControlFrame(0xA, pingData)
 		case 0xA: // pong -> discard
 			if payLen > 0 {
-				_, _ = io.CopyN(io.Discard, w.br, payLen)
+				if _, err := io.CopyN(io.Discard, w.br, payLen); err != nil {
+					return 0, err
+				}
 			}
 		default:
 			if payLen > 0 {
-				_, _ = io.CopyN(io.Discard, w.br, payLen)
+				if _, err := io.CopyN(io.Discard, w.br, payLen); err != nil {
+					return 0, err
+				}
 			}
 		}
 	}

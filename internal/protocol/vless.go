@@ -147,12 +147,28 @@ func (v *vlessRespConn) Write(p []byte) (int, error) {
 	v.mu.Lock()
 	if !v.sentResp {
 		v.sentResp = true
+		if _, isTCP := v.Conn.(*net.TCPConn); isTCP {
+			hdr := [2]byte{0x00, 0x00}
+			bufs := net.Buffers{hdr[:], p}
+			n, err := bufs.WriteTo(v.Conn)
+			v.mu.Unlock()
+			if n >= 2 {
+				return int(n - 2), err
+			}
+			return 0, err
+		}
+		// Coalesce 2-byte VLESS header + first payload into one Write for TLS / WS / REALITY
+		// so they emit 1 single encrypted TLS record / WS frame instead of a fingerprintable 2-byte frame!
+		bp := bufpool.Get(2 + len(p))
+		combined := (*bp)[:2+len(p)]
+		combined[0] = 0x00
+		combined[1] = 0x00
+		copy(combined[2:], p)
+		n, err := v.Conn.Write(combined)
+		bufpool.Put(bp)
 		v.mu.Unlock()
-		hdr := [2]byte{0x00, 0x00}
-		bufs := net.Buffers{hdr[:], p}
-		n, err := bufs.WriteTo(v.Conn)
 		if n >= 2 {
-			return int(n - 2), err
+			return n - 2, err
 		}
 		return 0, err
 	}
