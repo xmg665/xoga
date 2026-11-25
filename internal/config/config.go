@@ -93,11 +93,12 @@ type Config struct {
 	DNSConfigPath string
 
 	// CPU & Memory optimization settings (xoga enhancements)
-	EnableZeroCopy bool // Linux splice(2) kernel zero-copy when unthrottled
-	MemLimitMB     int  // Soft GOMEMLIMIT in MiB (0 = auto 128 MiB)
-	GCPercent      int  // Go GOGC target percentage (default 50 for low RSS)
-	ConnIdleSec    int  // Idle TCP stream timeout in seconds (default 300)
-	UDPIdleSec     int  // Idle UDP session timeout in seconds (default 60)
+	EnableZeroCopy bool   // Linux splice(2) kernel zero-copy when unthrottled
+	MemLimitMB     int    // Soft GOMEMLIMIT in MiB (0 = auto 512 MiB)
+	GCPercent      int    // Go GOGC target percentage
+	ConnIdleSec    int    // Idle TCP stream timeout in seconds (default 300)
+	UDPIdleSec     int    // Idle UDP session timeout in seconds (default 60)
+	PprofAddr      string // Optional localhost pprof address (e.g. 127.0.0.1:16060)
 
 	// Raw key-value preservation for `xoga config` editing
 	RawPath string
@@ -122,9 +123,9 @@ func Default() *Config {
 		DomainSniff:         true,
 		LogLevel:            "info",
 		EnableZeroCopy:      true,
-		MemLimitMB:          512,
-		GCPercent:           80,
-		ConnIdleSec:         300,
+		MemLimitMB:          0,
+		GCPercent:           100,
+		ConnIdleSec:         120,
 		UDPIdleSec:          60,
 	}
 }
@@ -289,8 +290,8 @@ func (c *Config) ApplyKV(key, val string) {
 		c.VLESSFlow = strings.TrimSpace(val)
 	case "v2ray_reduce_memory":
 		c.V2rayReduceMemory = parseBool(val, false)
-		if c.V2rayReduceMemory && c.GCPercent == 80 {
-			c.GCPercent = 65
+		if c.V2rayReduceMemory && c.GCPercent == 100 {
+			c.GCPercent = 80
 		}
 	case "dns_cache_time":
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
@@ -344,6 +345,8 @@ func (c *Config) ApplyKV(key, val string) {
 		if n, err := strconv.Atoi(val); err == nil && n >= 10 {
 			c.UDPIdleSec = n
 		}
+	case "pprof_addr":
+		c.PprofAddr = strings.TrimSpace(val)
 	case "forward_extra_port_enable", "dns_cache_enable", "tunnel_enable", "force_proxy_protocol":
 		// Accepted for 100% compatibility with soga.conf / Docker env vars
 	}
@@ -658,9 +661,9 @@ log_level=info
 
 # ==================== CPU & 内存深度优化配置 ====================
 enable_zero_copy=true
-mem_limit_mb=128
-gc_percent=50
-conn_idle_sec=300
+mem_limit_mb=0
+gc_percent=100
+conn_idle_sec=120
 udp_idle_sec=60
 `
 }

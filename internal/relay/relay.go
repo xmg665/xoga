@@ -104,8 +104,13 @@ func copyOneWay(
 		}
 	}
 
-	// Pooled 32 KiB slab buffer path (zero heap allocation per stream)
-	bp := bufpool.Get(bufpool.LargeSize)
+	// Asymmetric pooled slab buffer (4 KiB upload / 16 KiB download matching TLS & VMess 16 KiB max record size):
+	// cuts pinned idle heap across 5,000+ concurrent streams from 320 MiB down to ~100 MiB!
+	slabSize := bufpool.MediumSize
+	if isUpload {
+		slabSize = bufpool.UploadSize
+	}
+	bp := bufpool.Get(slabSize)
 	buf := *bp
 	defer bufpool.Put(bp)
 

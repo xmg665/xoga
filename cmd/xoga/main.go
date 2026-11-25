@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -60,6 +62,12 @@ func runDaemon(args []string) int {
 		return 1
 	}
 	logger.SetLevel(logger.ParseLevel(cfg.LogLevel))
+	if cfg.PprofAddr != "" {
+		go func() {
+			logger.Infof("Starting pprof diagnostic server on %s", cfg.PprofAddr)
+			_ = http.ListenAndServe(cfg.PprofAddr, nil)
+		}()
+	}
 
 	agent, err := daemon.NewAgent(cfg)
 	if err != nil {

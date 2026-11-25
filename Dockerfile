@@ -6,7 +6,7 @@ RUN go mod download
 
 COPY . .
 ARG TARGETARCH=amd64
-ARG VERSION=1.2.3
+ARG VERSION=1.2.4
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -trimpath \
     -ldflags="-s -w -X github.com/xmg665/xoga/internal/version.Version=${VERSION}" \

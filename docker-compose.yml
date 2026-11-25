@@ -19,7 +19,6 @@ services:
       - webapi_key=your_panel_key
       - proxy_protocol=true
       - v2ray_reduce_memory=true
-      - mem_limit_mb=512
     volumes:
       # 既可挂载到 /etc/xoga/routes.toml，也完全兼容原 soga 的 /etc/soga/routes.toml 路径
       - ./configs/routes.toml:/etc/xoga/routes.toml:ro
