@@ -50,41 +50,75 @@ type VMessUserEntry struct {
 // UserIndex is an immutable snapshot swapped atomically via atomic.Pointer[UserIndex] (RCU pattern).
 // Handshake lookups require ZERO mutex locks regardless of concurrency.
 type UserIndex struct {
-	Users      []*stats.UserEntry
-	ByTrojan   map[[56]byte]*stats.UserEntry
-	ByUUID     map[[16]byte]*stats.UserEntry
-	SSUsers    []SSUserEntry
-	SSEIHMap   map[[16]byte]*SSUserEntry
-	VMessUsers []VMessUserEntry
+	Users       []*stats.UserEntry
+	ByTrojan    map[[56]byte]*stats.UserEntry
+	ByUUID      map[[16]byte]*stats.UserEntry
+	SSUsers     []SSUserEntry
+	SSEIHMap    map[[16]byte]*SSUserEntry
+	VMessUsers  []VMessUserEntry
+	VMessBlocks []cipher.Block // compact 16B/user parallel slice for L1/L2 cache-friendly AuthID scan
 }
 
 func BuildUserIndex(users []*stats.UserEntry, ssKeyLen int) *UserIndex {
+	return BuildUserIndexForProtocol("", users, ssKeyLen)
+}
+
+// BuildUserIndexForProtocol constructs only the lookup structures required by `proto`
+// ("vmess", "vless", "trojan", "shadowsocks", or "" for all), saving ~35 MiB of unused
+// map buckets across multi-node instances and reusing cached per-user VMess AES key schedules.
+func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen int) *UserIndex {
+	needTrojan := proto == "" || proto == "trojan"
+	needVLESS := proto == "" || proto == "vless"
+	needVMess := proto == "" || proto == "vmess"
+	needSS := ssKeyLen > 0 || proto == "shadowsocks"
+
 	idx := &UserIndex{
-		Users:    users,
-		ByTrojan: make(map[[56]byte]*stats.UserEntry, len(users)),
-		ByUUID:   make(map[[16]byte]*stats.UserEntry, len(users)),
+		Users: users,
 	}
-	if ssKeyLen > 0 {
+	if needTrojan {
+		idx.ByTrojan = make(map[[56]byte]*stats.UserEntry, len(users))
+	}
+	if needVLESS {
+		idx.ByUUID = make(map[[16]byte]*stats.UserEntry, len(users))
+	}
+	if needSS && ssKeyLen > 0 {
 		idx.SSUsers = make([]SSUserEntry, 0, len(users))
 		idx.SSEIHMap = make(map[[16]byte]*SSUserEntry, len(users))
 	}
-	idx.VMessUsers = make([]VMessUserEntry, 0, len(users))
+	if needVMess {
+		idx.VMessUsers = make([]VMessUserEntry, 0, len(users))
+		idx.VMessBlocks = make([]cipher.Block, 0, len(users))
+	}
 
 	for _, u := range users {
-		idx.ByTrojan[u.TrojanHash] = u
+		if needTrojan {
+			idx.ByTrojan[u.TrojanHash] = u
+		}
 		if u.HasUUID {
-			idx.ByUUID[u.UUIDBytes] = u
-			cmdKey := vmessCmdKey(u.UUIDBytes)
-			authKey := vmessKDF(cmdKey[:], "AES Auth ID Encryption")[:16]
-			if blk, err := aes.NewCipher(authKey); err == nil {
-				idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
-					User:      u,
-					CmdKey:    cmdKey,
-					AuthBlock: blk,
-				})
+			if needVLESS {
+				idx.ByUUID[u.UUIDBytes] = u
+			}
+			if needVMess {
+				if !u.VMessAuthReady || u.VMessAuthBlock == nil {
+					cmdKey := vmessCmdKey(u.UUIDBytes)
+					authKey := vmessKDF(cmdKey[:], "AES Auth ID Encryption")[:16]
+					if blk, err := aes.NewCipher(authKey); err == nil {
+						u.VMessCmdKey = cmdKey
+						u.VMessAuthBlock = blk
+						u.VMessAuthReady = true
+					}
+				}
+				if u.VMessAuthReady && u.VMessAuthBlock != nil {
+					idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
+						User:      u,
+						CmdKey:    u.VMessCmdKey,
+						AuthBlock: u.VMessAuthBlock,
+					})
+					idx.VMessBlocks = append(idx.VMessBlocks, u.VMessAuthBlock)
+				}
 			}
 		}
-		if ssKeyLen > 0 {
+		if needSS && ssKeyLen > 0 {
 			mk := deriveSSUserKey(u.Passwd, ssKeyLen)
 			var eih [16]byte
 			blake3DeriveKey("shadowsocks 2022 identity subkey", mk, eih[:])

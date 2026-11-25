@@ -4,7 +4,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"sync"
 	"time"
 
 	"github.com/xmg665/xoga/internal/bufpool"
@@ -16,8 +15,8 @@ const spliceChunkSize = 4 * 1024 * 1024 // 4 MiB kernel splice window for live t
 
 // PipeBidirectional relays data between clientConn and remoteConn with:
 // 1. Linux kernel splice(2) zero-copy fast-path when both ends are raw *net.TCPConn and unthrottled.
-// 2. Pooled 32 KiB slab buffers (zero heap allocs per stream) for TLS/AEAD/WS or rate-limited streams.
-// 3. Half-close propagation and idle timeout enforcement to prevent goroutine/FD leaks.
+// 2. Zero-buffer idle epoll polling on *net.TCPConn (`copyFromRawTCP`) so thousands of idle streams hold 0 B of heap.
+// 3. 2 goroutines per stream instead of 3 (download runs inline on caller goroutine, cutting goroutine count & stack RAM by 33%).
 func PipeBidirectional(
 	clientConn net.Conn,
 	remoteConn net.Conn,
@@ -46,24 +45,20 @@ func PipeBidirectional(
 		}
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	uploadDone := make(chan struct{})
 
-	// Upload: client -> remote
+	// Upload: client -> remote (1 child goroutine)
 	go func() {
-		defer wg.Done()
+		defer close(uploadDone)
 		copyOneWay(remoteConn, clientConn, user, nodeLim, true, idleTimeout, enableZeroCopy)
 		closeWrite(remoteConn)
 	}()
 
-	// Download: remote -> client
-	go func() {
-		defer wg.Done()
-		copyOneWay(clientConn, remoteConn, user, nodeLim, false, idleTimeout, enableZeroCopy)
-		closeWrite(clientConn)
-	}()
+	// Download: remote -> client (inline on current goroutine -> eliminates 1 goroutine + 4-8 KiB stack per connection!)
+	copyOneWay(clientConn, remoteConn, user, nodeLim, false, idleTimeout, enableZeroCopy)
+	closeWrite(clientConn)
 
-	wg.Wait()
+	<-uploadDone
 }
 
 func copyOneWay(
@@ -80,36 +75,42 @@ func copyOneWay(
 		userLim = user.EffectiveLimiter()
 	}
 
-	// Fast-path: kernel splice(2) on Linux when both ends are raw *net.TCPConn and no token-bucket throttle is active.
-	if enableZeroCopy && userLim == nil && nodeLim.IsUnlimited() {
+	srcTCP, srcIsTCP := unwrapTCP(src)
+
+	// Fast-path 1: kernel splice(2) on Linux when both ends are raw *net.TCPConn and no token-bucket throttle is active.
+	if enableZeroCopy && srcIsTCP && userLim == nil && nodeLim.IsUnlimited() {
 		if dstTCP, ok1 := unwrapTCP(dst); ok1 {
-			if srcTCP, ok2 := unwrapTCP(src); ok2 {
-				for {
-					now := time.Now()
-					_ = srcTCP.SetReadDeadline(now.Add(idleTimeout))
-					_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout))
-					n, err := io.CopyN(dstTCP, srcTCP, spliceChunkSize)
-					if n > 0 && user != nil {
-						if isUpload {
-							user.AddUpload(n)
-						} else {
-							user.AddDownload(n)
-						}
+			for {
+				now := time.Now()
+				_ = srcTCP.SetReadDeadline(now.Add(idleTimeout))
+				_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout))
+				n, err := io.CopyN(dstTCP, srcTCP, spliceChunkSize)
+				if n > 0 && user != nil {
+					if isUpload {
+						user.AddUpload(n)
+					} else {
+						user.AddDownload(n)
 					}
-					if err != nil {
-						return
-					}
+				}
+				if err != nil {
+					return
 				}
 			}
 		}
 	}
 
-	// Asymmetric pooled slab buffer (4 KiB upload / 16 KiB download matching TLS & VMess 16 KiB max record size):
-	// cuts pinned idle heap across 5,000+ concurrent streams from 320 MiB down to ~100 MiB!
 	slabSize := bufpool.MediumSize
 	if isUpload {
 		slabSize = bufpool.UploadSize
 	}
+
+	// Fast-path 2: when `src` is a raw *net.TCPConn (e.g. `remoteConn` download across all VMess/VLESS/Trojan/SS streams!),
+	// use `syscall.RawConn.Read` on Unix so `bp` is returned to `bufpool` BEFORE parking in epoll on `EAGAIN`.
+	// Active streams perform the exact same 1 `read(2)` syscall/chunk, while 4,000+ idle connections hold 0 B of heap!
+	if srcIsTCP && tryCopyFromRawTCP(dst, srcTCP, slabSize, user, nodeLim, isUpload, idleTimeout) {
+		return
+	}
+
 	bp := bufpool.Get(slabSize)
 	buf := *bp
 	defer bufpool.Put(bp)

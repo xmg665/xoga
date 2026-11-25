@@ -1,15 +1,17 @@
-FROM golang:1.27-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=1.2.4
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+ARG VERSION=1.2.5
+RUN VER="${VERSION#v}" && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath \
-    -ldflags="-s -w -X github.com/xmg665/xoga/internal/version.Version=${VERSION}" \
+    -ldflags="-s -w -X github.com/xmg665/xoga/internal/version.Version=${VER}" \
     -o /out/xoga ./cmd/xoga
 
 FROM alpine:3.21

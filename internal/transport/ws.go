@@ -371,6 +371,49 @@ func (w *wsConn) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// WritePrependWSFrame writes the RFC 6455 binary frame header directly into `buf[payloadOffset-hdrLen:payloadOffset]`
+// (caller guarantees `payloadOffset >= 10`) and flushes the contiguous slice in a single `write(2)` syscall
+// with zero `net.Buffers` heap escapes or scatter-gather `iovec` overhead.
+func (w *wsConn) WritePrependWSFrame(buf []byte, payloadOffset int) error {
+	n := len(buf) - payloadOffset
+	if n <= 0 {
+		return nil
+	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	var hdrStart int
+	switch {
+	case n < 126:
+		hdrStart = payloadOffset - 2
+		buf[hdrStart] = 0x82
+		buf[hdrStart+1] = byte(n)
+	case n <= 65535:
+		hdrStart = payloadOffset - 4
+		buf[hdrStart] = 0x82
+		buf[hdrStart+1] = 126
+		binary.BigEndian.PutUint16(buf[hdrStart+2:payloadOffset], uint16(n))
+	default:
+		hdrStart = payloadOffset - 10
+		buf[hdrStart] = 0x82
+		buf[hdrStart+1] = 127
+		binary.BigEndian.PutUint64(buf[hdrStart+2:payloadOffset], uint64(n))
+	}
+
+	frame := buf[hdrStart:]
+	for len(frame) > 0 {
+		nw, err := w.rawWriter.Write(frame)
+		if err != nil {
+			return err
+		}
+		if nw <= 0 {
+			return io.ErrShortWrite
+		}
+		frame = frame[nw:]
+	}
+	return nil
+}
+
 func (w *wsConn) writeControlFrame(opcode byte, payload []byte) error {
 	if len(payload) > 125 {
 		payload = payload[:125]

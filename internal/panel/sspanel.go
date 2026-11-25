@@ -37,11 +37,14 @@ type SSPanelClient struct {
 	http    *http.Client
 	baseURL string
 
-	mu        sync.Mutex
-	nodeETag  string
-	usersETag string
-	nodeSpeed float64
-	nodeConn  int
+	mu            sync.Mutex
+	nodeETag      string
+	usersETag     string
+	lastUsersHash [32]byte
+	hasUsersHash  bool
+	lastUsersLen  int
+	nodeSpeed     float64
+	nodeConn      int
 }
 
 func NewSSPanelClient(cfg *config.Config, httpCli *http.Client) *SSPanelClient {
@@ -344,6 +347,8 @@ func parseAnyFloat(v any) float64 {
 func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
 	c.mu.Lock()
 	etag := c.usersETag
+	prevHash := c.lastUsersHash
+	hasPrevHash := c.hasUsersHash
 	nodeSpeed := c.nodeSpeed
 	nodeConn := c.nodeConn
 	c.mu.Unlock()
@@ -357,6 +362,13 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 		return nil, fmt.Errorf("fetch SSPanel users (HTTP %d): %w", status, err)
 	}
 
+	// Fast body-hash short-circuit: SSPanel PHP endpoints rarely emit HTTP `ETag`,
+	// so comparing SHA-256 skips `json.Unmarshal` (5,000+ structs) & `ReconcileUsers` when unchanged!
+	bodyHash := sha256.Sum256(body)
+	if hasPrevHash && bodyHash == prevHash {
+		return nil, ErrNotModified
+	}
+
 	var resp sspanelUsersResp
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("decode SSPanel users: %w", err)
@@ -364,11 +376,13 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	if resp.Ret != 1 {
 		return nil, fmt.Errorf("SSPanel users returned ret=%d", resp.Ret)
 	}
+	c.mu.Lock()
+	c.lastUsersHash = bodyHash
+	c.hasUsersHash = true
 	if newETag != "" {
-		c.mu.Lock()
 		c.usersETag = newETag
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 
 	needUUID := c.cfg.NormalizedServerType() == "vless" || c.cfg.NormalizedServerType() == "vmess"
 	out := make([]stats.SyncUserSpec, 0, len(resp.Data))
@@ -476,7 +490,7 @@ func (c *SSPanelClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) 
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, ifNoneMatch, http.StatusNotModified, ErrNotModified
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	body, err := readResponseBody(resp, &c.lastUsersLen)
 	if err != nil {
 		return nil, "", resp.StatusCode, err
 	}
@@ -484,6 +498,34 @@ func (c *SSPanelClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) 
 		return nil, "", resp.StatusCode, fmt.Errorf("status %d: %s", resp.StatusCode, truncateMsg(body))
 	}
 	return body, resp.Header.Get("ETag"), resp.StatusCode, nil
+}
+
+func readResponseBody(resp *http.Response, sizeHint *int) ([]byte, error) {
+	const maxBody = 32 * 1024 * 1024
+	lr := io.LimitReader(resp.Body, maxBody)
+	initCap := 0
+	if resp.ContentLength > 0 && resp.ContentLength <= maxBody {
+		initCap = int(resp.ContentLength) + 64
+	} else if sizeHint != nil && *sizeHint > 4096 && *sizeHint <= maxBody {
+		initCap = *sizeHint + 4096
+	}
+	if initCap > 0 {
+		var buf bytes.Buffer
+		buf.Grow(initCap)
+		if _, err := buf.ReadFrom(lr); err != nil {
+			return nil, err
+		}
+		b := buf.Bytes()
+		if sizeHint != nil && len(b) > 4096 {
+			*sizeHint = len(b)
+		}
+		return b, nil
+	}
+	b, err := io.ReadAll(lr)
+	if err == nil && sizeHint != nil && len(b) > 4096 {
+		*sizeHint = len(b)
+	}
+	return b, err
 }
 
 func (c *SSPanelClient) doPost(ctx context.Context, fullURL string, v any) error {

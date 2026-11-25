@@ -15,7 +15,6 @@ import (
 	"hash/crc32"
 	"hash/fnv"
 	"io"
-	"math"
 	"net"
 	"sync"
 	"time"
@@ -188,19 +187,39 @@ func vmessKDF(key []byte, path ...string) []byte {
 	return h.Sum(nil)
 }
 
-func checkVMessCandidate(cand *VMessUserEntry, authID, scratch []byte, now int64) bool {
-	cand.AuthBlock.Decrypt(scratch, authID)
-	if crc32.ChecksumIEEE(scratch[:12]) != binary.BigEndian.Uint32(scratch[12:16]) {
+// checkVMessBlock validates a candidate user's AES-128 AuthID block.
+// Checking the 64-bit Unix timestamp range (`[now-120, now+120]`) BEFORE CRC32 rejects
+// 99.999999999999999% (`1 - 241/2^64`) of non-matching keys in a single CPU subtraction+compare,
+// completely eliminating software CRC32 overhead during multi-thousand-user scans.
+func checkVMessBlock(blk cipher.Block, authID, scratch []byte, minTS uint64) bool {
+	blk.Decrypt(scratch, authID)
+	if binary.BigEndian.Uint64(scratch[:8])-minTS > 240 {
 		return false
 	}
-	ts := int64(binary.BigEndian.Uint64(scratch[:8]))
-	return math.Abs(float64(now-ts)) <= 120
+	return crc32.ChecksumIEEE(scratch[:12]) == binary.BigEndian.Uint32(scratch[12:16])
 }
 
-// handleVMess implements VMess AEAD (`AuthID` + AEAD request header + AES-128-GCM / ChaCha20-Poly1305 / Zero body)
-// for both TCP (`cmd=0x01`) and UDP-over-stream (`cmd=0x02`), with O(1) client-IP user hinting,
-// L1-cached hot-user ring (for L4 transit relays sharing 1 IP across thousands of streams), & anti-replay.
+func checkVMessCandidate(cand *VMessUserEntry, authID, scratch []byte, now int64) bool {
+	return checkVMessBlock(cand.AuthBlock, authID, scratch, uint64(now-120))
+}
+
+// handleVMess isolates the stack-heavy AEAD KDF handshake into a `//go:noinline` helper so
+// Go's stack shrinker reclaims the ~2.5 KiB handshake stack frame as soon as streaming begins.
 func (s *Server) handleVMess(conn net.Conn) {
+	vmConn, user, destHost, destPort, cmd, ok := s.handshakeVMess(conn)
+	if !ok {
+		return
+	}
+	defer vmConn.releaseReadBuf()
+	if cmd == 0x02 {
+		s.handleVMessUDP(vmConn, user, destHost, destPort)
+		return
+	}
+	s.connectAndRelay(vmConn, user, destHost, destPort, nil)
+}
+
+//go:noinline
+func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, bool) {
 	var br io.Reader = conn
 	if _, alreadyBuf := conn.(interface{ IsBufferedStream() bool }); !alreadyBuf {
 		br = bufio.NewReaderSize(conn, 2048)
@@ -208,33 +227,46 @@ func (s *Server) handleVMess(conn net.Conn) {
 
 	var authID [16]byte
 	if _, err := io.ReadFull(br, authID[:]); err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	idx := s.userIdx.Load()
 	if idx == nil || len(idx.VMessUsers) == 0 {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
-	now := time.Now().Unix()
+	minTS := uint64(time.Now().Unix() - 120)
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
 
-	// Single 16-byte scratch buffer reused across all candidate checks (eliminates 5,000+ heap allocs/scan!)
 	var scratchArr [16]byte
 	scratch := scratchArr[:]
 	authSlice := authID[:]
+	blocks := idx.VMessBlocks
 
-	var matched *VMessUserEntry
-	hintIdx := -1
-	// 1. O(1) lock-free IP->User hint fast path (1 AES block decrypt when client IP is distinct)
-	if h, ok := s.ipHints.Lookup(clientIP); ok && h < len(idx.VMessUsers) {
-		hintIdx = h
-		cand := &idx.VMessUsers[h]
-		if checkVMessCandidate(cand, authSlice, scratch, now) {
-			matched = cand
+	// Bitset tracking tested user indices (up to 16,384 users in 2 KiB on short-lived handshake stack)
+	// so fallback scan never double-decrypts candidates already checked via ipHints or hotRing.
+	var tested [256]uint64
+	markTested := func(uIdx int) {
+		if uIdx >= 0 && uIdx < 256*64 {
+			tested[uIdx>>6] |= uint64(1) << (uint(uIdx) & 63)
 		}
 	}
-	// 2. L1-cached active hot-user ring (256 slots -> ~25 checks when 4,000+ streams share 1 L4 transit IP!)
+	wasTested := func(uIdx int) bool {
+		if uIdx >= 0 && uIdx < 256*64 {
+			return (tested[uIdx>>6] & (uint64(1) << (uint(uIdx) & 63))) != 0
+		}
+		return false
+	}
+
+	var matched *VMessUserEntry
+	// 1. O(1) lock-free IP->User hint fast path (1 AES block decrypt when client IP is distinct)
+	if h, ok := s.ipHints.Lookup(clientIP); ok && h < len(blocks) {
+		markTested(h)
+		if checkVMessBlock(blocks[h], authSlice, scratch, minTS) {
+			matched = &idx.VMessUsers[h]
+		}
+	}
+	// 2. L1-cached active hot-user ring (for L4 transit relays sharing 1 source IP across thousands of streams)
 	if matched == nil {
 		for slot := 0; slot < hotRingSize; slot++ {
 			enc := int(s.hotRing.slots[slot].Load())
@@ -242,26 +274,25 @@ func (s *Server) handleVMess(conn net.Conn) {
 				break
 			}
 			uIdx := enc - 1
-			if uIdx == hintIdx || uIdx < 0 || uIdx >= len(idx.VMessUsers) {
+			if uIdx < 0 || uIdx >= len(blocks) || wasTested(uIdx) {
 				continue
 			}
-			cand := &idx.VMessUsers[uIdx]
-			if checkVMessCandidate(cand, authSlice, scratch, now) {
-				matched = cand
+			markTested(uIdx)
+			if checkVMessBlock(blocks[uIdx], authSlice, scratch, minTS) {
+				matched = &idx.VMessUsers[uIdx]
 				s.ipHints.Store(clientIP, uIdx)
 				break
 			}
 		}
 	}
-	// 3. Full fallback scan only when a cold user connects for the first time
+	// 3. Full fallback scan over compact cipher.Block slice only when a cold user connects
 	if matched == nil {
-		for i := range idx.VMessUsers {
-			if i == hintIdx {
+		for i, blk := range blocks {
+			if wasTested(i) {
 				continue
 			}
-			cand := &idx.VMessUsers[i]
-			if checkVMessCandidate(cand, authSlice, scratch, now) {
-				matched = cand
+			if checkVMessBlock(blk, authSlice, scratch, minTS) {
+				matched = &idx.VMessUsers[i]
 				s.ipHints.Store(clientIP, i)
 				s.hotRing.Promote(i)
 				break
@@ -269,18 +300,18 @@ func (s *Server) handleVMess(conn net.Conn) {
 		}
 	}
 	if matched == nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
-	// 3. Reject replayed AuthIDs after authentication succeeds (prevents GFW active replay probing)
+	// Reject replayed AuthIDs after authentication succeeds (prevents GFW active replay probing)
 	if s.replay.CheckAndMark(authID[:]) {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	// Read 18-byte encrypted header length + 8-byte connection nonce
 	var encLenAndNonce [26]byte
 	if _, err := io.ReadFull(br, encLenAndNonce[:]); err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	encHdrLen := encLenAndNonce[:18]
 	connNonce := encLenAndNonce[18:26]
@@ -289,19 +320,19 @@ func (s *Server) handleVMess(conn net.Conn) {
 	lenNonce := vmessKDF3(matched.CmdKey[:], kdfSaltHdrLenIV, authID[:], connNonce)
 	lenBlk, err := aes.NewCipher(lenKey[:16])
 	if err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	lenGCM, err := cipher.NewGCM(lenBlk)
 	if err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	var hdrLenBytes [2]byte
 	if _, err := lenGCM.Open(hdrLenBytes[:0], lenNonce[:12], encHdrLen, authID[:]); err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	hdrLen := int(binary.BigEndian.Uint16(hdrLenBytes[:])) + 16
 	if hdrLen <= 16 || hdrLen > 2048 {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	var stackHdr [512]byte
@@ -312,29 +343,29 @@ func (s *Server) handleVMess(conn net.Conn) {
 		encHdr = make([]byte, hdrLen)
 	}
 	if _, err := io.ReadFull(br, encHdr); err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	payKey := vmessKDF3(matched.CmdKey[:], kdfSaltHdrKey, authID[:], connNonce)
 	payNonce := vmessKDF3(matched.CmdKey[:], kdfSaltHdrIV, authID[:], connNonce)
 	payBlk, err := aes.NewCipher(payKey[:16])
 	if err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	payGCM, err := cipher.NewGCM(payBlk)
 	if err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	hdrPlain, err := payGCM.Open(encHdr[:0], payNonce[:12], encHdr, authID[:])
 	if err != nil || len(hdrPlain) < 41 {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	// Verify FNV1a32 checksum at end of VMess command header
 	fnvHash := fnv.New32a()
 	_, _ = fnvHash.Write(hdrPlain[:len(hdrPlain)-4])
 	if fnvHash.Sum32() != binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:]) || hdrPlain[0] != 0x01 {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 
 	var reqBodyIV, reqBodyKey [16]byte
@@ -348,24 +379,20 @@ func (s *Server) handleVMess(conn net.Conn) {
 	destPort := binary.BigEndian.Uint16(hdrPlain[38:40])
 
 	if len(hdrPlain)-4-pLen <= 40 {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	addrReader := bytes.NewReader(hdrPlain[40 : len(hdrPlain)-4-pLen])
 	destHost, err := parseVLESSAddr(addrReader)
 	if err != nil || (cmd != 0x01 && cmd != 0x02) {
-		return
+		return nil, nil, "", 0, 0, false
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
 	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType)
 	if err != nil {
-		return
+		return nil, nil, "", 0, 0, false
 	}
-	if cmd == 0x02 {
-		s.handleVMessUDP(vmConn, matched.User, destHost, destPort)
-		return
-	}
-	s.connectAndRelay(vmConn, matched.User, destHost, destPort, nil)
+	return vmConn, matched.User, destHost, destPort, cmd, true
 }
 
 func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, destHost string, destPort uint16) {
@@ -448,8 +475,13 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 	<-done
 }
 
+type wsPrependWriter interface {
+	WritePrependWSFrame(buf []byte, payloadOffset int) error
+}
+
 type vmessStreamConn struct {
 	net.Conn
+	wsFast       wsPrependWriter
 	reader       io.Reader
 	respV        byte
 	optChunkMask bool
@@ -465,6 +497,7 @@ type vmessStreamConn struct {
 	readAEAD  cipher.AEAD
 	readMask  sha3.ShakeHash
 	readCount uint16
+	readBuf   *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
 	leftover  []byte
 
 	writeMu    sync.Mutex
@@ -481,8 +514,10 @@ func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV,
 		br = c
 	}
 	chunkMask := (opt & 0x04) != 0
+	wsFast, _ := c.(wsPrependWriter)
 	vc := &vmessStreamConn{
 		Conn:         c,
+		wsFast:       wsFast,
 		reader:       br,
 		respV:        respV,
 		optChunkMask: chunkMask,
@@ -549,6 +584,21 @@ func (v *vmessStreamConn) nextMask(sh sha3.ShakeHash) uint16 {
 	return binary.BigEndian.Uint16(b[:])
 }
 
+func (v *vmessStreamConn) releaseReadBuf() {
+	v.readMu.Lock()
+	if v.readBuf != nil {
+		bufpool.Put(v.readBuf)
+		v.readBuf = nil
+		v.leftover = nil
+	}
+	v.readMu.Unlock()
+}
+
+func (v *vmessStreamConn) Close() error {
+	v.releaseReadBuf()
+	return v.Conn.Close()
+}
+
 func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	v.readMu.Lock()
 	defer v.readMu.Unlock()
@@ -581,9 +631,9 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	}
 
 	bp := bufpool.Get(size)
-	defer bufpool.Put(bp)
 	chunk := (*bp)[:size]
 	if _, err := io.ReadFull(v.reader, chunk); err != nil {
+		bufpool.Put(bp)
 		return 0, err
 	}
 	encData := chunk[:size-padLen]
@@ -597,12 +647,19 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 		var err error
 		plain, err = v.readAEAD.Open(encData[:0], nonce[:], encData, nil)
 		if err != nil {
+			bufpool.Put(bp)
 			return 0, err
 		}
 	}
 	n := copy(dst, plain)
 	if n < len(plain) {
-		v.leftover = append(v.leftover[:0], plain[n:]...)
+		if v.readBuf != nil {
+			bufpool.Put(v.readBuf)
+		}
+		v.readBuf = bp
+		v.leftover = plain[n:]
+	} else {
+		bufpool.Put(bp)
 	}
 	return n, nil
 }
@@ -612,6 +669,11 @@ func (v *vmessStreamConn) Read(p []byte) (int, error) {
 	if len(v.leftover) > 0 {
 		n := copy(p, v.leftover)
 		v.leftover = v.leftover[n:]
+		if len(v.leftover) == 0 && v.readBuf != nil {
+			bufpool.Put(v.readBuf)
+			v.readBuf = nil
+			v.leftover = nil
+		}
 		v.readMu.Unlock()
 		return n, nil
 	}
@@ -642,8 +704,11 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 	}
 	sizeMask := v.nextMask(v.writeMask)
 
-	bp := bufpool.Get(2 + len(part) + 16 + padLen)
-	out := (*bp)[:2]
+	// Reserve 10 bytes of prefix headroom when backed by WebSocket so `wsConn.WritePrependWSFrame`
+	// prepends the 2–10 byte RFC 6455 header in-place and emits 1 single contiguous `write(2)` syscall!
+	const wsHeadroom = 10
+	bp := bufpool.Get(wsHeadroom + 2 + len(part) + 16 + padLen)
+	out := (*bp)[:wsHeadroom+2]
 	if v.writeAEAD != nil {
 		var nonce [12]byte
 		binary.BigEndian.PutUint16(nonce[0:2], v.writeCount)
@@ -658,9 +723,14 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 		out = out[:padStart+padLen]
 		_, _ = rand.Read(out[padStart:])
 	}
-	wireSize := uint16(len(out)-2) ^ sizeMask
-	binary.BigEndian.PutUint16(out[0:2], wireSize)
-	_, err := v.Conn.Write(out)
+	wireSize := uint16(len(out)-(wsHeadroom+2)) ^ sizeMask
+	binary.BigEndian.PutUint16(out[wsHeadroom:wsHeadroom+2], wireSize)
+	var err error
+	if v.wsFast != nil {
+		err = v.wsFast.WritePrependWSFrame(out, wsHeadroom)
+	} else {
+		_, err = v.Conn.Write(out[wsHeadroom:])
+	}
 	bufpool.Put(bp)
 	return err
 }

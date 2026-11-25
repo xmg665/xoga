@@ -88,8 +88,12 @@ func NewAgent(cfg *config.Config) (*Agent, error) {
 }
 
 func (a *Agent) applyRuntimeTuning() {
-	if a.cfg.GCPercent > 0 {
-		debug.SetGCPercent(a.cfg.GCPercent)
+	gcPct := a.cfg.GCPercent
+	if a.cfg.V2rayReduceMemory && gcPct >= 100 {
+		gcPct = 75
+	}
+	if gcPct > 0 {
+		debug.SetGCPercent(gcPct)
 	}
 	if a.cfg.MemLimitMB > 0 {
 		debug.SetMemoryLimit(int64(a.cfg.MemLimitMB) * 1024 * 1024)
@@ -99,7 +103,7 @@ func (a *Agent) applyRuntimeTuning() {
 		panelName = a.workers[0].client.Name()
 	}
 	logger.Infof("Starting %s | panel=%s nodes=%s(%d) server_type=%s gc=%d%% mem_limit=%dMiB",
-		version.Summary(), panelName, a.cfg.FormatNodeIDs(), len(a.workers), a.cfg.NormalizedServerType(), a.cfg.GCPercent, a.cfg.MemLimitMB)
+		version.Summary(), panelName, a.cfg.FormatNodeIDs(), len(a.workers), a.cfg.NormalizedServerType(), gcPct, a.cfg.MemLimitMB)
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -124,7 +128,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}(i, w)
 	}
 
-	scavengeTicker := time.NewTicker(5 * time.Minute)
+	scavengeTicker := time.NewTicker(2 * time.Minute)
 	defer scavengeTicker.Stop()
 
 	for {
@@ -260,7 +264,7 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 	}
 
 	if configChanged || w.curServer == nil {
-		idx := protocol.BuildUserIndex(w.curUsers, ssKeySize)
+		idx := protocol.BuildUserIndexForProtocol(w.curSpec.Protocol, w.curUsers, ssKeySize)
 		aclEng := w.buildACL(w.curSpec.Routes)
 		srv, err := protocol.NewServer(w.cfg, w.curSpec, w.tracker, idx, aclEng, w.dnsRes)
 		if err != nil {
@@ -279,7 +283,7 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 	}
 
 	if usersModified && w.curServer != nil {
-		idx := protocol.BuildUserIndex(w.curUsers, w.curServer.SSKeySize())
+		idx := protocol.BuildUserIndexForProtocol(w.curSpec.Protocol, w.curUsers, w.curServer.SSKeySize())
 		w.curServer.UpdateUsers(idx)
 		logger.Infof("[node %d] Users synced (total=%d, +%d ~%d -%d)", w.nodeID, len(w.curUsers), added, updated, removed)
 	}

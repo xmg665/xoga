@@ -27,10 +27,13 @@ type UniProxyClient struct {
 	baseURL  string
 	nodeType string
 
-	mu         sync.Mutex
-	configETag string
-	usersETag  string
-	legacyV2   bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
+	mu            sync.Mutex
+	configETag    string
+	usersETag     string
+	lastUsersHash [32]byte
+	hasUsersHash  bool
+	lastBodyLen   int
+	legacyV2      bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
 }
 
 func NewUniProxyClient(cfg *config.Config, httpCli *http.Client) *UniProxyClient {
@@ -212,6 +215,8 @@ type uniUsersResp struct {
 func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
 	c.mu.Lock()
 	etag := c.usersETag
+	prevHash := c.lastUsersHash
+	hasPrevHash := c.hasUsersHash
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpoint("user"), etag)
@@ -222,16 +227,23 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 		return nil, fmt.Errorf("fetch UniProxy users (HTTP %d): %w", status, err)
 	}
 
+	bodyHash := sha256.Sum256(body)
+	if hasPrevHash && bodyHash == prevHash {
+		return nil, ErrNotModified
+	}
+
 	var resp uniUsersResp
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("decode UniProxy users: %w", err)
 	}
 
+	c.mu.Lock()
+	c.lastUsersHash = bodyHash
+	c.hasUsersHash = true
 	if newETag != "" {
-		c.mu.Lock()
 		c.usersETag = newETag
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 
 	out := make([]stats.SyncUserSpec, 0, len(resp.Users))
 	for _, u := range resp.Users {
@@ -354,7 +366,7 @@ func (c *UniProxyClient) doGet(ctx context.Context, fullURL, ifNoneMatch string)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, ifNoneMatch, http.StatusNotModified, ErrNotModified
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	body, err := readResponseBody(resp, &c.lastBodyLen)
 	if err != nil {
 		return nil, "", resp.StatusCode, err
 	}

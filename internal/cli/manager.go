@@ -92,18 +92,58 @@ func InspectInstance(instance string) InstanceInfo {
 		info.NodeID = cfg.NodeID
 		info.NodeDisplay = cfg.FormatNodeIDs()
 	}
-	if st, err := exec.Command("systemctl", "is-active", unit).Output(); err == nil {
-		info.Active = strings.TrimSpace(string(st)) == "active"
-	}
-	if en, err := exec.Command("systemctl", "is-enabled", unit).Output(); err == nil {
-		info.Enabled = strings.TrimSpace(string(en)) == "enabled"
-	}
-	if info.Active {
-		if memOut, err := exec.Command("systemctl", "show", unit, "-p", "MemoryCurrent", "--value").Output(); err == nil {
-			info.MemoryCurrent = formatSystemdBytes(strings.TrimSpace(string(memOut)))
+	if out, err := exec.Command("systemctl", "show", unit, "-p", "ActiveState,UnitFileState,MainPID,MemoryCurrent").Output(); err == nil {
+		var mainPID string
+		var cgroupMem string
+		for _, line := range strings.Split(string(out), "\n") {
+			k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "ActiveState":
+				info.Active = v == "active"
+			case "UnitFileState":
+				info.Enabled = v == "enabled"
+			case "MainPID":
+				mainPID = v
+			case "MemoryCurrent":
+				cgroupMem = v
+			}
+		}
+		if info.Active {
+			// Prefer actual process RSS (`/proc/<pid>/status` VmRSS) so kernel TCP socket sk_buffs
+			// from 10k+ connections don't artificially inflate reported xoga process memory.
+			if rss := readProcRSS(mainPID); rss != "" {
+				info.MemoryCurrent = rss
+			} else {
+				info.MemoryCurrent = formatSystemdBytes(cgroupMem)
+			}
 		}
 	}
 	return info
+}
+
+func readProcRSS(pid string) string {
+	if pid == "" || pid == "0" {
+		return ""
+	}
+	data, err := os.ReadFile("/proc/" + pid + "/status")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "VmRSS:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				var kb uint64
+				if _, err := fmt.Sscanf(fields[1], "%d", &kb); err == nil && kb > 0 {
+					return fmt.Sprintf("%.1f MiB", float64(kb)/1024.0)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func formatSystemdBytes(s string) string {

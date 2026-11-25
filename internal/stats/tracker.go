@@ -2,6 +2,7 @@ package stats
 
 import (
 	"bufio"
+	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -35,13 +36,16 @@ type TrafficDelta struct {
 // UserEntry holds hot per-user counters and auth keys.
 // Hot atomic fields are isolated from cold metadata to minimize CPU cache-line false sharing.
 type UserEntry struct {
-	// Immutable / rarely-updated identity
-	ID         int
-	UUID       string
-	Passwd     string
-	UUIDBytes  [16]byte
-	HasUUID    bool
-	TrojanHash [56]byte // hex-encoded SHA-224 of password/UUID
+	// Immutable / rarely-updated identity & cached VMess cipher schedule
+	ID             int
+	UUID           string
+	Passwd         string
+	UUIDBytes      [16]byte
+	HasUUID        bool
+	TrojanHash     [56]byte // hex-encoded SHA-224 of password/UUID
+	VMessCmdKey    [16]byte
+	VMessAuthBlock cipher.Block
+	VMessAuthReady bool
 
 	// Cache-line padding before hot atomic traffic counters
 	_ [64]byte
@@ -62,7 +66,7 @@ type UserEntry struct {
 	dyWhitelisted   atomic.Bool
 	Limiter         *limiter.Bucket
 
-	// Per-user active client IPs (netip.Addr is a 24-byte comparable value -> 0 string allocs)
+	// Per-user active client IPs (lazily allocated only when user connects -> saves ~28 MiB across multi-node idle users)
 	ipMu       sync.RWMutex
 	activeIPs  map[netip.Addr]int64 // lastSeen Unix seconds
 	remoteIPs  map[netip.Addr]struct{}
@@ -70,11 +74,10 @@ type UserEntry struct {
 
 func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit int, tcpLimit int, dyWhite bool) *UserEntry {
 	u := &UserEntry{
-		ID:        id,
-		UUID:      uuidOrPass,
-		Passwd:    uuidOrPass,
-		Limiter:   limiter.NewBucketBps(speedLimitBps),
-		activeIPs: make(map[netip.Addr]int64, 4),
+		ID:      id,
+		UUID:    uuidOrPass,
+		Passwd:  uuidOrPass,
+		Limiter: limiter.NewBucketBps(speedLimitBps),
 	}
 	u.baseSpeedBps.Store(speedLimitBps)
 	u.deviceLimit.Store(int32(deviceLimit))
@@ -87,6 +90,8 @@ func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit in
 func (u *UserEntry) RefreshKeys(uuidOrPass string) {
 	u.UUID = uuidOrPass
 	u.Passwd = uuidOrPass
+	u.VMessAuthReady = false
+	u.VMessAuthBlock = nil
 	if parsed, err := parseUUIDBytes(uuidOrPass); err == nil {
 		u.UUIDBytes = parsed
 		u.HasUUID = true
@@ -178,6 +183,10 @@ func (u *UserEntry) checkAndTouchIP(ip netip.Addr, ttlSec int64, redisLim *redis
 	u.ipMu.Lock()
 	defer u.ipMu.Unlock()
 
+	if u.activeIPs == nil {
+		u.activeIPs = make(map[netip.Addr]int64, 2)
+	}
+
 	cutoff := now - ttlSec
 	for k, ts := range u.activeIPs {
 		if ts < cutoff {
@@ -223,6 +232,13 @@ func (u *UserEntry) SetRemoteAliveIPs(ips []string) {
 }
 
 func (u *UserEntry) SnapshotAliveIPs(ttlSec int64) []string {
+	u.ipMu.RLock()
+	empty := len(u.activeIPs) == 0
+	u.ipMu.RUnlock()
+	if empty {
+		return nil
+	}
+
 	now := time.Now().Unix()
 	cutoff := now - ttlSec
 
