@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -139,5 +141,71 @@ func TestDNSUnlockUDPDoHAndHotReload(t *testing.T) {
 	ipNf2, err := res.Resolve(ctx, "fast.com", 0, false) // fast.com is in geosite:netflix!
 	if err != nil || ipNf2.String() != "203.0.113.88" {
 		t.Fatalf("expected hot-reloaded IP 203.0.113.88 for fast.com, got %v (err=%v)", ipNf2, err)
+	}
+}
+
+func TestSingleflightCoalescingAndServeStale(t *testing.T) {
+	var upstreamQueries atomic.Int32
+	var dropPackets atomic.Bool
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			upstreamQueries.Add(1)
+			if dropPackets.Load() {
+				continue
+			}
+			time.Sleep(25 * time.Millisecond)
+			ans := buildMockDNSResponse(buf[:n], [4]byte{198, 18, 0, 99}, [16]byte{})
+			if ans != nil {
+				_, _ = pc.WriteTo(ans, addr)
+			}
+		}
+	}()
+
+	res := NewResolver("", "", []string{pc.LocalAddr().String()}, "ipv4_only")
+
+	// Launch 32 concurrent lookups for the exact same uncached domain
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ip, rerr := res.Resolve(context.Background(), "coalesce.openai.com", 0, false)
+			if rerr != nil || ip.String() != "198.18.0.99" {
+				t.Errorf("unexpected resolve result: ip=%v err=%v", ip, rerr)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := upstreamQueries.Load(); got != 1 {
+		t.Fatalf("expected singleflight to coalesce 32 concurrent DNS queries into 1, got %d", got)
+	}
+
+	// Expire cache entry artificially and simulate upstream outage -> verify RFC 8767 serve-stale fallback!
+	res.cacheMu.Lock()
+	for k, v := range res.cache {
+		v.expires = time.Now().Unix() - 10
+		res.cache[k] = v
+	}
+	res.cacheMu.Unlock()
+	dropPackets.Store(true)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	staleIP, err := res.Resolve(shortCtx, "coalesce.openai.com", 0, false)
+	if err != nil || staleIP.String() != "198.18.0.99" {
+		t.Fatalf("expected RFC 8767 serve-stale IP 198.18.0.99 during upstream timeout, got %v (err=%v)", staleIP, err)
 	}
 }

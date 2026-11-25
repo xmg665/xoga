@@ -54,17 +54,19 @@ type OutboundTarget struct {
 }
 
 type compiledRule struct {
-	name         string
-	balance      string // "round_robin", "random", "first"
-	rrCounter    *atomic.Uint64
-	exactDomains map[string]struct{}
-	suffixes     []string
-	keywords     []string
-	regexps      []*regexp.Regexp
-	prefixes     []netip.Prefix
-	protocols    map[string]struct{}
-	action       Action
-	outs         []OutboundNode
+	name              string
+	balance           string // "round_robin", "random", "first"
+	rrCounter         *atomic.Uint64
+	nodeIDs           map[int]struct{}
+	hasTargetCriteria bool
+	exactDomains      map[string]struct{}
+	suffixMap         map[string]struct{}
+	keywords          []string
+	regexps           []*regexp.Regexp
+	prefixes          []netip.Prefix
+	protocols         map[string]struct{}
+	action            Action
+	outs              []OutboundNode
 }
 
 func (r *compiledRule) selectOutbounds() OutboundTarget {
@@ -274,6 +276,12 @@ func (e *Engine) HasRouteForDomain(domain string) bool {
 
 // DecideWithPort checks port bans (`forbidden_ports`), private IP policy, and domain/IP routing rules.
 func (e *Engine) DecideWithPort(destHost string, destPort uint16, sniffDomain string, sniffProto string) OutboundTarget {
+	return e.DecideForNode(0, destHost, destPort, sniffDomain, sniffProto)
+}
+
+// DecideForNode evaluates port bans, private IP policy, and node_id/domain/IP routing rules
+// (supporting multi-node soga `rules=["node_id:781"]` + `listen="10.163.0.100"` exit binding).
+func (e *Engine) DecideForNode(nodeID int, destHost string, destPort uint16, sniffDomain string, sniffProto string) OutboundTarget {
 	if e != nil && e.IsPortForbidden(destPort) {
 		return OutboundTarget{Action: ActionBlock, RuleName: "forbidden-port", MatchedRule: true}
 	}
@@ -285,11 +293,15 @@ func (e *Engine) DecideWithPort(destHost string, destPort uint16, sniffDomain st
 			}
 		}
 	}
-	return e.Decide(destHost, sniffDomain, sniffProto)
+	return e.decideInternal(nodeID, destHost, sniffDomain, sniffProto)
 }
 
 // Decide evaluates target host/IP and sniffed protocol/domain, returning the outbound action.
 func (e *Engine) Decide(destHost string, sniffDomain string, sniffProto string) OutboundTarget {
+	return e.decideInternal(0, destHost, sniffDomain, sniffProto)
+}
+
+func (e *Engine) decideInternal(nodeID int, destHost string, sniffDomain string, sniffProto string) OutboundTarget {
 	if e == nil {
 		return OutboundTarget{Action: ActionDirect}
 	}
@@ -311,14 +323,14 @@ func (e *Engine) Decide(destHost string, sniffDomain string, sniffProto string) 
 	host := strings.ToLower(strings.TrimSuffix(destHost, "."))
 	sdom := strings.ToLower(strings.TrimSuffix(sniffDomain, "."))
 
-	if sn.whitelist.matches(host, sdom, ip, sniffProto) {
+	if sn.whitelist.matches(nodeID, host, sdom, ip, sniffProto) {
 		return OutboundTarget{Action: ActionDirect, RuleName: "whitelist", MatchedRule: true}
 	}
-	if sn.blocklist.matches(host, sdom, ip, sniffProto) {
+	if sn.blocklist.matches(nodeID, host, sdom, ip, sniffProto) {
 		return OutboundTarget{Action: ActionBlock, RuleName: "blocklist", MatchedRule: true}
 	}
 	for i := range sn.routes {
-		if sn.routes[i].matches(host, sdom, ip, sniffProto) {
+		if sn.routes[i].matches(nodeID, host, sdom, ip, sniffProto) {
 			return sn.routes[i].selectOutbounds()
 		}
 	}
@@ -331,8 +343,32 @@ func newCompiledRule(name string, act Action) compiledRule {
 		balance:      "round_robin",
 		rrCounter:    new(atomic.Uint64),
 		exactDomains: make(map[string]struct{}),
+		suffixMap:    make(map[string]struct{}),
 		protocols:    make(map[string]struct{}),
 		action:       act,
+	}
+}
+
+func (r *compiledRule) addNodeIDSpec(spec string) {
+	if r.nodeIDs == nil {
+		r.nodeIDs = make(map[int]struct{})
+	}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if loStr, hiStr, ok := strings.Cut(part, "-"); ok {
+			lo, err1 := strconv.Atoi(strings.TrimSpace(loStr))
+			hi, err2 := strconv.Atoi(strings.TrimSpace(hiStr))
+			if err1 == nil && err2 == nil && lo > 0 && hi >= lo && hi-lo <= 1000 {
+				for id := lo; id <= hi; id++ {
+					r.nodeIDs[id] = struct{}{}
+				}
+			}
+		} else if id, err := strconv.Atoi(part); err == nil && id > 0 {
+			r.nodeIDs[id] = struct{}{}
+		}
 	}
 }
 
@@ -341,8 +377,14 @@ func (r *compiledRule) addPattern(raw string) {
 	if p == "" || strings.HasPrefix(p, "#") {
 		return
 	}
+	lower := strings.ToLower(p)
+	if strings.HasPrefix(lower, "node_id:") || strings.HasPrefix(lower, "node:") {
+		_, val, _ := strings.Cut(p, ":")
+		r.addNodeIDSpec(val)
+		return
+	}
 	if p == "*" || strings.EqualFold(p, "all") || strings.EqualFold(p, "any") {
-		// Match any domain or IPv4/IPv6 prefix
+		r.hasTargetCriteria = true
 		r.prefixes = append(r.prefixes,
 			netip.MustParsePrefix("0.0.0.0/0"),
 			netip.MustParsePrefix("::/0"),
@@ -356,43 +398,51 @@ func (r *compiledRule) addPattern(raw string) {
 		}
 		return
 	}
-	if strings.HasPrefix(p, "protocol:") {
-		r.protocols[strings.ToLower(strings.TrimSpace(p[9:]))] = struct{}{}
+	if strings.HasPrefix(lower, "protocol:") {
+		r.hasTargetCriteria = true
+		r.protocols[strings.TrimSpace(lower[9:])] = struct{}{}
 		return
 	}
-	if strings.EqualFold(p, "bittorrent") {
+	if lower == "bittorrent" {
+		r.hasTargetCriteria = true
 		r.protocols["bittorrent"] = struct{}{}
 		return
 	}
-	if strings.HasPrefix(p, "full:") {
-		r.exactDomains[strings.ToLower(strings.TrimSpace(p[5:]))] = struct{}{}
+	if strings.HasPrefix(lower, "full:") {
+		r.hasTargetCriteria = true
+		r.exactDomains[strings.TrimSpace(lower[5:])] = struct{}{}
 		return
 	}
-	if strings.HasPrefix(p, "domain:") {
-		s := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(p[7:]), "."))
+	if strings.HasPrefix(lower, "domain:") {
+		s := strings.TrimPrefix(strings.TrimSpace(lower[7:]), ".")
 		if s != "" {
-			r.suffixes = append(r.suffixes, s)
+			r.hasTargetCriteria = true
+			r.suffixMap[s] = struct{}{}
 		}
 		return
 	}
-	if strings.HasPrefix(p, "keyword:") {
-		k := strings.ToLower(strings.TrimSpace(p[8:]))
+	if strings.HasPrefix(lower, "keyword:") {
+		k := strings.TrimSpace(lower[8:])
 		if k != "" {
+			r.hasTargetCriteria = true
 			r.keywords = append(r.keywords, k)
 		}
 		return
 	}
-	if strings.HasPrefix(p, "regexp:") {
+	if strings.HasPrefix(lower, "regexp:") {
 		if re, err := regexp.Compile(strings.TrimSpace(p[7:])); err == nil {
+			r.hasTargetCriteria = true
 			r.regexps = append(r.regexps, re)
 		}
 		return
 	}
 	if pfx, err := netip.ParsePrefix(p); err == nil {
+		r.hasTargetCriteria = true
 		r.prefixes = append(r.prefixes, pfx.Masked())
 		return
 	}
 	if addr, err := netip.ParseAddr(p); err == nil {
+		r.hasTargetCriteria = true
 		addr = addr.Unmap()
 		bits := 32
 		if addr.Is6() {
@@ -401,14 +451,28 @@ func (r *compiledRule) addPattern(raw string) {
 		r.prefixes = append(r.prefixes, netip.PrefixFrom(addr, bits))
 		return
 	}
-	s := strings.ToLower(strings.TrimPrefix(p, "*."))
+	s := strings.TrimPrefix(lower, "*.")
 	s = strings.TrimPrefix(s, ".")
 	if s != "" {
-		r.suffixes = append(r.suffixes, s)
+		r.hasTargetCriteria = true
+		r.suffixMap[s] = struct{}{}
 	}
 }
 
-func (r *compiledRule) matches(host, sdom string, ip netip.Addr, proto string) bool {
+func (r *compiledRule) matches(nodeID int, host, sdom string, ip netip.Addr, proto string) bool {
+	if len(r.nodeIDs) > 0 {
+		if nodeID <= 0 {
+			return false
+		}
+		if _, ok := r.nodeIDs[nodeID]; !ok {
+			return false
+		}
+		if !r.hasTargetCriteria {
+			return true
+		}
+	} else if !r.hasTargetCriteria {
+		return false
+	}
 	if proto != "" {
 		if _, ok := r.protocols[proto]; ok {
 			return true
@@ -430,13 +494,22 @@ func (r *compiledRule) matches(host, sdom string, ip netip.Addr, proto string) b
 	return false
 }
 
+// matchDomain performs O(labels) zero-allocation label-boundary map lookup (xray-core / mihomo style)
+// instead of O(N) suffix scanning, scaling cleanly to tens of thousands of domains.
 func (r *compiledRule) matchDomain(d string) bool {
 	if _, ok := r.exactDomains[d]; ok {
 		return true
 	}
-	for _, suf := range r.suffixes {
-		if d == suf || (len(d) > len(suf) && strings.HasSuffix(d, suf) && d[len(d)-len(suf)-1] == '.') {
-			return true
+	if len(r.suffixMap) > 0 {
+		for cur := d; ; {
+			if _, ok := r.suffixMap[cur]; ok {
+				return true
+			}
+			dot := strings.IndexByte(cur, '.')
+			if dot < 0 {
+				break
+			}
+			cur = cur[dot+1:]
 		}
 	}
 	for _, kw := range r.keywords {
@@ -644,7 +717,7 @@ func ParseRoutesTOML(path string) []compiledRule {
 		switch mode {
 		case "route":
 			d := &drafts[len(drafts)-1]
-			switch k {
+			switch strings.ToLower(k) {
 			case "enable", "enabled":
 				d.enable = !strings.EqualFold(unquoted, "false")
 			case "name", "tag":
@@ -657,8 +730,12 @@ func ParseRoutesTOML(path string) []compiledRule {
 				}
 			case "outbound", "address", "proxy", "url":
 				d.outbound = unquoted
-			case "outboundTag", "outbound_tag":
+			case "outboundtag", "outbound_tag":
 				d.outTag = unquoted
+			case "node_id", "node_ids":
+				for _, item := range parseTOMLStringArray(v) {
+					d.matches = append(d.matches, "node_id:"+item)
+				}
 			case "rules", "match", "domain", "domains", "ip":
 				d.matches = append(d.matches, parseTOMLStringArray(v)...)
 			}
@@ -667,7 +744,7 @@ func ParseRoutesTOML(path string) []compiledRule {
 			out := &d.outs[len(d.outs)-1]
 			applyOutboundKV(out, k, unquoted)
 		case "named_out":
-			if k == "tag" || k == "name" {
+			if strings.EqualFold(k, "tag") || strings.EqualFold(k, "name") {
 				curNamedTag = unquoted
 			} else {
 				applyOutboundKV(&curNamedNode, k, unquoted)
@@ -728,7 +805,7 @@ func ParseRoutesTOML(path string) []compiledRule {
 }
 
 func applyOutboundKV(out *OutboundNode, k, v string) {
-	switch k {
+	switch strings.ToLower(k) {
 	case "type", "protocol":
 		t := strings.ToLower(v)
 		switch t {
@@ -764,6 +841,15 @@ func applyOutboundKV(out *OutboundNode, k, v string) {
 		out.Network = strings.ToLower(v)
 	case "ws_path", "path":
 		out.WSPath = v
+	case "listen", "out_ip", "send_through", "sendthrough", "local_addr":
+		if ip, err := netip.ParseAddr(strings.Trim(v, "[]")); err == nil {
+			ip = ip.Unmap()
+			if ip.Is4() {
+				out.ListenIPv4 = ip.String()
+			} else {
+				out.ListenIPv6 = ip.String()
+			}
+		}
 	case "listen_ipv4":
 		out.ListenIPv4 = v
 	case "listen_ipv6":

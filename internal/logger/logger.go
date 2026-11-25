@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,16 +21,16 @@ const (
 )
 
 func ParseLevel(s string) Level {
-	switch s {
-	case "debug", "DEBUG":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
 		return LevelDebug
-	case "info", "INFO", "":
+	case "info", "":
 		return LevelInfo
-	case "warn", "warning", "WARN", "WARNING":
+	case "warn", "warning":
 		return LevelWarn
-	case "error", "ERROR":
+	case "error":
 		return LevelError
-	case "none", "off", "NONE":
+	case "none", "off", "false", "0", "disable", "disabled":
 		return LevelNone
 	default:
 		return LevelInfo

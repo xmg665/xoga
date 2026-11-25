@@ -67,13 +67,13 @@ const (
 )
 
 type upstreamRule struct {
-	server   string // e.g. "154.12.1.1:53", "tcp://8.8.8.8:53", "https://dns.example.com/dns-query"
-	strategy Strategy
-	isCatch  bool // true when server has no rules or `else` wildcard
-	exact    map[string]struct{}
-	suffixes []string
-	keywords []string
-	regexps  []*regexp.Regexp
+	server    string // e.g. "154.12.1.1:53", "tcp://8.8.8.8:53", "https://dns.example.com/dns-query"
+	strategy  Strategy
+	isCatch   bool // true when server has no rules or `else` wildcard
+	exact     map[string]struct{}
+	suffixMap map[string]struct{}
+	keywords  []string
+	regexps   []*regexp.Regexp
 }
 
 func (u *upstreamRule) matches(domain string) bool {
@@ -83,9 +83,16 @@ func (u *upstreamRule) matches(domain string) bool {
 	if _, ok := u.exact[domain]; ok {
 		return true
 	}
-	for _, suf := range u.suffixes {
-		if domain == suf || (len(domain) > len(suf) && strings.HasSuffix(domain, suf) && domain[len(domain)-len(suf)-1] == '.') {
-			return true
+	if len(u.suffixMap) > 0 {
+		for cur := domain; ; {
+			if _, ok := u.suffixMap[cur]; ok {
+				return true
+			}
+			dot := strings.IndexByte(cur, '.')
+			if dot < 0 {
+				break
+			}
+			cur = cur[dot+1:]
 		}
 	}
 	for _, kw := range u.keywords {
@@ -136,7 +143,10 @@ func (u *upstreamRule) addPattern(raw string) {
 	}
 	s := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "*."), "."))
 	if s != "" {
-		u.suffixes = append(u.suffixes, s)
+		if u.suffixMap == nil {
+			u.suffixMap = make(map[string]struct{})
+		}
+		u.suffixMap[s] = struct{}{}
 	}
 }
 
@@ -157,13 +167,22 @@ type cacheEntry struct {
 	expires int64 // Unix seconds
 }
 
+type inflightCall struct {
+	done  chan struct{}
+	addrs []netip.Addr
+	ttl   uint32
+	err   error
+}
+
 // Resolver provides rule-based DNS unlocking (UDP, TCP, and RFC 8484 DoH), IPv4/IPv6 strategy
-// selection, bounded TTL caching, and automatic hot-reloading of `/etc/xoga/dns.yml`.
+// selection, singleflight query coalescing, RFC 8767 serve-stale fallback, bounded TTL caching,
+// and automatic hot-reloading of `/etc/xoga/dns.yml`.
 type Resolver struct {
 	configPath      string
 	remoteURL       string
 	defaultServers  []string
 	defaultStrategy Strategy
+	maxTTLSec       atomic.Int64
 
 	snap atomic.Pointer[dnsSnapshot]
 
@@ -173,6 +192,9 @@ type Resolver struct {
 
 	cacheMu sync.RWMutex
 	cache   map[cacheKey]cacheEntry
+
+	inflightMu sync.Mutex
+	inflight   map[cacheKey]*inflightCall
 
 	dohClient *http.Client
 }
@@ -184,6 +206,7 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 		defaultServers:  normalizeServerList(defaultServers),
 		defaultStrategy: ParseStrategy(defaultStrategy),
 		cache:           make(map[cacheKey]cacheEntry, 256),
+		inflight:        make(map[cacheKey]*inflightCall, 32),
 		dohClient: &http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
@@ -195,8 +218,16 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 			},
 		},
 	}
+	r.maxTTLSec.Store(600)
 	r.reloadNow(true)
 	return r
+}
+
+// SetCacheMinutes configures the maximum DNS cache TTL in minutes (`dns_cache_time` in soga.conf).
+func (r *Resolver) SetCacheMinutes(minutes int) {
+	if r != nil && minutes > 0 {
+		r.maxTTLSec.Store(int64(minutes) * 60)
+	}
 }
 
 // HasRuleForDomain reports whether `dns.yml` has an explicit rule matching domain
@@ -270,36 +301,91 @@ func (r *Resolver) Resolve(ctx context.Context, host string, overrideStrategy St
 	ck := cacheKey{domain: domain, server: servers[0], strategy: strat}
 	now := time.Now().Unix()
 
+	var staleAddr netip.Addr
 	r.cacheMu.RLock()
-	if ce, ok := r.cache[ck]; ok && ce.expires > now && len(ce.addrs) > 0 {
-		addr := ce.addrs[0]
-		r.cacheMu.RUnlock()
-		return addr, nil
+	if ce, ok := r.cache[ck]; ok && len(ce.addrs) > 0 {
+		if ce.expires > now {
+			addr := ce.addrs[0]
+			r.cacheMu.RUnlock()
+			return addr, nil
+		}
+		// Keep recently expired IP (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
+		if now-ce.expires <= 1800 {
+			staleAddr = ce.addrs[0]
+		}
 	}
 	r.cacheMu.RUnlock()
 
+	// Coalesce concurrent identical lookups via zero-dependency singleflight
+	r.inflightMu.Lock()
+	if call, dup := r.inflight[ck]; dup {
+		r.inflightMu.Unlock()
+		select {
+		case <-call.done:
+			if call.err == nil && len(call.addrs) > 0 {
+				return call.addrs[0], nil
+			}
+			if staleAddr.IsValid() {
+				return staleAddr, nil
+			}
+			return netip.Addr{}, call.err
+		case <-ctx.Done():
+			if staleAddr.IsValid() {
+				return staleAddr, nil
+			}
+			return netip.Addr{}, ctx.Err()
+		}
+	}
+	call := &inflightCall{done: make(chan struct{})}
+	r.inflight[ck] = call
+	r.inflightMu.Unlock()
+
+	var addrs []netip.Addr
+	var ttl uint32
 	var lastErr error
 	for _, srv := range servers {
-		addrs, ttl, err := r.queryServerWithStrategy(ctx, srv, domain, strat)
-		if err == nil && len(addrs) > 0 {
+		addrs, ttl, lastErr = r.queryServerWithStrategy(ctx, srv, domain, strat)
+		if lastErr == nil && len(addrs) > 0 {
 			r.putCache(ck, addrs, ttl)
-			return addrs[0], nil
+			break
 		}
-		lastErr = err
 	}
-	if lastErr != nil {
-		return netip.Addr{}, fmt.Errorf("dns resolve %s via %v: %w", domain, servers, lastErr)
+	if lastErr == nil && len(addrs) == 0 {
+		lastErr = fmt.Errorf("no DNS answer for %s", domain)
+	} else if lastErr != nil {
+		lastErr = fmt.Errorf("dns resolve %s via %v: %w", domain, servers, lastErr)
 	}
-	return netip.Addr{}, fmt.Errorf("no DNS answer for %s", domain)
+
+	call.addrs = addrs
+	call.ttl = ttl
+	call.err = lastErr
+	close(call.done)
+
+	r.inflightMu.Lock()
+	delete(r.inflight, ck)
+	r.inflightMu.Unlock()
+
+	if lastErr == nil && len(addrs) > 0 {
+		return addrs[0], nil
+	}
+	if staleAddr.IsValid() {
+		return staleAddr, nil
+	}
+	return netip.Addr{}, lastErr
 }
 
 func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
-	if ttl < 30 {
-		ttl = 30
-	} else if ttl > 600 {
-		ttl = 600
+	maxSec := r.maxTTLSec.Load()
+	if maxSec <= 0 {
+		maxSec = 600
 	}
-	exp := time.Now().Unix() + int64(ttl)
+	ttlSec := int64(ttl)
+	if ttlSec < 30 {
+		ttlSec = 30
+	} else if ttlSec > maxSec {
+		ttlSec = maxSec
+	}
+	exp := time.Now().Unix() + ttlSec
 
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
@@ -683,7 +769,7 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 
 	flush := func() {
 		if cur != nil && cur.server != "" {
-			if len(cur.exact) == 0 && len(cur.suffixes) == 0 && len(cur.keywords) == 0 && len(cur.regexps) == 0 {
+			if len(cur.exact) == 0 && len(cur.suffixMap) == 0 && len(cur.keywords) == 0 && len(cur.regexps) == 0 {
 				cur.isCatch = true
 			}
 			rules = append(rules, *cur)

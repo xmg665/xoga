@@ -2,7 +2,6 @@ package relay
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -135,11 +134,41 @@ func dialDirectWithDNS(
 
 // ResolveUDPTarget resolves a UDP target host through our custom DNS unlock engine.
 func ResolveUDPTarget(ctx context.Context, host string, port uint16, resolver *dns.Resolver) (*net.UDPAddr, error) {
-	ip, err := resolver.Resolve(ctx, host, dns.StrategyIPv4First, false)
+	return ResolveUDPTargetForRoute(ctx, host, port, acl.OutboundTarget{}, resolver)
+}
+
+// ResolveUDPTargetForRoute resolves a UDP target host honoring any per-route IPv4/IPv6 strategy.
+func ResolveUDPTargetForRoute(ctx context.Context, host string, port uint16, route acl.OutboundTarget, resolver *dns.Resolver) (*net.UDPAddr, error) {
+	strat := dns.StrategyIPv4First
+	hasStrat := false
+	if len(route.Outbounds) > 0 && route.Outbounds[0].ListenStrategy != "" {
+		strat = dns.ParseStrategy(route.Outbounds[0].ListenStrategy)
+		hasStrat = true
+	}
+	ip, err := resolver.Resolve(ctx, host, strat, hasStrat)
 	if err != nil {
 		return nil, err
 	}
 	return &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(port)}, nil
+}
+
+// LocalUDPAddrForRoute returns the bound local *net.UDPAddr when a route specifies `listen = "10.163.0.x"` / `listen_ipv4` / `listen_ipv6`.
+func LocalUDPAddrForRoute(route acl.OutboundTarget, preferIPv6 bool) *net.UDPAddr {
+	if len(route.Outbounds) == 0 {
+		return nil
+	}
+	out := route.Outbounds[0]
+	if preferIPv6 && out.ListenIPv6 != "" {
+		if ip := net.ParseIP(out.ListenIPv6); ip != nil {
+			return &net.UDPAddr{IP: ip}
+		}
+	}
+	if !preferIPv6 && out.ListenIPv4 != "" {
+		if ip := net.ParseIP(out.ListenIPv4); ip != nil {
+			return &net.UDPAddr{IP: ip}
+		}
+	}
+	return nil
 }
 
 func dialProxyTransport(ctx context.Context, out acl.OutboundNode, resolver *dns.Resolver, timeout time.Duration) (net.Conn, error) {
@@ -715,8 +744,20 @@ func (w *wsClientConn) Write(p []byte) (int, error) {
 
 	var mkey [4]byte
 	_, _ = rand.Read(mkey[:])
-	masked := bytes.Clone(p)
-	for i := range masked {
+
+	bp := bufpool.Get(len(p))
+	defer bufpool.Put(bp)
+	masked := (*bp)[:len(p)]
+	copy(masked, p)
+
+	m32 := binary.LittleEndian.Uint32(mkey[:])
+	m64 := uint64(m32)<<32 | uint64(m32)
+	i := 0
+	for ; i+8 <= len(masked); i += 8 {
+		v := binary.LittleEndian.Uint64(masked[i : i+8])
+		binary.LittleEndian.PutUint64(masked[i:i+8], v^m64)
+	}
+	for ; i < len(masked); i++ {
 		masked[i] ^= mkey[i&3]
 	}
 

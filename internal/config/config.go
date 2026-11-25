@@ -22,7 +22,8 @@ type Config struct {
 	// Base panel settings
 	Type       string // v2board, xboard, newv2board, sspanel
 	ServerType string // v2ray, vmess, vless, trojan, ss, shadowsocks
-	NodeID     int
+	NodeID     int    // primary node_id (first entry of NodeIDs)
+	NodeIDs    []int  // multi-node list (e.g. `node_id=781,782,783` in soga.conf)
 	SogaKey    string // kept for compatibility with soga.conf scripts (unused/free)
 	API        string // webapi
 
@@ -179,7 +180,12 @@ func (c *Config) ApplyKV(key, val string) {
 	case "server_type":
 		c.ServerType = strings.ToLower(val)
 	case "node_id":
-		c.NodeID, _ = strconv.Atoi(val)
+		c.NodeIDs = parseNodeIDList(val)
+		if len(c.NodeIDs) > 0 {
+			c.NodeID = c.NodeIDs[0]
+		} else {
+			c.NodeID = 0
+		}
 	case "soga_key":
 		c.SogaKey = val
 	case "api":
@@ -338,11 +344,152 @@ func (c *Config) ApplyKV(key, val string) {
 		if n, err := strconv.Atoi(val); err == nil && n >= 10 {
 			c.UDPIdleSec = n
 		}
+	case "forward_extra_port_enable", "dns_cache_enable", "tunnel_enable", "force_proxy_protocol":
+		// Accepted for 100% compatibility with soga.conf / Docker env vars
 	}
 }
 
+// EffectiveNodeIDs returns the deduplicated list of node IDs configured via `node_id=`.
+func (c *Config) EffectiveNodeIDs() []int {
+	if len(c.NodeIDs) > 0 {
+		return c.NodeIDs
+	}
+	if c.NodeID > 0 {
+		return []int{c.NodeID}
+	}
+	return nil
+}
+
+// FormatNodeIDs returns a compact human-readable summary of configured node IDs.
+func (c *Config) FormatNodeIDs() string {
+	ids := c.EffectiveNodeIDs()
+	if len(ids) == 0 {
+		return "0"
+	}
+	if len(ids) <= 3 {
+		parts := make([]string, len(ids))
+		for i, id := range ids {
+			parts[i] = strconv.Itoa(id)
+		}
+		return strings.Join(parts, ",")
+	}
+	return fmt.Sprintf("%d,%d,%d(+%d)", ids[0], ids[1], ids[2], len(ids)-3)
+}
+
+// CloneForNode returns a shallow copy of Config scoped to a single NodeID, sharing immutable maps/slices.
+func (c *Config) CloneForNode(nodeID int) *Config {
+	cp := *c
+	cp.NodeID = nodeID
+	cp.NodeIDs = []int{nodeID}
+	return &cp
+}
+
+// LoadWithEnv loads `path` (allowing missing file when `IS_DOCKER=true` or env `node_id` is set),
+// overlays environment variables, and falls back to `/etc/soga/{routes.toml,dns.yml,blockList,whiteList}`
+// in Docker mode when `/etc/xoga/` rule files are absent.
+func LoadWithEnv(path string) (*Config, error) {
+	cfg, err := Load(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && (os.Getenv("node_id") != "" || os.Getenv("NODE_ID") != "" || parseBool(os.Getenv("IS_DOCKER"), false)) {
+			cfg = Default()
+			baseDir := DefaultConfigDir
+			if path != "" {
+				baseDir = filepath.Dir(path)
+			}
+			cfg.BlockListPath = filepath.Join(baseDir, "blockList")
+			cfg.WhiteListPath = filepath.Join(baseDir, "whiteList")
+			cfg.RoutesPath = filepath.Join(baseDir, "routes.toml")
+			cfg.DNSConfigPath = filepath.Join(baseDir, "dns.yml")
+		} else {
+			return nil, err
+		}
+	}
+	cfg.ApplyEnv()
+
+	// Seamless vaxilu/soga Docker bind-mount compatibility (`/etc/soga/routes.toml`, etc.)
+	if parseBool(os.Getenv("IS_DOCKER"), false) {
+		cfg.RoutesPath = fallbackSogaRulePath(cfg.RoutesPath, "/etc/soga/routes.toml")
+		cfg.DNSConfigPath = fallbackSogaRulePath(cfg.DNSConfigPath, "/etc/soga/dns.yml")
+		cfg.BlockListPath = fallbackSogaRulePath(cfg.BlockListPath, "/etc/soga/blockList")
+		cfg.WhiteListPath = fallbackSogaRulePath(cfg.WhiteListPath, "/etc/soga/whiteList")
+	}
+	return cfg, nil
+}
+
+func fallbackSogaRulePath(primary, fallback string) string {
+	if _, err := os.Stat(primary); err == nil {
+		return primary
+	}
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback
+	}
+	return primary
+}
+
+var knownEnvKeys = []string{
+	"type", "server_type", "node_id", "soga_key", "api",
+	"webapi_url", "webapi_key", "webapi_mukey",
+	"cert_file", "key_file", "cert_mode", "cert_domain", "cert_key_length", "dns_provider", "force_close_ssl",
+	"proxy_protocol", "udp_proxy_protocol", "listen_ip", "listen_port",
+	"redis_ip_limit_enable", "redis_enable", "redis_ip_limit_addr", "redis_addr",
+	"redis_ip_limit_password", "redis_password", "redis_ip_limit_db", "redis_db",
+	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",
+	"dy_limit_enable", "dy_limit_duration", "dy_limit_trigger_time", "dy_limit_trigger_speed",
+	"dy_limit_speed", "dy_limit_time", "dy_limit_white_user_id",
+	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
+	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
+	"vless", "vless_flow", "v2ray_reduce_memory",
+	"dns_cache_time", "default_dns", "dns_strategy", "dns_config_url",
+	"domain_sniff", "force_domain_sniff", "dns_file", "dns_config_file",
+	"log_level", "block_list_file", "white_list_file", "routes_file",
+	"enable_zero_copy", "mem_limit_mb", "gc_percent", "conn_idle_sec", "udp_idle_sec",
+}
+
+// ApplyEnv overlays soga-compatible environment variables (both lowercase `node_id` and uppercase `XOGA_NODE_ID`).
+func (c *Config) ApplyEnv() {
+	for _, k := range knownEnvKeys {
+		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
+			c.ApplyKV(k, strings.TrimSpace(v))
+		}
+		if v, ok := os.LookupEnv("XOGA_" + strings.ToUpper(k)); ok && strings.TrimSpace(v) != "" {
+			c.ApplyKV(k, strings.TrimSpace(v))
+		}
+	}
+}
+
+func parseNodeIDList(raw string) []int {
+	var out []int
+	seen := make(map[int]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if loStr, hiStr, ok := strings.Cut(part, "-"); ok {
+			lo, err1 := strconv.Atoi(strings.TrimSpace(loStr))
+			hi, err2 := strconv.Atoi(strings.TrimSpace(hiStr))
+			if err1 == nil && err2 == nil && lo > 0 && hi >= lo && hi-lo <= 500 {
+				for id := lo; id <= hi; id++ {
+					if _, dup := seen[id]; !dup {
+						seen[id] = struct{}{}
+						out = append(out, id)
+					}
+				}
+			}
+			continue
+		}
+		if id, err := strconv.Atoi(part); err == nil && id > 0 {
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
 func (c *Config) Validate() error {
-	if c.NodeID <= 0 {
+	if len(c.EffectiveNodeIDs()) == 0 {
 		return errors.New("node_id must be greater than 0")
 	}
 	if c.WebAPIURL == "" {

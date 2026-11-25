@@ -10,11 +10,12 @@
 | :--- | :--- | :--- |
 | **构建体积** | `soga` (~85.8 MB) + `soga-cmd` (~7.5 MB) = **~93.3 MB** | **单二进制集成守护进程 + CLI (~7 MB)**，体积缩减 **>92%** |
 | **外部依赖** | 捆绑数十个云厂商 SDK、`gopsutil`、重量级 GeoIP/GeoSite | 仅依赖官方扩展库 `golang.org/x/crypto`，纯标准库零臃肿 |
-| **转发零拷贝** | 用户态缓冲区拷贝为主 | Linux 内核态 **`splice(2)` 4MiB 窗口零拷贝直通** + `sync.Pool` 分级 Slab 池（`0 allocs/op`） |
-| **鉴权与统计** | 映射锁竞争 / 重载配置重建实例 | **RCU 原子快照 (`atomic.Pointer`) 无锁 O(1) 握手** + 缓存行隔离 `atomic.Int64` 流量计数 |
-| **面板同步** | 周期性拉取解析 | **HTTP/2 Keep-Alive + `ETag` (`304 Not Modified`) 零解析短路** + 用户增量热更新不断流 |
-| **限速流控** | 互斥锁令牌桶 | **无锁 CAS 虚拟到达时间 (GCRA) 限速器** + 动态触发限速 (`dy_limit_*`) + 原生轻量 RESP Redis 全局设备数限制 |
-| **常驻内存** | 常见 80 ~ 250+ MiB | 空载 **~8 ~ 14 MiB**，内置 `GOMEMLIMIT` + `GOGC` 软上限与周期性 `MADV_DONTNEED` 内存归还 |
+| **转发零拷贝** | 用户态缓冲区拷贝为主 | Linux 内核态 **`splice(2)` 4MiB 窗口零拷贝直通（含 `proxy_protocol=true` 穿透解包）** + `TCP_FASTOPEN` + 64-bit WebSocket 掩码加速 |
+| **鉴权与抗重放** | 多用户线性遍历 / 磁盘落盘缓存文件 | **无锁 `O(1)` IP→User Hint 内存缓存（零磁盘 I/O，5000+ 用户 VMess/SS 毫秒级降载）** + 零分配栈上 `vmessKDF` + 双代原子布隆防重放过滤器 |
+| **多节点与路由** | 多开或重量级规则扫描 | **单进程多节点聚合 (`node_id=781,782,...`)** 共享内存池/连接池 + **`O(labels)` 零分配域名后缀哈希树** + `node_id:xxx` 独立源 IP 出口绑定 |
+| **面板与 DNS** | 周期性重复拉取 / 并发重复解析 | **HTTP/2 Keep-Alive + `ETag` (`304`) 短路** + 跨节点共享审计规则缓存 + **DNS `singleflight` 合并与 RFC 8767 过期兜底 (`Serve-Stale`)** |
+| **限速流控** | 互斥锁令牌桶 | **无锁 CAS 虚拟到达时间 (GCRA) 限速器** + 动态触发限速 (`dy_limit_*`) + 长连接复用 RESP Redis 全局设备数限制 |
+| **常驻内存** | 常见 80 ~ 500+ MiB | 空载 **~8 ~ 14 MiB**，内置 `GOMEMLIMIT` + `GOGC` 软上限与周期性 `MADV_DONTNEED` 内存归还 |
 
 ---
 
@@ -25,7 +26,11 @@
   - `vless`：VLESS v0 TCP / UDP（`[16]byte` UUID O(1) 无锁检索，Scatter-Gather 零拷贝响应头）
   - `trojan`：Trojan TCP / Trojan-UDP Associate（SHA-224 `[56]byte` O(1) 无锁检索）
   - `shadowsocks` / `ss`：经典 AEAD（`aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`）及 **Shadowsocks-2022**（`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`，支持单密钥与 V2Board/Xboard `server_key` 多用户 **EIH** 身份头）
-  - `vmess` / `v2ray`：现代 VMess AEAD（AES-128-GCM / ChaCha20-Poly1305 / Shake128 长度掩码）
+  - `vmess` / `v2ray`：现代 VMess AEAD（AES-128-GCM / ChaCha20-Poly1305 / Shake128 长度掩码与 `GlobalPadding` 混淆 / VMess UDP-over-TCP，内置无锁 IP→User `O(1)` 缓存与零分配栈上 KDF）
+- **单进程多节点聚合与 Docker 环境变量模式**：
+  - 支持 `node_id=781,782,783-790` 单进程同时承载数十个节点（共享同一个 Go 运行时、HTTP/2 面板连接池、DNS 缓存与 `routes.toml` 路由快照，错峰同步防面板拥塞）
+  - 支持 `routes.toml` 按 `rules=["node_id:781"]` + `listen = "10.163.0.100"` 将不同节点精准绑定至不同 TUN 隧道 / 多 IP 站群源地址出口（TCP 与 UDP 均生效）
+  - 兼容原版 `vaxilu/soga` Docker 环境变量无配置文件启动（`IS_DOCKER=true` + 环境变量注入 + 自动兼容 `/etc/soga/routes.toml` 挂载路径）
 - **传输与中转特性**：
   - 原生 TCP / TLS 1.2 & 1.3（支持手动证书热重载、内置 Let's Encrypt `cert_mode=http` 自动签发、内存自签 ECDSA P-256 证书、`force_close_ssl=true` 反代落盘）
   - WebSocket（RFC 6455 零依赖升级、支持 `?ed=2048` `Sec-WebSocket-Protocol` Early Data、自动透传 `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For` 真实客户端 IP）

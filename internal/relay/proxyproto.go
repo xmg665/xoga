@@ -7,13 +7,15 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var proxyV2Sig = [12]byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
 
 // ProxyProtoListener wraps a net.Listener and transparently parses HAProxy PROXY Protocol v1 & v2
-// headers (`proxy_protocol=true` in soga.conf) so transit/relay nodes preserve real client IPs.
+// headers (`proxy_protocol=true` in soga.conf) so transit/relay nodes preserve real client IPs
+// while still exposing the underlying *net.TCPConn for TCP_NODELAY and Linux splice(2) zero-copy.
 type ProxyProtoListener struct {
 	net.Listener
 }
@@ -28,15 +30,42 @@ func (l *ProxyProtoListener) Accept() (net.Conn, error) {
 
 type proxyProtoConn struct {
 	net.Conn
-	parsed     bool
+	parseOnce  sync.Once
+	parseErr   error
 	remoteAddr net.Addr
 	leftover   []byte
 }
 
-func (p *proxyProtoConn) RemoteAddr() net.Addr {
-	if !p.parsed {
-		_ = p.parseHeader()
+func (p *proxyProtoConn) ensureParsed() error {
+	p.parseOnce.Do(func() {
+		p.parseErr = p.parseHeader()
+	})
+	return p.parseErr
+}
+
+// NetConn exposes the wrapped connection so TuneTCP (`SetNoDelay` / `SetKeepAlive`) works through ProxyProtoListener.
+func (p *proxyProtoConn) NetConn() net.Conn {
+	return p.Conn
+}
+
+// UnwrapTCP exposes the raw *net.TCPConn once any peeked PROXY header leftover bytes are drained,
+// enabling Linux kernel `splice(2)` zero-copy even when `proxy_protocol=true`!
+func (p *proxyProtoConn) UnwrapTCP() (*net.TCPConn, bool) {
+	if err := p.ensureParsed(); err != nil || len(p.leftover) > 0 {
+		return nil, false
 	}
+	return unwrapTCP(p.Conn)
+}
+
+func (p *proxyProtoConn) CloseWrite() error {
+	if cw, ok := p.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.SetReadDeadline(time.Now())
+}
+
+func (p *proxyProtoConn) RemoteAddr() net.Addr {
+	_ = p.ensureParsed()
 	if p.remoteAddr != nil {
 		return p.remoteAddr
 	}
@@ -44,10 +73,8 @@ func (p *proxyProtoConn) RemoteAddr() net.Addr {
 }
 
 func (p *proxyProtoConn) Read(b []byte) (int, error) {
-	if !p.parsed {
-		if err := p.parseHeader(); err != nil {
-			return 0, err
-		}
+	if err := p.ensureParsed(); err != nil {
+		return 0, err
 	}
 	if len(p.leftover) > 0 {
 		n := copy(b, p.leftover)
@@ -58,7 +85,6 @@ func (p *proxyProtoConn) Read(b []byte) (int, error) {
 }
 
 func (p *proxyProtoConn) parseHeader() error {
-	p.parsed = true
 	_ = p.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer func() { _ = p.Conn.SetReadDeadline(time.Time{}) }()
 
@@ -69,21 +95,23 @@ func (p *proxyProtoConn) parseHeader() error {
 		return nil
 	}
 
-	// PROXY protocol v1: "PROXY TCP4 1.2.3.4 5.6.7.8 12345 443\r\n"
+	// PROXY protocol v1: "PROXY TCP4 1.2.3.4 5.6.7.8 12345 443\r\n" (max 107 bytes per spec)
 	if bytes.HasPrefix(hdr[:n], []byte("PROXY ")) {
-		buf := make([]byte, 0, 108)
-		buf = append(buf, hdr[:n]...)
-		for !bytes.Contains(buf, []byte("\r\n")) && len(buf) < 108 {
-			var one [1]byte
-			if _, rerr := p.Conn.Read(one[:]); rerr != nil {
+		var buf [128]byte
+		total := copy(buf[:], hdr[:n])
+		for !bytes.Contains(buf[:total], []byte("\r\n")) && total < 108 {
+			rn, rerr := p.Conn.Read(buf[total:108])
+			total += rn
+			if rerr != nil || rn == 0 {
 				break
 			}
-			buf = append(buf, one[0])
 		}
-		idx := bytes.Index(buf, []byte("\r\n"))
+		idx := bytes.Index(buf[:total], []byte("\r\n"))
 		if idx > 0 {
 			line := string(buf[:idx])
-			p.leftover = append(p.leftover, buf[idx+2:]...)
+			if idx+2 < total {
+				p.leftover = append(p.leftover, buf[idx+2:total]...)
+			}
 			parts := strings.Fields(line)
 			if len(parts) >= 6 {
 				if ip := net.ParseIP(parts[2]); ip != nil {
@@ -93,7 +121,7 @@ func (p *proxyProtoConn) parseHeader() error {
 			}
 			return nil
 		}
-		p.leftover = append(p.leftover, buf...)
+		p.leftover = append(p.leftover, buf[:total]...)
 		return nil
 	}
 

@@ -154,17 +154,37 @@ func writeFull(w io.Writer, b []byte) (int, error) {
 	return total, nil
 }
 
+type netConnWrapper interface {
+	NetConn() net.Conn
+}
+
+type tcpUnwrapper interface {
+	UnwrapTCP() (*net.TCPConn, bool)
+}
+
 func TuneTCP(c net.Conn) {
-	if tc, ok := unwrapTCP(c); ok {
-		_ = tc.SetNoDelay(true)
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(45 * time.Second)
+	cur := c
+	for depth := 0; depth < 4 && cur != nil; depth++ {
+		if tc, ok := cur.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(45 * time.Second)
+			return
+		}
+		if w, ok := cur.(netConnWrapper); ok {
+			cur = w.NetConn()
+			continue
+		}
+		break
 	}
 }
 
 func unwrapTCP(c net.Conn) (*net.TCPConn, bool) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		return tc, true
+	}
+	if u, ok := c.(tcpUnwrapper); ok {
+		return u.UnwrapTCP()
 	}
 	return nil, false
 }
@@ -185,6 +205,17 @@ func closeWrite(c net.Conn) {
 type PrependConn struct {
 	net.Conn
 	Reader io.Reader
+}
+
+func (p *PrependConn) NetConn() net.Conn {
+	return p.Conn
+}
+
+func (p *PrependConn) CloseWrite() error {
+	if cw, ok := p.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.SetReadDeadline(time.Now())
 }
 
 func (p *PrependConn) Read(b []byte) (int, error) {

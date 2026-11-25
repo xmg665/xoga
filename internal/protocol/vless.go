@@ -121,6 +121,17 @@ type vlessRespConn struct {
 	sentResp bool
 }
 
+func (v *vlessRespConn) NetConn() net.Conn {
+	return v.Conn
+}
+
+func (v *vlessRespConn) CloseWrite() error {
+	if cw, ok := v.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return v.Conn.SetReadDeadline(time.Now())
+}
+
 func (v *vlessRespConn) Write(p []byte) (int, error) {
 	v.mu.Lock()
 	if !v.sentResp {
@@ -145,18 +156,19 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 	}
 	defer user.ReleaseConn()
 
-	route := s.aclEng.Load().Decide(destHost, "", "")
+	route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, destHost, destPort, "", "")
 	if route.Action == acl.ActionBlock {
 		return
 	}
 
 	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-	udpAddr, err := relay.ResolveUDPTarget(rctx, destHost, destPort, s.dnsRes)
+	udpAddr, err := relay.ResolveUDPTargetForRoute(rctx, destHost, destPort, route, s.dnsRes)
 	rcancel()
 	if err != nil {
 		return
 	}
-	targetUDP, err := net.DialUDP("udp", nil, udpAddr)
+	localUDP := relay.LocalUDPAddrForRoute(route, udpAddr.IP.To4() == nil)
+	targetUDP, err := net.DialUDP("udp", localUDP, udpAddr)
 	if err != nil {
 		return
 	}

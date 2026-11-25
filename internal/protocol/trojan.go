@@ -145,12 +145,12 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 			break
 		}
 
-		route := s.aclEng.Load().Decide(host, "", "")
+		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {
 			continue
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-		dstAddr, err := relay.ResolveUDPTarget(rctx, host, port, s.dnsRes)
+		dstAddr, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
 		rcancel()
 		if err != nil {
 			logger.Debugf("trojan udp resolve %s failed: %v", host, err)

@@ -105,22 +105,42 @@ func (s *Server) handleSSClassicAEADTCP(conn net.Conn) {
 	var zeroNonce [12]byte
 	var plainLen [2]byte
 
-	for i := range idx.SSUsers {
-		u := &idx.SSUsers[i]
+	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
+	if hintIdx, ok := s.ipHints.Lookup(clientIP); ok && hintIdx < len(idx.SSUsers) {
+		u := &idx.SSUsers[hintIdx]
 		deriveSSSubkey(cs, u.MasterKey, salt[:cs.saltSize], subkey[:cs.keySize])
-		aead, err := cs.makeAEAD(subkey[:cs.keySize])
-		if err != nil {
-			continue
+		if aead, err := cs.makeAEAD(subkey[:cs.keySize]); err == nil {
+			if _, err := aead.Open(plainLen[:0], zeroNonce[:], firstLenEnc[:], nil); err == nil {
+				matchedUser = u.User
+				matchedKey = u.MasterKey
+				decAead = aead
+				firstChunkLen = int(binary.BigEndian.Uint16(plainLen[:]) & 0x3FFF)
+			}
 		}
-		if _, err := aead.Open(plainLen[:0], zeroNonce[:], firstLenEnc[:], nil); err == nil {
-			matchedUser = u.User
-			matchedKey = u.MasterKey
-			decAead = aead
-			firstChunkLen = int(binary.BigEndian.Uint16(plainLen[:]) & 0x3FFF)
-			break
+	}
+
+	if matchedUser == nil {
+		for i := range idx.SSUsers {
+			u := &idx.SSUsers[i]
+			deriveSSSubkey(cs, u.MasterKey, salt[:cs.saltSize], subkey[:cs.keySize])
+			aead, err := cs.makeAEAD(subkey[:cs.keySize])
+			if err != nil {
+				continue
+			}
+			if _, err := aead.Open(plainLen[:0], zeroNonce[:], firstLenEnc[:], nil); err == nil {
+				matchedUser = u.User
+				matchedKey = u.MasterKey
+				decAead = aead
+				firstChunkLen = int(binary.BigEndian.Uint16(plainLen[:]) & 0x3FFF)
+				s.ipHints.Store(clientIP, i)
+				break
+			}
 		}
 	}
 	if matchedUser == nil || firstChunkLen <= 0 || firstChunkLen > 0x3FFF {
+		return
+	}
+	if s.replay.CheckAndMark(salt[:cs.saltSize]) {
 		return
 	}
 
@@ -253,6 +273,9 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 	}
 	ts := int64(binary.BigEndian.Uint64(fixedPlain[1:9]))
 	if math.Abs(float64(time.Now().Unix()-ts)) > 30 {
+		return
+	}
+	if s.replay.CheckAndMark(reqSalt[:cs.saltSize]) {
 		return
 	}
 	varHdrLen := int(binary.BigEndian.Uint16(fixedPlain[9:11]))
@@ -507,18 +530,34 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		var subkey [32]byte
 		plainBuf := make([]byte, len(ct))
 
-		for i := range idx.SSUsers {
-			u := &idx.SSUsers[i]
+		clientIP := relay.ExtractClientIP(clientAddr)
+		if hintIdx, ok := s.ipHints.Lookup(clientIP); ok && hintIdx < len(idx.SSUsers) {
+			u := &idx.SSUsers[hintIdx]
 			deriveSSSubkey(cs, u.MasterKey, salt, subkey[:cs.keySize])
-			aead, err := cs.makeAEAD(subkey[:cs.keySize])
-			if err != nil {
-				continue
+			if aead, err := cs.makeAEAD(subkey[:cs.keySize]); err == nil {
+				if dec, err := aead.Open(plainBuf[:0], zeroNonce[:], ct, nil); err == nil {
+					matchedUser = u.User
+					matchedKey = u.MasterKey
+					plain = dec
+				}
 			}
-			if dec, err := aead.Open(plainBuf[:0], zeroNonce[:], ct, nil); err == nil {
-				matchedUser = u.User
-				matchedKey = u.MasterKey
-				plain = dec
-				break
+		}
+
+		if matchedUser == nil {
+			for i := range idx.SSUsers {
+				u := &idx.SSUsers[i]
+				deriveSSSubkey(cs, u.MasterKey, salt, subkey[:cs.keySize])
+				aead, err := cs.makeAEAD(subkey[:cs.keySize])
+				if err != nil {
+					continue
+				}
+				if dec, err := aead.Open(plainBuf[:0], zeroNonce[:], ct, nil); err == nil {
+					matchedUser = u.User
+					matchedKey = u.MasterKey
+					plain = dec
+					s.ipHints.Store(clientIP, i)
+					break
+				}
 			}
 		}
 		if matchedUser == nil {
@@ -530,12 +569,12 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		if err != nil || pr.Len() == 0 {
 			continue
 		}
-		route := s.aclEng.Load().Decide(host, "", "")
+		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {
 			continue
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-		dstUDP, err := relay.ResolveUDPTarget(rctx, host, port, s.dnsRes)
+		dstUDP, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
 		rcancel()
 		if err != nil {
 			continue
@@ -547,7 +586,11 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		natMu.Lock()
 		sess, exists := sessions[keyStr]
 		if !exists {
-			natPC, lerr := net.ListenPacket("udp", "")
+			localBind := ""
+			if lu := relay.LocalUDPAddrForRoute(route, dstUDP.IP.To4() == nil); lu != nil {
+				localBind = net.JoinHostPort(lu.IP.String(), "0")
+			}
+			natPC, lerr := net.ListenPacket("udp", localBind)
 			if lerr != nil {
 				natMu.Unlock()
 				continue

@@ -198,6 +198,34 @@ type = "direct"
 
 ---
 
+### 场景 4：单进程多节点聚合 + 按 `node_id` 绑定多隧道 / 站群源 IP 出口
+
+当一台入口/中转落地机挂载了多条 OpenVPN / WireGuard 隧道（如 `tun0` ~ `tun35`）或多块弹性网卡 IP 时，可在 `xoga.conf` 配置 `node_id=781,782,784`，并在 `/etc/xoga/routes.toml` 中按节点 ID 指定独立出口源 IP（100% 兼容原版 `soga` 的 `listen = "..."` 语法，TCP 与 UDP 均自动绑定）：
+
+```toml
+[[routes]]
+rules = ["node_id:781"]
+[[routes.Outs]]
+listen = "10.163.0.100"  # 节点 781 绑定澳门隧道出口 IP
+type = "direct"
+
+[[routes]]
+rules = ["node_id:782"]
+[[routes.Outs]]
+listen = "10.163.0.108"  # 节点 782 绑定台北隧道出口 IP
+type = "direct"
+
+# 也可将指定节点的特定域名（如 AI）单独分流至本地 WARP：
+[[routes]]
+rules = ["node_id:851", "geosite:openai"]
+[[routes.Outs]]
+type = "socks"
+server = "127.0.0.1"
+port = 40000
+```
+
+---
+
 ## 四、内置零内存 `geosite:` 规则速查表
 
 无需下载维护任何 `.dat` 文件，以下标签在 `dns.yml` 与 `routes.toml` 中开箱即用：

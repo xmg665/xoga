@@ -38,3 +38,57 @@ func TestLoadAndUpdateFile(t *testing.T) {
 	}
 	_ = os.Remove(tmp)
 }
+
+func TestMultiNodeIDAndDockerEnv(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "soga.conf")
+	raw := `
+type=sspanel-uim
+server_type=v2ray
+node_id=781,782,783-785,782,911
+webapi_url=https://api.example.com/
+webapi_key=testkey
+proxy_protocol=true
+forward_extra_port_enable=true
+log_level=false
+`
+	if err := os.WriteFile(tmp, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate multi-node failed: %v", err)
+	}
+	wantIDs := []int{781, 782, 783, 784, 785, 911}
+	gotIDs := cfg.EffectiveNodeIDs()
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("expected %v, got %v", wantIDs, gotIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("mismatch at %d: want %d got %d", i, wantIDs[i], gotIDs[i])
+		}
+	}
+	if cfg.FormatNodeIDs() != "781,782,783(+3)" {
+		t.Fatalf("unexpected FormatNodeIDs: %s", cfg.FormatNodeIDs())
+	}
+
+	// Verify IS_DOCKER=true env-only bootstrap without a config file on disk
+	t.Setenv("IS_DOCKER", "true")
+	t.Setenv("type", "sspanel-uim")
+	t.Setenv("server_type", "v2ray")
+	t.Setenv("node_id", "851")
+	t.Setenv("webapi_url", "https://api.example.com/")
+	t.Setenv("webapi_key", "docker-key")
+	t.Setenv("proxy_protocol", "true")
+
+	envCfg, err := LoadWithEnv(filepath.Join(t.TempDir(), "nonexistent.conf"))
+	if err != nil {
+		t.Fatalf("LoadWithEnv docker mode failed: %v", err)
+	}
+	if envCfg.NodeID != 851 || !envCfg.ProxyProtocol || envCfg.NormalizedServerType() != "vmess" {
+		t.Fatalf("unexpected docker env config: %+v", envCfg)
+	}
+}

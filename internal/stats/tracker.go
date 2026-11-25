@@ -462,12 +462,17 @@ func parseUUIDBytes(s string) ([16]byte, error) {
 	return out, err
 }
 
-// redisIPLimiter implements a minimal, zero-dependency Redis RESP2 client for global IP limiting.
+// redisIPLimiter implements a minimal, zero-dependency Redis RESP2 client with persistent
+// keep-alive connection reuse for global IP limiting across multi-node clusters.
 type redisIPLimiter struct {
 	addr   string
 	passwd string
 	db     int
 	useTLS bool
+
+	mu   sync.Mutex
+	conn net.Conn
+	br   *bufio.Reader
 }
 
 func newRedisIPLimiter(cfg *config.Config) *redisIPLimiter {
@@ -479,8 +484,13 @@ func newRedisIPLimiter(cfg *config.Config) *redisIPLimiter {
 	}
 }
 
-func (r *redisIPLimiter) CheckAndTouch(userID int, ip string, maxIPs int, expirySec int) (bool, error) {
-	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond}
+func (r *redisIPLimiter) dialLocked() error {
+	if r.conn != nil {
+		_ = r.conn.Close()
+		r.conn = nil
+		r.br = nil
+	}
+	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond, KeepAlive: 45 * time.Second}
 	var conn net.Conn
 	var err error
 	if r.useTLS {
@@ -489,50 +499,84 @@ func (r *redisIPLimiter) CheckAndTouch(userID int, ip string, maxIPs int, expiry
 		conn, err = dialer.Dial("tcp", r.addr)
 	}
 	if err != nil {
-		return true, err
+		return err
 	}
-	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
-
 	br := bufio.NewReaderSize(conn, 512)
 	if r.passwd != "" {
 		if _, err := writeRESP(conn, "AUTH", r.passwd); err != nil {
-			return true, err
+			_ = conn.Close()
+			return err
 		}
 		if _, err := readRESPLine(br); err != nil {
-			return true, err
+			_ = conn.Close()
+			return err
 		}
 	}
 	if r.db > 0 {
 		if _, err := writeRESP(conn, "SELECT", strconv.Itoa(r.db)); err != nil {
-			return true, err
+			_ = conn.Close()
+			return err
 		}
 		if _, err := readRESPLine(br); err != nil {
-			return true, err
+			_ = conn.Close()
+			return err
 		}
 	}
+	r.conn = conn
+	r.br = br
+	return nil
+}
 
+func (r *redisIPLimiter) CheckAndTouch(userID int, ip string, maxIPs int, expirySec int) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if r.conn == nil {
+			if err := r.dialLocked(); err != nil {
+				return true, err
+			}
+		}
+		allowed, err := r.execPipelineLocked(userID, ip, maxIPs, expirySec)
+		if err == nil {
+			return allowed, nil
+		}
+		_ = r.conn.Close()
+		r.conn = nil
+		r.br = nil
+	}
+	return true, errors.New("redis pipeline failed after reconnect")
+}
+
+func (r *redisIPLimiter) execPipelineLocked(userID int, ip string, maxIPs int, expirySec int) (bool, error) {
+	_ = r.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	now := time.Now().Unix()
 	key := fmt.Sprintf("xoga:ip:%d", userID)
 	minScore := strconv.FormatInt(now-int64(expirySec), 10)
 	nowStr := strconv.FormatInt(now, 10)
 	expStr := strconv.Itoa(expirySec + 10)
 
-	// Pipeline 4 commands in one write syscall
 	var sb strings.Builder
 	appendRESP(&sb, "ZREMRANGEBYSCORE", key, "-inf", minScore)
 	appendRESP(&sb, "ZADD", key, nowStr, ip)
 	appendRESP(&sb, "ZCARD", key)
 	appendRESP(&sb, "EXPIRE", key, expStr)
 
-	if _, err := conn.Write([]byte(sb.String())); err != nil {
+	if _, err := r.conn.Write([]byte(sb.String())); err != nil {
 		return true, err
 	}
-	_, _ = readRESPLine(br) // ZREMRANGEBYSCORE reply
-	_, _ = readRESPLine(br) // ZADD reply
-	cardLine, err := readRESPLine(br)
-	_, _ = readRESPLine(br) // EXPIRE reply
+	if _, err := readRESPLine(r.br); err != nil {
+		return true, err
+	}
+	if _, err := readRESPLine(r.br); err != nil {
+		return true, err
+	}
+	cardLine, err := readRESPLine(r.br)
 	if err != nil {
+		return true, err
+	}
+	if _, err := readRESPLine(r.br); err != nil {
 		return true, err
 	}
 	if strings.HasPrefix(cardLine, ":") {

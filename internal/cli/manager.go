@@ -28,15 +28,16 @@ const (
 var validInstanceRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,48}$`)
 
 type InstanceInfo struct {
-	Name       string // "xoga" for default instance, otherwise template instance name
-	UnitName   string // "xoga.service" or "xoga@<name>.service"
-	ConfigPath string // "/etc/xoga/<name>.conf"
-	Active     bool
-	Enabled    bool
+	Name          string // "xoga" for default instance, otherwise template instance name
+	UnitName      string // "xoga.service" or "xoga@<name>.service"
+	ConfigPath    string // "/etc/xoga/<name>.conf"
+	Active        bool
+	Enabled       bool
 	MemoryCurrent string
-	PanelType  string
-	ServerType string
-	NodeID     int
+	PanelType     string
+	ServerType    string
+	NodeID        int
+	NodeDisplay   string
 }
 
 func ResolveUnitAndConfig(instance string) (name, unit, confPath string) {
@@ -89,6 +90,7 @@ func InspectInstance(instance string) InstanceInfo {
 		info.PanelType = cfg.Type
 		info.ServerType = cfg.ServerType
 		info.NodeID = cfg.NodeID
+		info.NodeDisplay = cfg.FormatNodeIDs()
 	}
 	if st, err := exec.Command("systemctl", "is-active", unit).Output(); err == nil {
 		info.Active = strings.TrimSpace(string(st)) == "active"
@@ -229,8 +231,12 @@ func PrintInstanceList() {
 		if mem == "" {
 			mem = "-"
 		}
-		fmt.Printf("%-14s %-21s %-10s %-12s %-12s %-8d %-10s %s\n",
-			item.Name, st, en, emptyDash(item.PanelType), emptyDash(item.ServerType), item.NodeID, mem, item.ConfigPath)
+		nd := item.NodeDisplay
+		if nd == "" {
+			nd = fmt.Sprintf("%d", item.NodeID)
+		}
+		fmt.Printf("%-14s %-21s %-10s %-12s %-12s %-14s %-10s %s\n",
+			item.Name, st, en, emptyDash(item.PanelType), emptyDash(item.ServerType), nd, mem, item.ConfigPath)
 	}
 }
 
@@ -250,8 +256,12 @@ func printDetailedStatus(instance string) {
 	if info.MemoryCurrent != "" && info.MemoryCurrent != "-" {
 		fmt.Printf("实时内存:   %s%s%s\n", ansiGreen, info.MemoryCurrent, ansiPlain)
 	}
-	fmt.Printf("节点信息:   type=%s server_type=%s node_id=%d\n",
-		emptyDash(info.PanelType), emptyDash(info.ServerType), info.NodeID)
+	nd := info.NodeDisplay
+	if nd == "" {
+		nd = fmt.Sprintf("%d", info.NodeID)
+	}
+	fmt.Printf("节点信息:   type=%s server_type=%s node_id=%s\n",
+		emptyDash(info.PanelType), emptyDash(info.ServerType), nd)
 	fmt.Printf("配置文件:   %s\n", info.ConfigPath)
 }
 

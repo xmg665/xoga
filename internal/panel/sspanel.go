@@ -14,10 +14,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/config"
 	"github.com/xmg665/xoga/internal/stats"
+)
+
+type cachedDetectEntry struct {
+	rules   []string
+	expires int64
+}
+
+var (
+	detectCacheMu sync.RWMutex
+	detectCache   = make(map[string]cachedDetectEntry)
 )
 
 // SSPanelClient implements SSPanel-UIM and SSPanel-Metron `/mod_mu/*` WebAPI endpoints.
@@ -163,6 +174,17 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 }
 
 func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
+	cacheKey := c.baseURL + "|" + c.cfg.WebAPIKey
+	now := time.Now().Unix()
+
+	detectCacheMu.RLock()
+	if ce, ok := detectCache[cacheKey]; ok && ce.expires > now {
+		rules := ce.rules
+		detectCacheMu.RUnlock()
+		return rules
+	}
+	detectCacheMu.RUnlock()
+
 	body, _, _, err := c.doGet(ctx, c.modURL("/mod_mu/func/detect_rules", true), "")
 	if err != nil {
 		return nil
@@ -183,6 +205,13 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 			out = append(out, "regexp:"+r.Regex)
 		}
 	}
+
+	detectCacheMu.Lock()
+	detectCache[cacheKey] = cachedDetectEntry{
+		rules:   out,
+		expires: now + 300,
+	}
+	detectCacheMu.Unlock()
 	return out
 }
 

@@ -21,6 +21,7 @@ func main() {
 	// Daemon mode is triggered by:
 	// 1. `xoga run [-c /etc/xoga/xoga.conf]`
 	// 2. `xoga -c /etc/xoga/xoga.conf` (soga@.service flag compatibility)
+	// 3. Zero-arg container startup when `IS_DOCKER=true` or `XOGA_DAEMON=true` (vaxilu/soga Docker compatibility)
 	if len(args) > 0 && (args[0] == "run" || args[0] == "-c" || strings.HasPrefix(args[0], "-c=")) {
 		runArgs := args
 		if args[0] == "run" {
@@ -28,9 +29,22 @@ func main() {
 		}
 		os.Exit(runDaemon(runArgs))
 	}
+	if len(args) == 0 && isEnvDaemonMode() {
+		os.Exit(runDaemon(nil))
+	}
 
 	// Management CLI / Interactive TUI mode (compatible with soga & soga-cmd)
 	os.Exit(cli.RunCommand(args))
+}
+
+func isEnvDaemonMode() bool {
+	for _, k := range []string{"IS_DOCKER", "XOGA_DAEMON"} {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+		if v == "1" || v == "true" || v == "yes" {
+			return true
+		}
+	}
+	return false
 }
 
 func runDaemon(args []string) int {
@@ -40,7 +54,7 @@ func runDaemon(args []string) int {
 		return 2
 	}
 
-	cfg, err := config.Load(*confPath)
+	cfg, err := config.LoadWithEnv(*confPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config %s: %v\n", *confPath, err)
 		return 1

@@ -61,7 +61,13 @@ type Client interface {
 }
 
 func NewClient(cfg *config.Config) (Client, error) {
-	httpCli := newKeepAliveHTTPClient()
+	return NewClientWithHTTP(cfg, NewKeepAliveHTTPClient(4))
+}
+
+func NewClientWithHTTP(cfg *config.Config, httpCli *http.Client) (Client, error) {
+	if httpCli == nil {
+		httpCli = NewKeepAliveHTTPClient(4)
+	}
 	switch cfg.NormalizedPanelType() {
 	case "uniproxy":
 		return NewUniProxyClient(cfg, httpCli), nil
@@ -72,9 +78,12 @@ func NewClient(cfg *config.Config) (Client, error) {
 	}
 }
 
-// newKeepAliveHTTPClient constructs a low-memory HTTP/1.1 & HTTP/2 client reusing persistent
-// TCP/TLS connections across polling ticks so nodes avoid repeated TLS handshakes.
-func newKeepAliveHTTPClient() *http.Client {
+// NewKeepAliveHTTPClient constructs a low-memory HTTP/1.1 & HTTP/2 client reusing persistent
+// TCP/TLS connections across polling ticks so multi-node instances avoid repeated TLS handshakes.
+func NewKeepAliveHTTPClient(maxPerHost int) *http.Client {
+	if maxPerHost < 2 {
+		maxPerHost = 2
+	}
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -82,8 +91,8 @@ func newKeepAliveHTTPClient() *http.Client {
 			KeepAlive: 60 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          4,
-		MaxIdleConnsPerHost:   2,
+		MaxIdleConns:          maxPerHost * 2,
+		MaxIdleConnsPerHost:   maxPerHost,
 		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

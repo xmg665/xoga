@@ -125,3 +125,70 @@ type="direct"
 		t.Fatal("expected port 6889 in range 6881-6999 to be blocked")
 	}
 }
+
+func TestMultiNodeExitListenBindingRoutesTOML(t *testing.T) {
+	tomlPath := filepath.Join(t.TempDir(), "routes.toml")
+	content := `
+[[routes]]
+rules=["node_id:781"]
+[[routes.Outs]]
+listen = "10.163.0.100"
+type = "direct"
+
+[[routes]]
+rules=["node_id:782"]
+[[routes.Outs]]
+listen = "10.163.0.108"
+type = "direct"
+
+[[routes]]
+rules=["node_id:851", "geosite:openai"]
+[[routes.Outs]]
+type = "socks"
+server = "127.0.0.1"
+port = 40000
+`
+	if err := os.WriteFile(tomlPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	eng := NewEngine(true, "", "", tomlPath, nil)
+
+	r781 := eng.DecideForNode(781, "www.youtube.com", 443, "", "tls")
+	if r781.Action != ActionProxy || len(r781.Outbounds) != 1 || r781.Outbounds[0].Type != "direct" || r781.Outbounds[0].ListenIPv4 != "10.163.0.100" {
+		t.Fatalf("expected node 781 source bind 10.163.0.100, got %+v", r781)
+	}
+
+	r782 := eng.DecideForNode(782, "1.1.1.1", 443, "", "tls")
+	if r782.Action != ActionProxy || len(r782.Outbounds) != 1 || r782.Outbounds[0].ListenIPv4 != "10.163.0.108" {
+		t.Fatalf("expected node 782 source bind 10.163.0.108, got %+v", r782)
+	}
+
+	// Scoped node_id + domain rule: node 851 + chatgpt.com -> socks5:40000, node 851 + apple.com -> ActionDirect
+	r851AI := eng.DecideForNode(851, "chatgpt.com", 443, "", "tls")
+	if r851AI.Action != ActionProxy || r851AI.Outbounds[0].Type != "socks5" {
+		t.Fatalf("expected node 851 chatgpt.com -> WARP socks5, got %+v", r851AI)
+	}
+	r851Direct := eng.DecideForNode(851, "www.apple.com", 443, "", "tls")
+	if r851Direct.Action != ActionDirect {
+		t.Fatalf("expected node 851 www.apple.com -> ActionDirect, got %+v", r851Direct)
+	}
+}
+
+func BenchmarkACLSuffixMap10000Domains(b *testing.B) {
+	cr := newCompiledRule("bench", ActionBlock)
+	for i := 0; i < 10000; i++ {
+		cr.addPattern("domain:blocked-site-" + string(rune('a'+(i%26))) + ".example" + string(rune('0'+(i%10))) + ".org")
+	}
+	cr.addPattern("domain:openai.com")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !cr.matchDomain("api.chat.openai.com") {
+			b.Fatal("expected match")
+		}
+		if cr.matchDomain("cdn.cloudflare.net") {
+			b.Fatal("unexpected match")
+		}
+	}
+}

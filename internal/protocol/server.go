@@ -136,6 +136,9 @@ type Server struct {
 	ssPSK    []byte
 	ssPSKBlk cipher.Block
 
+	ipHints ipHintCache
+	replay  replayFilter
+
 	userIdx atomic.Pointer[UserIndex]
 	aclEng  atomic.Pointer[acl.Engine]
 
@@ -220,7 +223,7 @@ func (s *Server) Start() error {
 	}
 	addr := net.JoinHostPort(listenIP, strconv.Itoa(port))
 
-	rawLn, err := net.Listen("tcp", addr)
+	rawLn, err := listenTCP(context.Background(), addr)
 	if err != nil {
 		return fmt.Errorf("listen tcp %s: %w", addr, err)
 	}
@@ -357,7 +360,7 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 
 	sn := sniff.Inspect(peeked)
 	aclEng := s.aclEng.Load()
-	route := aclEng.DecideWithPort(destHost, destPort, sn.Domain, sn.Protocol)
+	route := aclEng.DecideForNode(s.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		logger.Debugf("blocked user=%d dest=%s:%d sni=%s proto=%s rule=%s", user.ID, destHost, destPort, sn.Domain, sn.Protocol, route.RuleName)
 		return
