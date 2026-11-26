@@ -14,6 +14,16 @@ func TestSniffHTTPHostAndBT(t *testing.T) {
 	if btRes.Protocol != "bittorrent" {
 		t.Fatalf("expected bittorrent detection, got %+v", btRes)
 	}
+
+	// IP literals (IPv4 & bracketed IPv6) in Host header must NOT be returned as spoofed domains!
+	ipHostReq := []byte("GET / HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n\r\n")
+	if h, ok := SniffHTTPHost(ipHostReq); ok || h != "" {
+		t.Fatalf("expected IPv6 literal Host to be rejected by SniffHTTPHost, got %q", h)
+	}
+	loHostReq := []byte("GET / HTTP/1.1\r\nHost: 127.0.0.1:6379\r\n\r\n")
+	if h, ok := SniffHTTPHost(loHostReq); ok || h != "" {
+		t.Fatalf("expected loopback IP Host to be rejected by SniffHTTPHost, got %q", h)
+	}
 }
 
 func TestSniffTLSClientHello(t *testing.T) {

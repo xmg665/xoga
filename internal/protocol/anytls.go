@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
 	"github.com/xmg665/xoga/internal/relay"
+	"github.com/xmg665/xoga/internal/sniff"
 	"github.com/xmg665/xoga/internal/stats"
 )
 
@@ -70,7 +72,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 			return
 		}
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
 	sessConnID, err := user.AcquireMuxSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
@@ -83,6 +85,8 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 		srv:     s,
 		conn:    conn,
 		user:    user,
+		ctrlCh:  make(chan anytlsCtrlFrame, 64),
+		doneCh:  make(chan struct{}),
 		streams: make(map[uint32]*anytlsStream),
 	}
 	if scheme := strings.TrimSpace(s.spec.AnyTLSPaddingScheme); scheme != "" {
@@ -90,6 +94,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 		sess.paddingScheme = []byte(scheme)
 		sess.paddingMD5 = hex.EncodeToString(sum[:])
 	}
+	go sess.runCtrlWriter()
 	defer sess.closeAllStreams()
 
 	idleDur := time.Duration(s.cfg.ConnIdleSec) * time.Second
@@ -143,17 +148,17 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 			}
 			if clientVer >= 2 {
 				sess.peerVersion.Store(int32(clientVer))
-				_ = sess.writeFrame(anytlsCmdServerSettings, 0, []byte("v=2"))
+				sess.enqueueCtrl(anytlsCmdServerSettings, 0, []byte("v=2"))
 			}
 			if len(sess.paddingScheme) > 0 && clientPadMD5 != sess.paddingMD5 {
-				_ = sess.writeFrame(anytlsCmdUpdatePaddingScheme, 0, sess.paddingScheme)
+				sess.enqueueCtrl(anytlsCmdUpdatePaddingScheme, 0, sess.paddingScheme)
 			}
 
 		case anytlsCmdHeartRequest:
 			if dataLen > 0 {
 				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
 			}
-			_ = sess.writeFrame(anytlsCmdHeartResponse, streamID, nil)
+			sess.enqueueCtrl(anytlsCmdHeartResponse, streamID, nil)
 
 		case anytlsCmdHeartResponse:
 			if dataLen > 0 {
@@ -165,7 +170,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
 			}
 			if !sess.seenSettings.Load() {
-				_ = sess.writeFrame(anytlsCmdAlert, 0, []byte("cmdSettings required before cmdSYN"))
+				sess.enqueueCtrl(anytlsCmdAlert, 0, []byte("cmdSettings required before cmdSYN"))
 				return
 			}
 			st := sess.openStream(streamID)
@@ -201,6 +206,12 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 	}
 }
 
+type anytlsCtrlFrame struct {
+	cmd      byte
+	streamID uint32
+	data     []byte
+}
+
 type anytlsSession struct {
 	srv           *Server
 	conn          net.Conn
@@ -211,11 +222,41 @@ type anytlsSession struct {
 	seenSettings atomic.Bool
 	peerVersion  atomic.Int32
 	closed       atomic.Bool
+	closeOnce    sync.Once
+
+	ctrlCh chan anytlsCtrlFrame
+	doneCh chan struct{}
 
 	writeMu sync.Mutex
 
 	streamsMu sync.RWMutex
 	streams   map[uint32]*anytlsStream
+}
+
+func (s *anytlsSession) enqueueCtrl(cmd byte, streamID uint32, data []byte) {
+	if s.closed.Load() {
+		return
+	}
+	select {
+	case s.ctrlCh <- anytlsCtrlFrame{cmd: cmd, streamID: streamID, data: data}:
+	default:
+		// Control queue saturated (stalled peer) -> close session cleanly rather than deadlocking reader!
+		s.closed.Store(true)
+		_ = s.conn.Close()
+	}
+}
+
+func (s *anytlsSession) runCtrlWriter() {
+	for {
+		select {
+		case <-s.doneCh:
+			return
+		case f := <-s.ctrlCh:
+			if err := s.writeFrame(f.cmd, f.streamID, f.data); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *anytlsSession) writeFrame(cmd byte, streamID uint32, data []byte) error {
@@ -224,6 +265,9 @@ func (s *anytlsSession) writeFrame(cmd byte, streamID uint32, data []byte) error
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.closed.Load() {
+		return net.ErrClosed
+	}
 
 	var hdr [7]byte
 	hdr[0] = cmd
@@ -231,12 +275,18 @@ func (s *anytlsSession) writeFrame(cmd byte, streamID uint32, data []byte) error
 	binary.BigEndian.PutUint16(hdr[5:7], uint16(len(data)))
 
 	_ = s.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	var err error
 	if len(data) == 0 {
-		_, err := s.conn.Write(hdr[:])
-		return err
+		_, err = s.conn.Write(hdr[:])
+	} else {
+		bufs := net.Buffers{hdr[:], data}
+		_, err = bufs.WriteTo(s.conn)
 	}
-	bufs := net.Buffers{hdr[:], data}
-	_, err := bufs.WriteTo(s.conn)
+	if err != nil {
+		// Prevent subsequent stream writes from injecting headers into a partially-written frame!
+		s.closed.Store(true)
+		_ = s.conn.Close()
+	}
 	return err
 }
 
@@ -279,6 +329,9 @@ func (s *anytlsSession) finFromPeer(id uint32) {
 
 func (s *anytlsSession) closeAllStreams() {
 	s.closed.Store(true)
+	s.closeOnce.Do(func() {
+		close(s.doneCh)
+	})
 	s.streamsMu.Lock()
 	list := make([]*anytlsStream, 0, len(s.streams))
 	for _, st := range s.streams {
@@ -297,7 +350,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 
 	if err := s.user.AcquireSubStream(); err != nil {
 		if s.peerVersion.Load() >= 2 {
-			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte(err.Error()))
+			s.enqueueCtrl(anytlsCmdSYNACK, st.id, []byte(err.Error()))
 		}
 		return
 	}
@@ -307,7 +360,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 	destHost, destPort, err := parseSOCKS5Addr(st)
 	if err != nil {
 		if s.peerVersion.Load() >= 2 {
-			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte("invalid destination address"))
+			s.enqueueCtrl(anytlsCmdSYNACK, st.id, []byte("invalid destination address"))
 		}
 		return
 	}
@@ -321,19 +374,56 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 		return
 	}
 
-	// In AnyTLS v2, send `cmdSYNACK` once outbound connection is established (or error text if blocked/failed).
-	if s.peerVersion.Load() >= 2 {
-		st.needSYNACK.Store(true)
+	// Pre-check ACL on destination host/port so blocked targets receive clean v2 SYNACK error immediately
+	aclEng := s.srv.aclEng.Load()
+	preRoute := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, "", "")
+	if preRoute.Action == acl.ActionBlock {
+		if s.peerVersion.Load() >= 2 {
+			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte("blocked by audit policy"))
+		}
+		return
 	}
-	s.srv.connectStreamNoAcquire(st, s.user, destHost, destPort, nil, func(dialErr error) {
-		if st.needSYNACK.Swap(false) {
-			if dialErr != nil {
-				_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte(dialErr.Error()))
-			} else {
-				_ = s.writeFrame(anytlsCmdSYNACK, st.id, nil)
+
+	// Acknowledge stream (v=2) BEFORE peeking so AnyTLS v2 clients transmit their first payload
+	// (TLS ClientHello / HTTP / BitTorrent), enabling full SNI unlock & BitTorrent blocking on both v1 and v2!
+	if s.peerVersion.Load() >= 2 {
+		if err := s.writeFrame(anytlsCmdSYNACK, st.id, nil); err != nil {
+			return
+		}
+	}
+
+	peeked, perr := s.srv.peekInitialPayload(st)
+	if perr != nil {
+		return
+	}
+	sn := sniff.Inspect(peeked)
+	route := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
+	if route.Action == acl.ActionBlock {
+		return
+	}
+
+	effectiveHost := destHost
+	if sn.Domain != "" && s.srv.cfg.DomainSniff {
+		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
+			if s.srv.cfg.ForceDomainSniff || route.IsRemoteProxy || s.srv.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
+				effectiveHost = sn.Domain
 			}
 		}
-	})
+	}
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	remoteConn, derr := relay.DialOutbound(dialCtx, effectiveHost, destPort, route, s.srv.dnsRes, 10*time.Second)
+	cancel()
+	if derr != nil {
+		return
+	}
+	defer remoteConn.Close()
+
+	idleDur := time.Duration(s.srv.cfg.ConnIdleSec) * time.Second
+	if idleDur < 15*time.Second {
+		idleDur = 120 * time.Second
+	}
+	relay.PipeBidirectional(st, remoteConn, peeked, s.user, s.srv.tracker.NodeLimiter, idleDur, false)
 }
 
 // handleUoTStream implements `sing-box` UDP-over-TCP v1 & v2 (`sp.v2.udp-over-tcp.arpa`) over an AnyTLS stream.
@@ -355,15 +445,18 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 	}
 
-	var localUDP *net.UDPAddr
+	var initRoute acl.OutboundTarget
 	if isConnect && fixedHost != "" {
-		initRoute := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, fixedHost, fixedPort, "", "")
-		localUDP = relay.LocalUDPAddrForRoute(initRoute, false)
+		initRoute = s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, fixedHost, fixedPort, "", "")
+		if initRoute.Action == acl.ActionBlock {
+			return
+		}
 	} else {
-		nodeRoute := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, "0.0.0.0", 53, "", "")
-		localUDP = relay.LocalUDPAddrForRoute(nodeRoute, false)
+		initRoute = s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, "1.1.1.1", 443, "", "")
 	}
-	udpConn, err := net.ListenUDP("udp", localUDP)
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	udpConn, err := relay.DialUDPForRoute(dctx, initRoute, false, s.srv.dnsRes)
+	dcancel()
 	if err != nil {
 		return
 	}
@@ -373,6 +466,9 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
 	}
+
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().Unix())
 
 	done := make(chan struct{})
 	go func() {
@@ -386,10 +482,19 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 				return
 			}
 			_ = udpConn.SetReadDeadline(time.Now().Add(idleDur))
-			n, raddr, rerr := udpConn.ReadFromUDP(buf)
+			n, raddr, rerr := udpConn.ReadFrom(buf)
 			if rerr != nil {
+				var ne net.Error
+				if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
 				return
 			}
+			ua, ok := raddr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			lastActive.Store(time.Now().Unix())
 			if ul := s.user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -398,7 +503,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 
 			var frame bytes.Buffer
 			if !isConnect {
-				writeUoTAddr(&frame, raddr)
+				writeUoTAddr(&frame, ua)
 			}
 			var l2 [2]byte
 			binary.BigEndian.PutUint16(l2[:], uint16(n))
@@ -424,11 +529,17 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 			var aerr error
 			host, port, aerr = readUoTAddr(st)
 			if aerr != nil {
+				if errors.Is(aerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
 				break
 			}
 		}
 		var l2 [2]byte
 		if _, err := io.ReadFull(st, l2[:]); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && isConnect && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				continue
+			}
 			break
 		}
 		pktLen := int(binary.BigEndian.Uint16(l2[:]))
@@ -440,6 +551,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 				break
 			}
 		}
+		lastActive.Store(time.Now().Unix())
 
 		route := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {
@@ -457,7 +569,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 		s.srv.tracker.NodeLimiter.Wait(pktLen)
 		s.user.AddUpload(int64(pktLen))
-		_, _ = udpConn.WriteToUDP(inBuf[:pktLen], dstAddr)
+		_, _ = udpConn.WriteTo(inBuf[:pktLen], dstAddr)
 	}
 
 	_ = udpConn.Close()
@@ -559,7 +671,7 @@ func (s *anytlsStream) pushRx(data []byte) {
 	s.rxMu.Unlock()
 	if overflow {
 		s.sess.removeStream(s.id)
-		_ = s.sess.writeFrame(anytlsCmdFIN, s.id, nil)
+		s.sess.enqueueCtrl(anytlsCmdFIN, s.id, nil)
 	}
 }
 
@@ -613,20 +725,22 @@ func (s *anytlsStream) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (s *anytlsStream) CloseWrite() error {
+// sendFINOnce transmits `anytlsCmdFIN` when closing locally if peer has not already sent `cmdFIN`.
+// Note: `anytlsStream` intentionally does NOT implement `CloseWrite()` because per AnyTLS spec,
+// `cmdFIN` is a non-echoed full close (implementing `CloseWrite()` caused 15s-300s hangs on server EOF).
+func (s *anytlsStream) sendFINOnce() {
 	s.finOnce.Do(func() {
 		s.rxMu.Lock()
 		gotPeerFIN := s.peerEOF
 		s.rxMu.Unlock()
 		if !gotPeerFIN && !s.sess.closed.Load() {
-			_ = s.sess.writeFrame(anytlsCmdFIN, s.id, nil)
+			s.sess.enqueueCtrl(anytlsCmdFIN, s.id, nil)
 		}
 	})
-	return nil
 }
 
 func (s *anytlsStream) Close() error {
-	_ = s.CloseWrite()
+	s.sendFINOnce()
 	s.sess.removeStream(s.id)
 	s.rxMu.Lock()
 	s.localClose = true

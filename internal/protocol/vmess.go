@@ -11,12 +11,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"hash"
 	"hash/crc32"
 	"hash/fnv"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -386,9 +388,9 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	if err != nil || (cmd != 0x01 && cmd != 0x02) {
 		return nil, nil, "", 0, 0, false
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
-	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType)
+	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType, cmd == 0x02)
 	if err != nil {
 		return nil, nil, "", 0, 0, false
 	}
@@ -408,14 +410,14 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 		return
 	}
 
-	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	udpAddr, err := relay.ResolveUDPTargetForRoute(rctx, destHost, destPort, route, s.dnsRes)
-	rcancel()
 	if err != nil {
+		rcancel()
 		return
 	}
-	localUDP := relay.LocalUDPAddrForRoute(route, udpAddr.IP.To4() == nil)
-	targetUDP, err := net.DialUDP("udp", localUDP, udpAddr)
+	targetUDP, err := relay.DialUDPForRoute(rctx, route, udpAddr.IP.To4() == nil, s.dnsRes)
+	rcancel()
 	if err != nil {
 		return
 	}
@@ -426,6 +428,9 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 		idleDur = 60 * time.Second
 	}
 
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().Unix())
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -434,13 +439,18 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 		defer bufpool.Put(bp)
 		for {
 			_ = targetUDP.SetReadDeadline(time.Now().Add(idleDur))
-			n, err := targetUDP.Read(buf)
+			n, _, err := targetUDP.ReadFrom(buf)
 			if err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
 				return
 			}
 			if n <= 0 || n > 65535-80 {
 				continue
 			}
+			lastActive.Store(time.Now().Unix())
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -462,17 +472,22 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 		_ = vmConn.SetReadDeadline(time.Now().Add(idleDur))
 		n, err := vmConn.readSingleChunk(inBuf)
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				continue
+			}
 			break
 		}
 		if n == 0 {
 			continue
 		}
+		lastActive.Store(time.Now().Unix())
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(n)
 		}
 		s.tracker.NodeLimiter.Wait(n)
 		user.AddUpload(int64(n))
-		_, _ = targetUDP.Write(inBuf[:n])
+		_, _ = targetUDP.WriteTo(inBuf[:n], udpAddr)
 	}
 
 	_ = targetUDP.Close()
@@ -488,6 +503,7 @@ type vmessStreamConn struct {
 	wsFast       wsPrependWriter
 	reader       io.Reader
 	respV        byte
+	rawStream    bool
 	optChunkMask bool
 	optGlobalPad bool
 	secType      byte
@@ -497,33 +513,41 @@ type vmessStreamConn struct {
 	respKey [16]byte
 	respIV  [16]byte
 
-	readMu    sync.Mutex
-	readAEAD  cipher.AEAD
-	readMask  sha3.ShakeHash
-	readCount uint16
-	readBuf   *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
-	leftover  []byte
+	readMu         sync.Mutex
+	readAEAD       cipher.AEAD
+	readMask       sha3.ShakeHash
+	readCount      uint16
+	hasPendingMask bool
+	pendingPadLen  int
+	pendingMask    uint16
+	hdrBytes       [2]byte
+	hdrRead        int
+	readBuf        *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
+	leftover       []byte
 
 	writeMu    sync.Mutex
 	sentResp   bool
+	sentEOF    bool
 	writeAEAD  cipher.AEAD
 	writeMask  sha3.ShakeHash
 	writeCount uint16
 }
 
-func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV, opt, secType byte) (*vmessStreamConn, error) {
+func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV, opt, secType byte, isUDP bool) (*vmessStreamConn, error) {
 	rk := sha256.Sum256(reqKey[:])
 	riv := sha256.Sum256(reqIV[:])
 	if br == nil {
 		br = c
 	}
-	chunkMask := (opt & 0x04) != 0
+	rawStream := !isUDP && (secType == 0x06 || (opt&0x01) == 0)
+	chunkMask := !rawStream && (opt&0x04) != 0
 	wsFast, _ := c.(wsPrependWriter)
 	vc := &vmessStreamConn{
 		Conn:         c,
 		wsFast:       wsFast,
 		reader:       br,
 		respV:        respV,
+		rawStream:    rawStream,
 		optChunkMask: chunkMask,
 		optGlobalPad: chunkMask && (opt&0x08) != 0,
 		secType:      secType,
@@ -574,8 +598,10 @@ func makeVMessBodyAEAD(secType byte, key16 []byte) (cipher.AEAD, error) {
 		copy(k32[0:16], m1[:])
 		copy(k32[16:32], m2[:])
 		return chacha20poly1305.New(k32[:])
-	default: // None (0x05) / Zero (0x06)
+	case 5, 6: // None (0x05) / Zero (0x06)
 		return nil, nil
+	default:
+		return nil, errors.New("unsupported VMess security cipher")
 	}
 }
 
@@ -598,6 +624,22 @@ func (v *vmessStreamConn) releaseReadBuf() {
 	v.readMu.Unlock()
 }
 
+func (v *vmessStreamConn) FlushResponseHeader() error {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if !v.sentResp {
+		v.sentResp = true
+		if err := v.sendAEADResponseHeader(); err != nil {
+			return err
+		}
+	}
+	if !v.rawStream && !v.sentEOF {
+		v.sentEOF = true
+		_ = v.writeFramedLocked(nil)
+	}
+	return nil
+}
+
 func (v *vmessStreamConn) Close() error {
 	v.releaseReadBuf()
 	return v.Conn.Close()
@@ -607,17 +649,33 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	v.readMu.Lock()
 	defer v.readMu.Unlock()
 
-	padLen := 0
-	if v.optGlobalPad {
-		padLen = int(v.nextMask(v.readMask) % 64)
+	if v.rawStream {
+		return v.reader.Read(dst)
 	}
-	sizeMask := v.nextMask(v.readMask)
 
-	var lb [2]byte
-	if _, err := io.ReadFull(v.reader, lb[:]); err != nil {
-		return 0, err
+	// Preserve Shake128 mask & partial 2-byte length progress across 150ms SNI peek timeouts!
+	if !v.hasPendingMask {
+		v.pendingPadLen = 0
+		if v.optGlobalPad {
+			v.pendingPadLen = int(v.nextMask(v.readMask) % 64)
+		}
+		v.pendingMask = v.nextMask(v.readMask)
+		v.hasPendingMask = true
 	}
-	size := int(binary.BigEndian.Uint16(lb[:]) ^ sizeMask)
+
+	for v.hdrRead < 2 {
+		n, err := v.reader.Read(v.hdrBytes[v.hdrRead:2])
+		v.hdrRead += n
+		if err != nil {
+			return 0, err
+		}
+	}
+	padLen := v.pendingPadLen
+	sizeMask := v.pendingMask
+	v.hdrRead = 0
+	v.hasPendingMask = false
+
+	size := int(binary.BigEndian.Uint16(v.hdrBytes[:]) ^ sizeMask)
 
 	overhead := 0
 	if v.readAEAD != nil {
@@ -626,7 +684,18 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	if size == overhead+padLen {
 		if size > 0 {
 			var eofBuf [128]byte
-			_, _ = io.ReadFull(v.reader, eofBuf[:size])
+			if _, err := io.ReadFull(v.reader, eofBuf[:size]); err != nil {
+				return 0, err
+			}
+			if v.readAEAD != nil {
+				var nonce [12]byte
+				binary.BigEndian.PutUint16(nonce[0:2], v.readCount)
+				copy(nonce[2:12], v.reqIV[2:12])
+				v.readCount++
+				if _, err := v.readAEAD.Open(eofBuf[:0], nonce[:], eofBuf[:overhead], nil); err != nil {
+					return 0, err
+				}
+			}
 		}
 		return 0, io.EOF
 	}
@@ -754,6 +823,9 @@ func (v *vmessStreamConn) Write(p []byte) (int, error) {
 		if err := v.sendAEADResponseHeader(); err != nil {
 			return 0, err
 		}
+	}
+	if v.rawStream {
+		return v.Conn.Write(p)
 	}
 
 	total := 0

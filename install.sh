@@ -74,12 +74,43 @@ install_xoga() {
         url="https://github.com/${REPO}/releases/download/v${target_ver}/xoga-linux-${arch}.tar.gz"
     fi
 
-    curl -fL --retry 3 -o /tmp/xoga.tar.gz "${url}"
+    local tmp_tar
+    tmp_tar="$(mktemp /tmp/xoga-release.XXXXXX.tar.gz)"
+    local tmp_stage
+    tmp_stage="$(mktemp -d /tmp/xoga-stage.XXXXXX)"
+    trap 'rm -rf "${tmp_tar}" "${tmp_stage}"' EXIT
+
+    curl -fL --retry 3 -o "${tmp_tar}" "${url}"
     if [[ $? -ne 0 ]]; then
         echo -e "${red}下载失败: ${url}${plain}"
         echo -e "${yellow}请检查服务器是否可访问 GitHub Releases 或指定版本号是否存在${plain}"
         exit 1
     fi
+
+    if ! tar -xzf "${tmp_tar}" -C "${tmp_stage}"; then
+        echo -e "${red}安装包解压校验失败，已中止安装以保护现有运行环境${plain}"
+        exit 1
+    fi
+    rm -f "${tmp_tar}"
+
+    # Support archives packed either flat or with top-level xoga/ directory
+    if [[ -d "${tmp_stage}/xoga" && -f "${tmp_stage}/xoga/xoga" ]]; then
+        mv "${tmp_stage}/xoga/"* "${tmp_stage}/"
+        rmdir "${tmp_stage}/xoga" 2>/dev/null || true
+    fi
+    if [[ ! -f "${tmp_stage}/xoga" ]]; then
+        echo -e "${red}安装包内未找到 xoga 可执行文件${plain}"
+        exit 1
+    fi
+
+    local is_upgrade=0
+    if [[ -f /etc/systemd/system/xoga.service || -d /usr/local/xoga ]]; then
+        is_upgrade=1
+    fi
+    local was_default_active=0
+    local was_default_enabled=0
+    systemctl is-active --quiet xoga 2>/dev/null && was_default_active=1
+    systemctl is-enabled --quiet xoga 2>/dev/null && was_default_enabled=1
 
     local active_tpl_units=()
     while IFS= read -r u; do
@@ -93,14 +124,8 @@ install_xoga() {
 
     rm -rf /usr/local/xoga
     mkdir -p /usr/local/xoga /etc/xoga
-    tar -xzf /tmp/xoga.tar.gz -C /usr/local/xoga
-    rm -f /tmp/xoga.tar.gz
-
-    # Support archives packed either flat or with top-level xoga/ directory
-    if [[ -d /usr/local/xoga/xoga && -f /usr/local/xoga/xoga/xoga ]]; then
-        mv /usr/local/xoga/xoga/* /usr/local/xoga/
-        rmdir /usr/local/xoga/xoga 2>/dev/null || true
-    fi
+    mv "${tmp_stage}/"* /usr/local/xoga/
+    rm -rf "${tmp_stage}"
 
     chmod +x /usr/local/xoga/xoga
     ln -sf /usr/local/xoga/xoga /usr/bin/xoga
@@ -108,7 +133,9 @@ install_xoga() {
     cp -f /usr/local/xoga/xoga.service /etc/systemd/system/xoga.service
     cp -f /usr/local/xoga/xoga@.service /etc/systemd/system/xoga@.service
     systemctl daemon-reload
-    systemctl enable xoga >/dev/null 2>&1
+    if [[ ${is_upgrade} -eq 0 || ${was_default_enabled} -eq 1 ]]; then
+        systemctl enable xoga >/dev/null 2>&1 || true
+    fi
 
     for f in blockList whiteList dns.yml routes.toml; do
         if [[ ! -f "/etc/xoga/${f}" && -f "/usr/local/xoga/${f}" ]]; then
@@ -118,22 +145,27 @@ install_xoga() {
 
     local installed_ver
     installed_ver="$(/usr/local/xoga/xoga version 2>/dev/null || echo "latest")"
-    echo -e "${green}xoga v${installed_ver}${plain} 安装完成，已设置开机自启！"
+    echo -e "${green}xoga v${installed_ver}${plain} 安装完成！"
 
-    if [[ ! -f /etc/xoga/xoga.conf ]]; then
+    # Always restart any previously active `xoga@*.service` template instances!
+    for u in "${active_tpl_units[@]}"; do
+        systemctl restart "${u}" >/dev/null 2>&1 || true
+    done
+
+    if [[ ! -f /etc/xoga/xoga.conf && ${is_upgrade} -eq 0 ]]; then
         cp /usr/local/xoga/xoga.conf /etc/xoga/xoga.conf
+        chmod 640 /etc/xoga/xoga.conf
         echo -e "${yellow}首次全新安装，已生成默认配置 /etc/xoga/xoga.conf${plain}"
-    else
+    elif [[ ${was_default_active} -eq 1 && -f /etc/xoga/xoga.conf ]]; then
         systemctl restart xoga
-        for u in "${active_tpl_units[@]}"; do
-            systemctl restart "${u}" >/dev/null 2>&1 || true
-        done
         sleep 1
         if check_status; then
             echo -e "${green}xoga 服务已自动重启成功${plain}"
         else
             echo -e "${yellow}xoga 暂未就绪，请检查配置或运行 xoga log 查看详情${plain}"
         fi
+    elif [[ ${#active_tpl_units[@]} -gt 0 ]]; then
+        echo -e "${green}已自动重启 ${#active_tpl_units[@]} 个多开实例服务${plain}"
     fi
 
     echo ""

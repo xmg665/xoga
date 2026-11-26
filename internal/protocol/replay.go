@@ -8,9 +8,9 @@ import (
 )
 
 const (
-	replayWords      = 2048              // 2048 * 64 = 131,072 bits (16 KiB per generation, 32 KiB total)
+	replayWords      = 16384             // 16384 * 64 = 1,048,576 bits (128 KiB per generation, <0.02% FP at 500 conn/s)
 	replayBitMask    = replayWords*64 - 1
-	replayWindowSecs = 120
+	replayWindowSecs = 65
 )
 
 // replayFilter implements a lock-free dual-generation rotating atomic Bloom filter (modeled after

@@ -8,8 +8,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
+	"time"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -60,10 +62,29 @@ func readLimitedWSLine(br *bufio.Reader, maxLen int) (string, error) {
 	}
 }
 
+// isTrustedProxyPeer reports whether the immediate TCP peer is loopback or private/link-local
+// (e.g. local Nginx/HAProxy/Caddy/cloudflared), preventing public clients from spoofing X-Forwarded-For / CF-Connecting-IP.
+func isTrustedProxyPeer(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	var ip netip.Addr
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		if parsed, ok2 := netip.AddrFromSlice(ta.IP); ok2 {
+			ip = parsed.Unmap()
+		}
+	} else if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		if parsed, perr := netip.ParseAddr(host); perr == nil {
+			ip = parsed.Unmap()
+		}
+	}
+	return ip.IsValid() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+}
+
 // AcceptWebSocket performs a zero-dependency RFC 6455 HTTP Upgrade handshake, supports
 // Xray/Sing-box `Sec-WebSocket-Protocol` base64url Early Data (`?ed=2048`), and extracts
-// real client IPs from CDN/reverse-proxy headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`).
-func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
+// real client IPs from CDN/reverse-proxy headers ONLY when the immediate peer is a trusted proxy.
+func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (net.Conn, error) {
 	br := wsReaderPool.Get().(*bufio.Reader)
 	br.Reset(c)
 	reqLine, err := readLimitedWSLine(br, 4096)
@@ -89,6 +110,7 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 			cleanExp = cleanExp[:qIdx]
 		}
 		if reqPath != cleanExp {
+			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 			br.Reset(nil)
 			wsReaderPool.Put(br)
@@ -144,6 +166,7 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 	}
 
 	if wsKey == "" {
+		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		_, _ = c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
 		br.Reset(nil)
 		wsReaderPool.Put(br)
@@ -180,14 +203,17 @@ func AcceptWebSocket(c net.Conn, expectedPath string) (net.Conn, error) {
 		resp.WriteString("\r\n")
 	}
 	resp.WriteString("\r\n")
+	_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.Write([]byte(resp.String())); err != nil {
 		br.Reset(nil)
 		wsReaderPool.Put(br)
 		return nil, err
 	}
+	_ = c.SetWriteDeadline(time.Time{})
 
 	remoteAddr := c.RemoteAddr()
-	if realIPStr != "" {
+	trustHeaders := (len(trustForwarded) > 0 && trustForwarded[0]) || isTrustedProxyPeer(remoteAddr)
+	if trustHeaders && realIPStr != "" {
 		if ip := net.ParseIP(realIPStr); ip != nil {
 			port := 0
 			if ta, ok := remoteAddr.(*net.TCPAddr); ok {
@@ -462,6 +488,7 @@ func (w *wsConn) writeControlFrame(opcode byte, payload []byte) error {
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
+	_ = w.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	hdr := [2]byte{0x80 | opcode, byte(len(payload))}
 	bufs := net.Buffers{hdr[:], payload}
 	_, err := bufs.WriteTo(w.rawWriter)

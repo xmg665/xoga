@@ -2,13 +2,16 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -17,8 +20,8 @@ import (
 	"github.com/xmg665/xoga/internal/stats"
 )
 
-// handleVLESS processes VLESS v0 TCP (0x01) and UDP (0x02) connections.
-// Wire format: Ver(1)==0 | UUID(16) | AddonLen(1) | Addon(N) | Cmd(1) | Port(2) | AddrType(1) | Addr
+// handleVLESS processes VLESS v0 TCP (0x01), UDP (0x02), and Mux/XUDP (0x03) connections.
+// Wire format: Ver(1)==0 | UUID(16) | AddonLen(1) | Addon(N) | Cmd(1) | [Port(2) | AddrType(1) | Addr when Cmd != 0x03]
 func (s *Server) handleVLESS(conn net.Conn) {
 	br := bufio.NewReaderSize(conn, 2048)
 
@@ -51,22 +54,55 @@ func (s *Server) handleVLESS(conn net.Conn) {
 		}
 		flow = decodeVLESSAddonFlow(addonBuf[:addonLen])
 	}
-
-	var cmdPort [3]byte
-	if _, err := io.ReadFull(br, cmdPort[:]); err != nil {
+	if flow != "" && flow != FlowVision && flow != FlowVisionUDP443 {
 		return
 	}
-	cmd := cmdPort[0]
-	destPort := binary.BigEndian.Uint16(cmdPort[1:3])
+	// Enforce configured Vision flow on TCP/Mux streams so unpadded downgrade probes are rejected
+	nodeWantsVision := s.spec.Flow == FlowVision || s.spec.Flow == FlowVisionUDP443
+
+	var cmdByte [1]byte
+	if _, err := io.ReadFull(br, cmdByte[:]); err != nil {
+		return
+	}
+	cmd := cmdByte[0]
+
+	// Cmd 0x03 (RequestCommandMux / XUDP) omits Port & Address from the VLESS header!
+	if cmd == 0x03 {
+		if nodeWantsVision && flow == "" {
+			return
+		}
+		_ = conn.SetDeadline(time.Time{})
+		var muxStream net.Conn
+		if flow == FlowVision || flow == FlowVisionUDP443 {
+			muxStream = newVisionConn(conn, br, uuid)
+		} else {
+			var r io.Reader = conn
+			if br.Buffered() > 0 {
+				r = br
+			}
+			muxStream = &vlessRespConn{Conn: &relay.PrependConn{Conn: conn, Reader: r}}
+		}
+		s.handleVLESSMux(muxStream, user, flow)
+		return
+	}
+
+	var portBytes [2]byte
+	if _, err := io.ReadFull(br, portBytes[:]); err != nil {
+		return
+	}
+	destPort := binary.BigEndian.Uint16(portBytes[:])
 
 	destHost, err := parseVLESSAddr(br)
 	if err != nil {
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	switch cmd {
 	case 0x01: // TCP
+		if nodeWantsVision && flow == "" {
+			return
+		}
 		if flow == FlowVision || flow == FlowVisionUDP443 {
 			visConn := newVisionConn(conn, br, uuid)
 			s.connectAndRelay(visConn, user, destHost, destPort, nil)
@@ -80,7 +116,7 @@ func (s *Server) handleVLESS(conn net.Conn) {
 		}
 		s.connectAndRelay(respConn, user, destHost, destPort, preread)
 	case 0x02: // VLESS UDP (2-byte big-endian length-framed packets)
-		if flow == FlowVision && destPort == 443 {
+		if (flow == FlowVision || s.spec.Flow == FlowVision) && destPort == 443 {
 			// Per XTLS-Vision spec, reject UDP:443 QUIC so client falls back to TCP TLS 1.3
 			return
 		}
@@ -136,11 +172,30 @@ func (v *vlessRespConn) NetConn() net.Conn {
 	return v.Conn
 }
 
+func (v *vlessRespConn) CanHalfCloseWrite() bool {
+	if hc, ok := v.Conn.(interface{ CanHalfCloseWrite() bool }); ok {
+		return hc.CanHalfCloseWrite()
+	}
+	_, ok := v.Conn.(interface{ CloseWrite() error })
+	return ok
+}
+
 func (v *vlessRespConn) CloseWrite() error {
 	if cw, ok := v.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return v.Conn.SetReadDeadline(time.Now())
+	return errors.New("half-close unsupported")
+}
+
+func (v *vlessRespConn) FlushResponseHeader() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.sentResp {
+		v.sentResp = true
+		_, err := v.Conn.Write([]byte{0x00, 0x00})
+		return err
+	}
+	return nil
 }
 
 func (v *vlessRespConn) Write(p []byte) (int, error) {
@@ -189,14 +244,14 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		return
 	}
 
-	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	udpAddr, err := relay.ResolveUDPTargetForRoute(rctx, destHost, destPort, route, s.dnsRes)
-	rcancel()
 	if err != nil {
+		rcancel()
 		return
 	}
-	localUDP := relay.LocalUDPAddrForRoute(route, udpAddr.IP.To4() == nil)
-	targetUDP, err := net.DialUDP("udp", localUDP, udpAddr)
+	targetUDP, err := relay.DialUDPForRoute(rctx, route, udpAddr.IP.To4() == nil, s.dnsRes)
+	rcancel()
 	if err != nil {
 		return
 	}
@@ -207,6 +262,9 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		idleDur = 60 * time.Second
 	}
 
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().Unix())
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -216,10 +274,15 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 
 		for {
 			_ = targetUDP.SetReadDeadline(time.Now().Add(idleDur))
-			n, err := targetUDP.Read(buf[2:])
+			n, _, err := targetUDP.ReadFrom(buf[2:])
 			if err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
 				return
 			}
+			lastActive.Store(time.Now().Unix())
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -242,6 +305,10 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		var lb [2]byte
 		if _, err := io.ReadFull(reader, lb[:]); err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				continue
+			}
 			break
 		}
 		pktLen := int(binary.BigEndian.Uint16(lb[:]))
@@ -251,15 +318,269 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		if _, err := io.ReadFull(reader, inBuf[:pktLen]); err != nil {
 			break
 		}
+		lastActive.Store(time.Now().Unix())
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(pktLen)
 		}
 		s.tracker.NodeLimiter.Wait(pktLen)
 		user.AddUpload(int64(pktLen))
 
-		_, _ = targetUDP.Write(inBuf[:pktLen])
+		_, _ = targetUDP.WriteTo(inBuf[:pktLen], udpAddr)
 	}
 
 	_ = targetUDP.Close()
 	<-done
+}
+
+type xudpSubSession struct {
+	pc       net.PacketConn
+	lastSeen atomic.Int64
+	lastHost string
+	lastPort uint16
+}
+
+// handleVLESSMux implements Xray VLESS `cmd == 0x03` (`RequestCommandMux` / XUDP) UDP sub-session framing,
+// which is the default UDP transport in Xray-core / v2rayN / Mihomo and required for UDP over `xtls-rprx-vision`.
+func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow string) {
+	clientIP := relay.ExtractClientIP(conn.RemoteAddr())
+	connID, err := user.AcquireMuxSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), conn)
+	if err != nil {
+		return
+	}
+	defer user.ReleaseMuxSession(connID)
+
+	idleDur := time.Duration(s.cfg.UDPIdleSec) * time.Second
+	if idleDur < 10*time.Second {
+		idleDur = 60 * time.Second
+	}
+
+	var writeMu sync.Mutex
+	writeXUDP := func(frame []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(idleDur))
+		_, werr := conn.Write(frame)
+		return werr
+	}
+
+	var sessMu sync.Mutex
+	sessions := make(map[uint16]*xudpSubSession)
+	defer func() {
+		sessMu.Lock()
+		for _, us := range sessions {
+			_ = us.pc.Close()
+		}
+		sessions = nil
+		sessMu.Unlock()
+	}()
+
+	bp := bufpool.Get(bufpool.MaxUDPSize)
+	inBuf := *bp
+	defer bufpool.Put(bp)
+
+	var metaLenBuf [2]byte
+	var metaBuf [512]byte
+
+	for {
+		if user.IsDisabled() {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
+		if _, err := io.ReadFull(conn, metaLenBuf[:]); err != nil {
+			return
+		}
+		metaLen := int(binary.BigEndian.Uint16(metaLenBuf[:]))
+		if metaLen < 4 || metaLen > len(metaBuf) {
+			return
+		}
+		if _, err := io.ReadFull(conn, metaBuf[:metaLen]); err != nil {
+			return
+		}
+		sid := binary.BigEndian.Uint16(metaBuf[0:2])
+		status := metaBuf[2]
+		opt := metaBuf[3]
+
+		var host string
+		var port uint16
+		var netType byte
+		hasAddr := false
+
+		if (status == 0x01 || status == 0x02) && metaLen > 4 {
+			mr := bytes.NewReader(metaBuf[4:metaLen])
+			var nb [3]byte
+			if _, err := io.ReadFull(mr, nb[:]); err == nil {
+				netType = nb[0]
+				port = binary.BigEndian.Uint16(nb[1:3])
+				if h, aerr := parseVLESSAddr(mr); aerr == nil {
+					host = h
+					hasAddr = true
+				}
+			}
+		}
+
+		var payload []byte
+		if (opt & 0x01) != 0 {
+			var dlenBuf [2]byte
+			if _, err := io.ReadFull(conn, dlenBuf[:]); err != nil {
+				return
+			}
+			dlen := int(binary.BigEndian.Uint16(dlenBuf[:]))
+			if dlen > len(inBuf) {
+				return
+			}
+			if dlen > 0 {
+				if _, err := io.ReadFull(conn, inBuf[:dlen]); err != nil {
+					return
+				}
+				payload = inBuf[:dlen]
+			}
+		}
+
+		if status == 0x04 { // KeepAlive
+			continue
+		}
+		if status == 0x03 { // End
+			sessMu.Lock()
+			if us := sessions[sid]; us != nil {
+				delete(sessions, sid)
+				_ = us.pc.Close()
+			}
+			sessMu.Unlock()
+			continue
+		}
+		if hasAddr && netType != 0x02 {
+			// Only UDP XUDP sessions are carried over Mux in VLESS/Vision; reject unexpected inner TCP mux cleanly
+			continue
+		}
+		if (flow == FlowVision || s.spec.Flow == FlowVision) && hasAddr && port == 443 {
+			continue
+		}
+
+		sessMu.Lock()
+		us := sessions[sid]
+		if !hasAddr && us != nil {
+			host = us.lastHost
+			port = us.lastPort
+			hasAddr = host != ""
+		}
+		sessMu.Unlock()
+		if !hasAddr || len(payload) == 0 {
+			continue
+		}
+
+		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
+		if route.Action == acl.ActionBlock {
+			continue
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), 4*time.Second)
+		dstUDP, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
+		if err != nil {
+			rcancel()
+			continue
+		}
+
+		sessMu.Lock()
+		us = sessions[sid]
+		if us == nil {
+			if len(sessions) >= 256 {
+				sessMu.Unlock()
+				rcancel()
+				continue
+			}
+			pc, derr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, s.dnsRes)
+			if derr != nil {
+				sessMu.Unlock()
+				rcancel()
+				continue
+			}
+			us = &xudpSubSession{pc: pc, lastHost: host, lastPort: port}
+			us.lastSeen.Store(time.Now().Unix())
+			sessions[sid] = us
+
+			go func(subID uint16, sub *xudpSubSession) {
+				defer func() {
+					_ = sub.pc.Close()
+					sessMu.Lock()
+					if sessions != nil && sessions[subID] == sub {
+						delete(sessions, subID)
+					}
+					sessMu.Unlock()
+				}()
+				rbp := bufpool.Get(bufpool.MaxUDPSize)
+				rbuf := *rbp
+				defer bufpool.Put(rbp)
+
+				for {
+					if user.IsDisabled() {
+						return
+					}
+					_ = sub.pc.SetReadDeadline(time.Now().Add(idleDur))
+					rn, raddr, rerr := sub.pc.ReadFrom(rbuf)
+					if rerr != nil {
+						var ne net.Error
+						if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sub.lastSeen.Load(), 0)) < idleDur {
+							continue
+						}
+						return
+					}
+					ua, ok := raddr.(*net.UDPAddr)
+					if !ok || rn <= 0 {
+						continue
+					}
+					sub.lastSeen.Store(time.Now().Unix())
+					if ul := user.EffectiveLimiter(); ul != nil {
+						ul.Wait(rn)
+					}
+					s.tracker.NodeLimiter.Wait(rn)
+					user.AddDownload(int64(rn))
+
+					frame := encodeXUDPReplyFrame(subID, ua, rbuf[:rn])
+					if writeXUDP(frame) != nil {
+						return
+					}
+				}
+			}(sid, us)
+		} else {
+			us.lastHost = host
+			us.lastPort = port
+			us.lastSeen.Store(time.Now().Unix())
+		}
+		sessMu.Unlock()
+		rcancel()
+
+		if ul := user.EffectiveLimiter(); ul != nil {
+			ul.Wait(len(payload))
+		}
+		s.tracker.NodeLimiter.Wait(len(payload))
+		user.AddUpload(int64(len(payload)))
+		_, _ = us.pc.WriteTo(payload, dstUDP)
+	}
+}
+
+func encodeXUDPReplyFrame(sid uint16, ua *net.UDPAddr, data []byte) []byte {
+	ip4 := ua.IP.To4()
+	metaLen := 4 + 1 + 2 + 1 + 16
+	if ip4 != nil {
+		metaLen = 4 + 1 + 2 + 1 + 4
+	}
+	out := make([]byte, 2+metaLen+2+len(data))
+	binary.BigEndian.PutUint16(out[0:2], uint16(metaLen))
+	binary.BigEndian.PutUint16(out[2:4], sid)
+	out[4] = 0x02 // SessionStatusKeep
+	out[5] = 0x01 // OptionData
+	out[6] = 0x02 // Network UDP
+	binary.BigEndian.PutUint16(out[7:9], uint16(ua.Port))
+	pos := 9
+	if ip4 != nil {
+		out[pos] = 0x01
+		pos++
+		pos += copy(out[pos:], ip4)
+	} else {
+		out[pos] = 0x03
+		pos++
+		pos += copy(out[pos:], ua.IP.To16())
+	}
+	binary.BigEndian.PutUint16(out[pos:pos+2], uint16(len(data)))
+	copy(out[pos+2:], data)
+	return out
 }

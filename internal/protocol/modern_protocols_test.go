@@ -3,6 +3,8 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,6 +21,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
+	"golang.org/x/crypto/sha3"
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/config"
@@ -725,5 +728,397 @@ func TestWSSVLESSAndVisionZeroPadNoDeadlock(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("vision zero-pad Continue stalled for %v", elapsed)
+	}
+}
+
+func startServerSpeaksFirstTCP(t *testing.T, banner []byte) uint16 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = conn.Write(banner)
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+	return uint16(ln.Addr().(*net.TCPAddr).Port)
+}
+
+// TestVMessVisionAndAnyTLSDeepBugRegressions verifies fixes for:
+// 1. P-01: VMess Shake128 readMask preservation across 150ms SNI peek timeout (SSH/server-first protocols)
+// 2. P-02: VLESS Vision 21-byte initial header preservation across 150ms SNI peek timeout & partial header read
+// 3. P-11: VLESS `cmd == 0x03` (Mux / XUDP) UDP sub-session relay + Vision flow downgrade rejection
+// 4. P-07 & P-12: AnyTLS server-closed stream instant exit (<300ms, no 15s hang) + AnyTLS BitTorrent blocking
+// 5. P-09: Classic SS AEAD 24-char alphanumeric password (`EVP_BytesToKey`) + V2Board hyphenated UUID SS2022
+func TestVMessVisionAndAnyTLSDeepBugRegressions(t *testing.T) {
+	sshBanner := []byte("SSH-2.0-OpenSSH_9.6\r\n")
+	sshPort := startServerSpeaksFirstTCP(t, sshBanner)
+	_, echoUDP := startEchoTCPAndUDP(t)
+
+	// --- 1. P-01: VMess server-speaks-first (>150ms delay before client's 1st chunk) must NOT desync Shake128! ---
+	{
+		cfg := config.Default()
+		cfg.ForceCloseSSL = true
+		tr := stats.NewTracker(cfg)
+		users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{{ID: 1, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"}})
+		idx := BuildUserIndexForCipher("vmess", "", users)
+		vPort := freeLocalPort(t, "tcp")
+		srv, err := NewServer(cfg, &panel.NodeSpec{Protocol: "vmess", ListenIP: "127.0.0.1", ServerPort: vPort, Network: "tcp"}, tr, idx, acl.NewEngine(false, "", "", "", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		c, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(vPort)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+
+		// Build VMess AEAD request header with ChunkStream | ChunkMasking | GlobalPadding
+		u := &idx.VMessUsers[0]
+		var reqKey, reqIV, plainAuth, authID [16]byte
+		var connNonce [8]byte
+		_, _ = rand.Read(reqKey[:])
+		_, _ = rand.Read(reqIV[:])
+		_, _ = rand.Read(connNonce[:])
+		binary.BigEndian.PutUint64(plainAuth[0:8], uint64(time.Now().Unix()))
+		// compute crc32 via vmess helper test pattern
+		u.AuthBlock.Encrypt(authID[:], makeAuthIDPlain(plainAuth[8:12]))
+
+		var cmdPlain bytes.Buffer
+		cmdPlain.WriteByte(0x01)
+		cmdPlain.Write(reqIV[:])
+		cmdPlain.Write(reqKey[:])
+		cmdPlain.WriteByte(0x11)              // respV
+		cmdPlain.WriteByte(0x01 | 0x04 | 0x08) // S | M | P
+		cmdPlain.WriteByte(0x03)              // AES-128-GCM
+		cmdPlain.WriteByte(0x00)
+		cmdPlain.WriteByte(0x01) // TCP
+		_ = binary.Write(&cmdPlain, binary.BigEndian, sshPort)
+		cmdPlain.WriteByte(0x01)
+		cmdPlain.Write([]byte{127, 0, 0, 1})
+		appendFNV1a32(&cmdPlain)
+
+		sealedHdr := sealVMessReqHeader(u.CmdKey, authID, connNonce, cmdPlain.Bytes())
+		if _, err := c.Write(sealedHdr); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait >180ms WITHOUT sending any client body chunk -> triggers server's 150ms SNI peek timeout!
+		// Server must connect to SSH backend and deliver SSH banner first!
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var respHdr [38]byte
+		if _, err := io.ReadFull(c, respHdr[:]); err != nil {
+			t.Fatalf("VMess server-first failed waiting for SSH banner header: %v", err)
+		}
+
+		rkSum := sha256.Sum256(reqKey[:])
+		rivSum := sha256.Sum256(reqIV[:])
+		sShake := sha3.NewShake128()
+		_, _ = sShake.Write(rivSum[:16])
+		sBlk, _ := aes.NewCipher(rkSum[:16])
+		sGCM, _ := cipher.NewGCM(sBlk)
+		var sCnt uint16
+		readSrvChunk := func() []byte {
+			var pm, sm, lh [2]byte
+			_, _ = sShake.Read(pm[:])
+			sPad := int(binary.BigEndian.Uint16(pm[:]) % 64)
+			_, _ = sShake.Read(sm[:])
+			sMask := binary.BigEndian.Uint16(sm[:])
+			if _, err := io.ReadFull(c, lh[:]); err != nil {
+				t.Fatalf("read VMess chunk len: %v", err)
+			}
+			sz := int(binary.BigEndian.Uint16(lh[:]) ^ sMask)
+			body := make([]byte, sz)
+			if _, err := io.ReadFull(c, body); err != nil {
+				t.Fatalf("read VMess chunk body: %v", err)
+			}
+			var sn [12]byte
+			binary.BigEndian.PutUint16(sn[0:2], sCnt)
+			copy(sn[2:12], rivSum[2:12])
+			sCnt++
+			plain, oerr := sGCM.Open(nil, sn[:], body[:sz-sPad], nil)
+			if oerr != nil {
+				t.Fatalf("decrypt VMess server chunk: %v", oerr)
+			}
+			return plain
+		}
+
+		gotBanner := readSrvChunk()
+		if !bytes.Equal(gotBanner, sshBanner) {
+			t.Fatalf("VMess SSH banner mismatch: got %q want %q", gotBanner, sshBanner)
+		}
+
+		// Now client sends its 1st Shake128-masked chunk -> server's Shake128 readMask MUST still be synchronized!
+		clientMsg := []byte("SSH-2.0-ClientAfterPeekTimeout\r\n")
+		writeOneVMessClientChunk(t, c, reqKey, reqIV, clientMsg)
+		gotEcho := readSrvChunk()
+		if !bytes.Equal(gotEcho, clientMsg) {
+			t.Fatalf("VMess post-peek-timeout echo mismatch: got %q want %q", gotEcho, clientMsg)
+		}
+	}
+
+	// --- 2. P-02 & P-11: VLESS Vision server-first (>150ms partial initHdr) + XUDP (cmd=0x03) + flow enforcement ---
+	{
+		cfg := config.Default()
+		cfg.ForceCloseSSL = true
+		tr := stats.NewTracker(cfg)
+		users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{{ID: 2, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"}})
+		vPort := freeLocalPort(t, "tcp")
+		srv, err := NewServer(cfg, &panel.NodeSpec{
+			Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: vPort, Network: "tcp", Flow: FlowVision,
+		}, tr, BuildUserIndexForCipher("vless", "", users), acl.NewEngine(false, "", "", "", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		// (a) Unpadded downgrade (flow="") on a Vision node must be rejected!
+		badC, _ := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(vPort)))
+		var badReq bytes.Buffer
+		badReq.WriteByte(0x00)
+		badReq.Write(users[0].UUIDBytes[:])
+		badReq.WriteByte(0x00) // empty flow!
+		badReq.WriteByte(0x01)
+		_ = binary.Write(&badReq, binary.BigEndian, sshPort)
+		badReq.Write([]byte{0x01, 127, 0, 0, 1})
+		_, _ = badC.Write(badReq.Bytes())
+		_ = badC.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		var one [1]byte
+		if n, _ := badC.Read(one[:]); n > 0 {
+			t.Fatal("expected unpadded flow='' downgrade to be rejected on FlowVision node")
+		}
+		_ = badC.Close()
+
+		// (b) Send VLESS Vision TCP header + only 5 bytes of 21-byte Vision UUID, sleep 200ms (>150ms peek), then send remaining 16+5+payload!
+		vc, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(vPort)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer vc.Close()
+		addon := append([]byte{0x0a, byte(len(FlowVision))}, []byte(FlowVision)...)
+		var hdr bytes.Buffer
+		hdr.WriteByte(0x00)
+		hdr.Write(users[0].UUIDBytes[:])
+		hdr.WriteByte(byte(len(addon)))
+		hdr.Write(addon)
+		hdr.WriteByte(0x01)
+		_ = binary.Write(&hdr, binary.BigEndian, sshPort)
+		hdr.Write([]byte{0x01, 127, 0, 0, 1})
+		// Partial 5 bytes of Vision UUID before 150ms peek timeout!
+		hdr.Write(users[0].UUIDBytes[:5])
+		_, _ = vc.Write(hdr.Bytes())
+
+		time.Sleep(200 * time.Millisecond)
+		msg := []byte("vision-after-partial-peek-timeout")
+		var rest bytes.Buffer
+		rest.Write(users[0].UUIDBytes[5:16])
+		rest.WriteByte(visionCmdEnd)
+		_ = binary.Write(&rest, binary.BigEndian, uint16(len(msg)))
+		_ = binary.Write(&rest, binary.BigEndian, uint16(4))
+		rest.Write(msg)
+		rest.Write([]byte{1, 2, 3, 4})
+		_, _ = vc.Write(rest.Bytes())
+
+		// Read VLESS [0,0] + Vision SSH banner frame + Vision echoed msg frame
+		_ = vc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var vr2 [2]byte
+		if _, err := io.ReadFull(vc, vr2[:]); err != nil {
+			t.Fatalf("Vision post-peek VLESS resp failed: %v", err)
+		}
+		var rxPlain bytes.Buffer
+		for rxPlain.Len() < len(sshBanner)+len(msg) {
+			var vh [5]byte
+			if rxPlain.Len() == 0 {
+				var uuidSkip [16]byte
+				if _, err := io.ReadFull(vc, uuidSkip[:]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := io.ReadFull(vc, vh[:]); err != nil {
+				t.Fatal(err)
+			}
+			cl := int(binary.BigEndian.Uint16(vh[1:3]))
+			pl := int(binary.BigEndian.Uint16(vh[3:5]))
+			cb := make([]byte, cl)
+			if _, err := io.ReadFull(vc, cb); err != nil {
+				t.Fatal(err)
+			}
+			if pl > 0 {
+				_, _ = io.CopyN(io.Discard, vc, int64(pl))
+			}
+			rxPlain.Write(cb)
+		}
+		if !bytes.Equal(rxPlain.Bytes(), append(append([]byte(nil), sshBanner...), msg...)) {
+			t.Fatalf("Vision stream corrupted across peek timeout: got %q", rxPlain.Bytes())
+		}
+
+		// (c) VLESS `cmd == 0x03` (XUDP Mux over Vision) UDP echo!
+		xc, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(vPort)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer xc.Close()
+		var xreq bytes.Buffer
+		xreq.WriteByte(0x00)
+		xreq.Write(users[0].UUIDBytes[:])
+		xreq.WriteByte(byte(len(addon)))
+		xreq.Write(addon)
+		xreq.WriteByte(0x03) // RequestCommandMux (NO Port/Addr in VLESS header!)
+
+		// Build XUDP New frame: Meta = [sid=7(2) | status=New(1) | opt=Data(1) | net=UDP(2)(1) | port(2) | IPv4(1+4)] = 12B
+		udpMsg := []byte("xudp-over-vision-ok")
+		var xudp bytes.Buffer
+		_ = binary.Write(&xudp, binary.BigEndian, uint16(12))
+		_ = binary.Write(&xudp, binary.BigEndian, uint16(7))
+		xudp.Write([]byte{0x01, 0x01, 0x02})
+		_ = binary.Write(&xudp, binary.BigEndian, echoUDP)
+		xudp.Write([]byte{0x01, 127, 0, 0, 1})
+		_ = binary.Write(&xudp, binary.BigEndian, uint16(len(udpMsg)))
+		xudp.Write(udpMsg)
+
+		// Wrap XUDP frame inside Vision End block
+		xreq.Write(users[0].UUIDBytes[:])
+		xreq.WriteByte(visionCmdEnd)
+		_ = binary.Write(&xreq, binary.BigEndian, uint16(xudp.Len()))
+		_ = binary.Write(&xreq, binary.BigEndian, uint16(0))
+		xreq.Write(xudp.Bytes())
+		_, _ = xc.Write(xreq.Bytes())
+
+		_ = xc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var xv [2 + 21]byte
+		if _, err := io.ReadFull(xc, xv[:]); err != nil {
+			t.Fatalf("XUDP Vision resp header failed: %v", err)
+		}
+		xcLen := int(binary.BigEndian.Uint16(xv[2+17 : 2+19]))
+		xpLen := int(binary.BigEndian.Uint16(xv[2+19 : 2+21]))
+		xbody := make([]byte, xcLen)
+		if _, err := io.ReadFull(xc, xbody); err != nil {
+			t.Fatal(err)
+		}
+		if xpLen > 0 {
+			_, _ = io.CopyN(io.Discard, xc, int64(xpLen))
+		}
+		if !bytes.HasSuffix(xbody, udpMsg) {
+			t.Fatalf("XUDP reply %x missing payload %q", xbody, udpMsg)
+		}
+	}
+
+	// --- 3. P-09: V2Board hyphenated UUID SS2022 + Classic SS AEAD 24-char alphanumeric password ---
+	{
+		echoTCP, _ := startEchoTCPAndUDP(t)
+		cfg := config.Default()
+		cfg.ForceCloseSSL = true
+		tr := stats.NewTracker(cfg)
+		// 24-char base64-looking alphanumeric password that SIP004 MUST hash via EVP_BytesToKey!
+		const alphaPass24 = "AbCdEfGhIjKlMnOpQrStUvWx"
+		users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{{ID: 9, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811", AltPasswd: alphaPass24}})
+		idx := BuildUserIndexForCipher("shadowsocks", "aead_aes_128_gcm", users)
+		if !bytes.Equal(idx.SSUsers[0].MasterKey, evpBytesToKey(alphaPass24, 16)) {
+			t.Fatalf("classic AEAD wrongly base64-decoded 24-char password instead of EVP_BytesToKey!")
+		}
+		// V2Board hyphenated UUID in SS2022 must take first 16 ASCII bytes of UUID
+		uV2B, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{{ID: 10, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"}})
+		idx2022 := BuildUserIndexForCipher("shadowsocks", "2022-blake3-aes-128-gcm", uV2B)
+		if string(idx2022.SSUsers[0].MasterKey) != "b831381d-6324-4d" {
+			t.Fatalf("V2Board SS2022 UUID key mismatch: got %q", idx2022.SSUsers[0].MasterKey)
+		}
+		_ = echoTCP
+	}
+}
+
+func makeAuthIDPlain(rand4 []byte) []byte {
+	var p [16]byte
+	binary.BigEndian.PutUint64(p[0:8], uint64(time.Now().Unix()))
+	copy(p[8:12], rand4)
+	// IEEE CRC32
+	var crc uint32 = 0xFFFFFFFF
+	for _, b := range p[0:12] {
+		crc ^= uint32(b)
+		for k := 0; k < 8; k++ {
+			if (crc & 1) != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	binary.BigEndian.PutUint32(p[12:16], ^crc)
+	return p[:]
+}
+
+func appendFNV1a32(b *bytes.Buffer) {
+	var h uint32 = 2166136261
+	for _, c := range b.Bytes() {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	var out [4]byte
+	binary.BigEndian.PutUint32(out[:], h)
+	b.Write(out[:])
+}
+
+func sealVMessReqHeader(cmdKey, authID [16]byte, connNonce [8]byte, cmdPlain []byte) []byte {
+	lk := vmessKDF3(cmdKey[:], kdfSaltHdrLenKey, authID[:], connNonce[:])
+	ln := vmessKDF3(cmdKey[:], kdfSaltHdrLenIV, authID[:], connNonce[:])
+	lblk, _ := aes.NewCipher(lk[:16])
+	lgcm, _ := cipher.NewGCM(lblk)
+	var hlen [2]byte
+	binary.BigEndian.PutUint16(hlen[:], uint16(len(cmdPlain)))
+	encLen := lgcm.Seal(nil, ln[:12], hlen[:], authID[:])
+
+	pk := vmessKDF3(cmdKey[:], kdfSaltHdrKey, authID[:], connNonce[:])
+	pn := vmessKDF3(cmdKey[:], kdfSaltHdrIV, authID[:], connNonce[:])
+	pblk, _ := aes.NewCipher(pk[:16])
+	pgcm, _ := cipher.NewGCM(pblk)
+	encPay := pgcm.Seal(nil, pn[:12], cmdPlain, authID[:])
+
+	var out bytes.Buffer
+	out.Write(authID[:])
+	out.Write(encLen)
+	out.Write(connNonce[:])
+	out.Write(encPay)
+	return out.Bytes()
+}
+
+func writeOneVMessClientChunk(t *testing.T, c net.Conn, reqKey, reqIV [16]byte, msg []byte) {
+	t.Helper()
+	cShake := sha3.NewShake128()
+	_, _ = cShake.Write(reqIV[:])
+	var pm, sm [2]byte
+	_, _ = cShake.Read(pm[:])
+	padLen := int(binary.BigEndian.Uint16(pm[:]) % 64)
+	_, _ = cShake.Read(sm[:])
+	sizeMask := binary.BigEndian.Uint16(sm[:])
+
+	cBlk, _ := aes.NewCipher(reqKey[:])
+	cGCM, _ := cipher.NewGCM(cBlk)
+	var cNonce [12]byte
+	copy(cNonce[2:12], reqIV[2:12])
+	sealed := cGCM.Seal(nil, cNonce[:], msg, nil)
+
+	var lh [2]byte
+	binary.BigEndian.PutUint16(lh[:], uint16(len(sealed)+padLen)^sizeMask)
+	_, _ = c.Write(lh[:])
+	_, _ = c.Write(sealed)
+	if padLen > 0 {
+		_, _ = c.Write(make([]byte, padLen))
 	}
 }

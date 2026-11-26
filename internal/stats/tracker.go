@@ -2,12 +2,16 @@ package stats
 
 import (
 	"bufio"
+	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/netip"
@@ -57,9 +61,12 @@ type UserEntry struct {
 	downBytes atomic.Int64
 	winBytes  atomic.Int64 // bytes accumulated during current dynamic limit tick
 	activeTCP atomic.Int32
-	disabled  atomic.Bool  // set true immediately when account expires or exceeds traffic quota
-	hasQuota  atomic.Bool  // true when real-time byte quota enforcement is active
-	quotaRem  atomic.Int64 // real-time remaining bytes before instant kick when hasQuota == true
+	activeMux atomic.Int32
+	activeUDP atomic.Int32
+	disabled  atomic.Bool   // set true immediately when account expires or exceeds traffic quota
+	hasQuota  atomic.Bool   // true when real-time byte quota enforcement is active
+	quotaRem  atomic.Int64  // real-time remaining bytes before instant kick when hasQuota == true
+	quotaGen  atomic.Uint64 // generation counter preventing stale preempted AddUpload/AddDownload from disabling renewed users
 
 	_ [64]byte
 
@@ -78,9 +85,30 @@ type UserEntry struct {
 	activeConns map[uint64]io.Closer
 
 	// Per-user active client IPs (lazily allocated only when user connects -> saves ~28 MiB across multi-node idle users)
-	ipMu       sync.RWMutex
-	activeIPs  map[netip.Addr]int64 // lastSeen Unix seconds
-	remoteIPs  map[netip.Addr]struct{}
+	ipMu        sync.RWMutex
+	activeIPs   map[netip.Addr]int64 // lastSeen Unix seconds
+	remoteIPs   map[netip.Addr]struct{}
+	remoteCount atomic.Int32 // cluster-wide integer device count reported by Xboard / NewV2Board /alivelist
+}
+
+func precomputeVMessAuth(uuid [16]byte) ([16]byte, cipher.Block, bool) {
+	const vmessMagic = "c48619fe-8f02-49e0-b9e9-edf763e17e21"
+	mh := md5.New()
+	mh.Write(uuid[:])
+	mh.Write([]byte(vmessMagic))
+	var cmdKey [16]byte
+	copy(cmdKey[:], mh.Sum(nil))
+
+	innerHMAC := hmac.New(func() hash.Hash {
+		return hmac.New(sha256.New, []byte("VMess AEAD KDF"))
+	}, []byte("AES Auth ID Encryption"))
+	innerHMAC.Write(cmdKey[:])
+	authKey := innerHMAC.Sum(nil)[:16]
+	blk, err := aes.NewCipher(authKey)
+	if err != nil {
+		return cmdKey, nil, false
+	}
+	return cmdKey, blk, true
 }
 
 func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit int, tcpLimit int, dyWhite bool) *UserEntry {
@@ -101,18 +129,19 @@ func NewUserEntry(id int, uuidOrPass string, speedLimitBps int64, deviceLimit in
 func (u *UserEntry) RefreshKeys(uuidOrPass string) {
 	u.UUID = uuidOrPass
 	u.Passwd = uuidOrPass
-	u.VMessAuthReady = false
-	u.VMessAuthBlock = nil
 	if parsed, err := parseUUIDBytes(uuidOrPass); err == nil {
 		u.UUIDBytes = parsed
 		u.HasUUID = true
+		u.VMessCmdKey, u.VMessAuthBlock, u.VMessAuthReady = precomputeVMessAuth(parsed)
 	} else {
 		u.HasUUID = false
+		u.VMessAuthReady = false
+		u.VMessAuthBlock = nil
 	}
 	sum224 := sha256.Sum224([]byte(uuidOrPass))
 	hex.Encode(u.TrojanHash[:], sum224[:])
 	u.SHA256UUID = sha256.Sum256([]byte(u.UUID))
-	u.SHA256Passwd = sha256.Sum256([]byte(u.Passwd))
+	u.SHA256Passwd = u.SHA256UUID
 }
 
 func (u *UserEntry) RefreshDualKeys(uuid, passwd string) {
@@ -122,24 +151,40 @@ func (u *UserEntry) RefreshDualKeys(uuid, passwd string) {
 	if passwd == "" {
 		passwd = uuid
 	}
-	if u.UUID == uuid && u.Passwd == passwd {
-		return
+	u.UUID = uuid
+	u.Passwd = passwd
+	if parsed, err := parseUUIDBytes(uuid); err == nil {
+		u.UUIDBytes = parsed
+		u.HasUUID = true
+		u.VMessCmdKey, u.VMessAuthBlock, u.VMessAuthReady = precomputeVMessAuth(parsed)
+	} else if parsed, err := parseUUIDBytes(passwd); err == nil {
+		u.UUIDBytes = parsed
+		u.HasUUID = true
+		u.VMessCmdKey, u.VMessAuthBlock, u.VMessAuthReady = precomputeVMessAuth(parsed)
+	} else {
+		u.HasUUID = false
+		u.VMessAuthReady = false
+		u.VMessAuthBlock = nil
 	}
-	u.RefreshKeys(uuid)
-	if passwd != uuid {
-		u.Passwd = passwd
-		u.SHA256Passwd = sha256.Sum256([]byte(passwd))
-	}
+	// Primary TrojanHash uses Passwd (and BuildUserIndexForProtocol also indexes UUID when UUID != Passwd)
+	sum224 := sha256.Sum224([]byte(passwd))
+	hex.Encode(u.TrojanHash[:], sum224[:])
+	u.SHA256UUID = sha256.Sum256([]byte(u.UUID))
+	u.SHA256Passwd = sha256.Sum256([]byte(u.Passwd))
 }
 
 func (u *UserEntry) SetRemainingQuota(remainBytes int64) {
+	u.connsMu.Lock()
+	u.quotaGen.Add(1)
 	if remainBytes < 0 {
 		u.hasQuota.Store(false)
 		u.quotaRem.Store(0)
+		u.connsMu.Unlock()
 		return
 	}
 	u.quotaRem.Store(remainBytes)
 	u.hasQuota.Store(true)
+	u.connsMu.Unlock()
 	if remainBytes == 0 {
 		u.DisableAndKick()
 	}
@@ -155,8 +200,8 @@ func (u *UserEntry) DisableAndKick() int {
 	if u == nil {
 		return 0
 	}
-	u.disabled.Store(true)
 	u.connsMu.Lock()
+	u.disabled.Store(true)
 	conns := u.activeConns
 	u.activeConns = nil
 	u.connsMu.Unlock()
@@ -169,9 +214,34 @@ func (u *UserEntry) DisableAndKick() int {
 	return len(conns)
 }
 
+func (u *UserEntry) disableOnQuotaExhausted(observedGen uint64) {
+	if u == nil {
+		return
+	}
+	u.connsMu.Lock()
+	// Re-verify under connsMu so a concurrent panel top-up / Reenable() can never be clobbered!
+	if u.quotaGen.Load() != observedGen || !u.hasQuota.Load() || u.quotaRem.Load() > 0 {
+		u.connsMu.Unlock()
+		return
+	}
+	u.disabled.Store(true)
+	conns := u.activeConns
+	u.activeConns = nil
+	u.connsMu.Unlock()
+
+	for _, c := range conns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+}
+
 func (u *UserEntry) Reenable() {
 	if u != nil {
+		u.connsMu.Lock()
+		u.quotaGen.Add(1)
 		u.disabled.Store(false)
+		u.connsMu.Unlock()
 	}
 }
 
@@ -190,8 +260,9 @@ func (u *UserEntry) AddUpload(n int64) {
 		u.upBytes.Add(n)
 		u.winBytes.Add(n)
 		if u.hasQuota.Load() {
+			gen := u.quotaGen.Load()
 			if u.quotaRem.Add(-n) <= 0 && u.hasQuota.Load() {
-				u.DisableAndKick()
+				u.disableOnQuotaExhausted(gen)
 			}
 		}
 	}
@@ -202,8 +273,9 @@ func (u *UserEntry) AddDownload(n int64) {
 		u.downBytes.Add(n)
 		u.winBytes.Add(n)
 		if u.hasQuota.Load() {
+			gen := u.quotaGen.Load()
 			if u.quotaRem.Add(-n) <= 0 && u.hasQuota.Load() {
-				u.DisableAndKick()
+				u.disableOnQuotaExhausted(gen)
 			}
 		}
 	}
@@ -268,8 +340,8 @@ func (u *UserEntry) AcquireSession(clientIP netip.Addr, ipTTLSec int64, redisLim
 	return cid, nil
 }
 
-// AcquireMuxSession registers an outer multiplexed connection (AnyTLS / Hysteria2) for IP tracking
-// and instant DisableAndKick teardown while delegating per-stream TCP concurrency limits to AcquireSubStream.
+// AcquireMuxSession registers an outer multiplexed connection (AnyTLS / Hysteria2) for IP tracking,
+// bounded mux session count, and instant DisableAndKick teardown while delegating per-stream TCP limits to AcquireSubStream.
 func (u *UserEntry) AcquireMuxSession(clientIP netip.Addr, ipTTLSec int64, redisLim *redisIPLimiter, closer io.Closer) (uint64, error) {
 	if u == nil || u.disabled.Load() {
 		return 0, ErrUserDisabled
@@ -277,7 +349,16 @@ func (u *UserEntry) AcquireMuxSession(clientIP netip.Addr, ipTTLSec int64, redis
 	if u.hasQuota.Load() && u.quotaRem.Load() <= 0 {
 		return 0, ErrUserDisabled
 	}
+	maxMux := int32(64)
+	if maxTCP := u.tcpLimit.Load(); maxTCP > 0 && maxTCP < maxMux {
+		maxMux = max(maxTCP, 8)
+	}
+	if u.activeMux.Add(1) > maxMux {
+		u.activeMux.Add(-1)
+		return 0, ErrTCPLimit
+	}
 	if err := u.checkAndTouchIP(clientIP, ipTTLSec, redisLim); err != nil {
+		u.activeMux.Add(-1)
 		return 0, err
 	}
 	if closer == nil {
@@ -287,6 +368,7 @@ func (u *UserEntry) AcquireMuxSession(clientIP netip.Addr, ipTTLSec int64, redis
 	u.connsMu.Lock()
 	if u.disabled.Load() {
 		u.connsMu.Unlock()
+		u.activeMux.Add(-1)
 		_ = closer.Close()
 		return 0, ErrUserDisabled
 	}
@@ -299,7 +381,60 @@ func (u *UserEntry) AcquireMuxSession(clientIP netip.Addr, ipTTLSec int64, redis
 }
 
 func (u *UserEntry) ReleaseMuxSession(connID uint64) {
-	if u != nil && connID > 0 {
+	if u == nil {
+		return
+	}
+	u.activeMux.Add(-1)
+	if connID > 0 {
+		u.connsMu.Lock()
+		if u.activeConns != nil {
+			delete(u.activeConns, connID)
+		}
+		u.connsMu.Unlock()
+	}
+}
+
+// AcquireUDPSession bounds concurrent per-user UDP NAT sockets (`max 256`) without starving `activeTCP` (`user_tcp_limit`).
+func (u *UserEntry) AcquireUDPSession(clientIP netip.Addr, ipTTLSec int64, redisLim *redisIPLimiter, closer io.Closer) (uint64, error) {
+	if u == nil || u.disabled.Load() {
+		return 0, ErrUserDisabled
+	}
+	if u.hasQuota.Load() && u.quotaRem.Load() <= 0 {
+		return 0, ErrUserDisabled
+	}
+	if u.activeUDP.Add(1) > 256 {
+		u.activeUDP.Add(-1)
+		return 0, ErrTCPLimit
+	}
+	if err := u.checkAndTouchIP(clientIP, ipTTLSec, redisLim); err != nil {
+		u.activeUDP.Add(-1)
+		return 0, err
+	}
+	if closer == nil {
+		return 0, nil
+	}
+	cid := u.nextConnID.Add(1)
+	u.connsMu.Lock()
+	if u.disabled.Load() {
+		u.connsMu.Unlock()
+		u.activeUDP.Add(-1)
+		_ = closer.Close()
+		return 0, ErrUserDisabled
+	}
+	if u.activeConns == nil {
+		u.activeConns = make(map[uint64]io.Closer, 4)
+	}
+	u.activeConns[cid] = closer
+	u.connsMu.Unlock()
+	return cid, nil
+}
+
+func (u *UserEntry) ReleaseUDPSession(connID uint64) {
+	if u == nil {
+		return
+	}
+	u.activeUDP.Add(-1)
+	if connID > 0 {
 		u.connsMu.Lock()
 		if u.activeConns != nil {
 			delete(u.activeConns, connID)
@@ -394,6 +529,9 @@ func (u *UserEntry) checkAndTouchIP(ip netip.Addr, ttlSec int64, redisLim *redis
 				totalDistinct++
 			}
 		}
+		if rc := int(u.remoteCount.Load()); rc > totalDistinct {
+			totalDistinct = rc
+		}
 		if totalDistinct >= devLimit {
 			return ErrIPLimit
 		}
@@ -406,6 +544,7 @@ func (u *UserEntry) checkAndTouchIP(ip netip.Addr, ttlSec int64, redisLim *redis
 func (u *UserEntry) SetRemoteAliveIPs(ips []string) {
 	u.ipMu.Lock()
 	defer u.ipMu.Unlock()
+	u.remoteCount.Store(0)
 	if len(ips) == 0 {
 		u.remoteIPs = nil
 		return
@@ -417,6 +556,17 @@ func (u *UserEntry) SetRemoteAliveIPs(ips []string) {
 		}
 	}
 	u.remoteIPs = m
+}
+
+func (u *UserEntry) SetRemoteAliveCount(cnt int) {
+	u.ipMu.Lock()
+	u.remoteIPs = nil
+	if cnt > 0 {
+		u.remoteCount.Store(int32(cnt))
+	} else {
+		u.remoteCount.Store(0)
+	}
+	u.ipMu.Unlock()
 }
 
 func (u *UserEntry) SnapshotAliveIPs(ttlSec int64) []string {
@@ -526,14 +676,48 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 		}
 		_, dyWhite := t.cfg.DyLimitWhiteUserIDs[sp.ID]
 
+		wantUUID := sp.UUIDOrPass
+		wantPass := sp.UUIDOrPass
+		if sp.AltPasswd != "" {
+			wantPass = sp.AltPasswd
+		}
+		if wantUUID == "" {
+			wantUUID = wantPass
+		}
+
 		if existing, ok := t.users[sp.ID]; ok {
-			wasDisabled := existing.IsDisabled()
-			prevUUID, prevPass := existing.UUID, existing.Passwd
-			if sp.AltPasswd != "" {
-				existing.RefreshDualKeys(sp.UUIDOrPass, sp.AltPasswd)
-			} else if existing.UUID != sp.UUIDOrPass {
-				existing.RefreshKeys(sp.UUIDOrPass)
+			if existing.UUID != wantUUID || existing.Passwd != wantPass {
+				// Credential reset/rotation: immediately sever pre-existing sessions using the old leaked secret,
+				// carry over unpushed bytes, and swap in an immutable fresh UserEntry (zero data races!).
+				existing.DisableAndKick()
+				prevUp := existing.upBytes.Swap(0)
+				prevDown := existing.downBytes.Swap(0)
+
+				u := NewUserEntry(sp.ID, wantUUID, effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
+				if wantPass != wantUUID {
+					u.RefreshDualKeys(wantUUID, wantPass)
+				}
+				if prevUp > 0 {
+					u.upBytes.Add(prevUp)
+				}
+				if prevDown > 0 {
+					u.downBytes.Add(prevDown)
+				}
+				if sp.RemainBytes > 0 {
+					rem := sp.RemainBytes - (prevUp + prevDown)
+					if rem <= 0 {
+						u.SetRemainingQuota(0)
+					} else {
+						u.SetRemainingQuota(rem)
+					}
+				}
+				t.users[sp.ID] = u
+				entries = append(entries, u)
+				updated++
+				continue
 			}
+
+			wasDisabled := existing.IsDisabled()
 			existing.UpdateLimits(effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
 			if sp.RemainBytes > 0 {
 				// Subtract local unpushed bytes so a pull running before PushTraffic never re-enables an over-quota user!
@@ -542,21 +726,21 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 				if rem <= 0 {
 					existing.SetRemainingQuota(0)
 				} else {
-					existing.Reenable()
 					existing.SetRemainingQuota(rem)
+					existing.Reenable()
 				}
 			} else {
-				existing.Reenable()
 				existing.SetRemainingQuota(-1)
+				existing.Reenable()
 			}
-			if existing.UUID != prevUUID || existing.Passwd != prevPass || wasDisabled != existing.IsDisabled() {
+			if wasDisabled != existing.IsDisabled() {
 				updated++
 			}
 			entries = append(entries, existing)
 		} else {
-			u := NewUserEntry(sp.ID, sp.UUIDOrPass, effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
-			if sp.AltPasswd != "" {
-				u.RefreshDualKeys(sp.UUIDOrPass, sp.AltPasswd)
+			u := NewUserEntry(sp.ID, wantUUID, effSpeed, effDev, t.cfg.UserTCPLimit, dyWhite)
+			if wantPass != wantUUID {
+				u.RefreshDualKeys(wantUUID, wantPass)
 			}
 			if sp.RemainBytes > 0 {
 				u.SetRemainingQuota(sp.RemainBytes)
@@ -663,12 +847,21 @@ func (t *Tracker) SnapshotAliveMap() map[int][]string {
 	return res
 }
 
-// ApplyRemoteAliveList updates panel-wide device state (from UniProxy /alivelist).
+// ApplyRemoteAliveList updates panel-wide device state (from UniProxy /alivelist IP lists).
 func (t *Tracker) ApplyRemoteAliveList(alive map[int][]string) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for id, u := range t.users {
 		u.SetRemoteAliveIPs(alive[id])
+	}
+}
+
+// ApplyRemoteAliveCounts updates panel-wide integer device counts (from Xboard / NewV2Board /alivelist).
+func (t *Tracker) ApplyRemoteAliveCounts(counts map[int]int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for id, u := range t.users {
+		u.SetRemoteAliveCount(counts[id])
 	}
 }
 
@@ -679,6 +872,9 @@ func (t *Tracker) TickDynamicSpeedLimit() {
 	}
 	triggerBps := int64(t.cfg.DyLimitTriggerSpeed * 125000.0)
 	throttleBps := int64(t.cfg.DyLimitSpeed * 125000.0)
+	if throttleBps <= 0 {
+		throttleBps = 125000 // never set 0 (unlimited) during dynamic penalty!
+	}
 	triggerSec := int32(t.cfg.DyLimitTriggerTime)
 	throttleDur := int64(t.cfg.DyLimitTime)
 	now := time.Now().Unix()

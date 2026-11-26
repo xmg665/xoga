@@ -209,3 +209,72 @@ func TestSingleflightCoalescingAndServeStale(t *testing.T) {
 		t.Fatalf("expected RFC 8767 serve-stale IP 198.18.0.99 during upstream timeout, got %v (err=%v)", staleIP, err)
 	}
 }
+
+func TestSogaServersListAndSingleflightCancelIsolation(t *testing.T) {
+	// 1. Official soga `servers:` object list + empty `rules: []` must NOT hijack catch-all DNS!
+	yml := `
+servers:
+  - address: 1.1.1.1
+  - address: 154.12.1.1
+    domains:
+      - "geosite:netflix"
+      - "regexp:^cdn[0-9]{1,3}\\.nflx\\.net$"
+  - address: 192.0.2.1
+    rules: []
+`
+	rules, defs := ParseDNSYAML(yml, StrategyIPv4First)
+	if len(defs) == 0 || defs[0] != "1.1.1.1" {
+		t.Fatalf("expected default server 1.1.1.1 from soga servers list, got %v", defs)
+	}
+	for _, r := range rules {
+		if r.server == "192.0.2.1" && r.isCatch {
+			t.Fatal("empty rules: [] block must NOT become a global catch-all DNS server")
+		}
+	}
+
+	// 2. Reject spoofed txID=0 on plain UDP
+	forged := []byte{0x00, 0x00, 0x81, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if _, _, err := decodeDNSAnswers(forged, 0x1234, qTypeA, false); err == nil {
+		t.Fatal("expected UDP DNS decoder to reject forged txID=0 when expectedID != 0")
+	}
+
+	// 3. Singleflight leader context cancellation must NOT fail concurrent followers!
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			time.Sleep(60 * time.Millisecond)
+			ans := buildMockDNSResponse(buf[:n], [4]byte{203, 0, 113, 7}, [16]byte{})
+			if ans != nil {
+				_, _ = pc.WriteTo(ans, addr)
+			}
+		}
+	}()
+
+	res := NewResolver("", "", []string{pc.LocalAddr().String()}, "ipv4_only")
+	leaderCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	followerCh := make(chan error, 1)
+	go func() {
+		time.Sleep(3 * time.Millisecond)
+		ip, ferr := res.Resolve(context.Background(), "leader-cancel.example.com", 0, false)
+		if ferr == nil && ip.String() != "203.0.113.7" {
+			ferr = io.ErrUnexpectedEOF
+		}
+		followerCh <- ferr
+	}()
+
+	_, _ = res.Resolve(leaderCtx, "leader-cancel.example.com", 0, false) // leader cancels at 10ms
+	if ferr := <-followerCh; ferr != nil {
+		t.Fatalf("follower DNS lookup was poisoned by leader context cancellation: %v", ferr)
+	}
+}

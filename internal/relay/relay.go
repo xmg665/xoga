@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -12,7 +13,7 @@ import (
 	"github.com/xmg665/xoga/internal/stats"
 )
 
-const spliceChunkSize = 4 * 1024 * 1024 // 4 MiB kernel splice window for live traffic accounting
+const spliceChunkSize = 256 * 1024 // 256 KiB kernel splice window for responsive dynamic throttling & live accounting
 
 // PipeBidirectional relays data between clientConn and remoteConn with:
 // 1. Linux kernel splice(2) zero-copy fast-path when both ends are raw *net.TCPConn and unthrottled.
@@ -62,8 +63,9 @@ func PipeBidirectional(
 			return
 		}
 		if !tryHalfCloseWrite(remoteConn) {
-			abortDownload.Store(true)
-			_ = remoteConn.SetReadDeadline(time.Now())
+			// Outbounds without TCP half-close (e.g. SS/WS) may still be actively sending the HTTP/RPC response!
+			// Do NOT abort download at 0ms; bound idle response wait to 15s while letting active downloads finish.
+			_ = remoteConn.SetReadDeadline(time.Now().Add(min(idleTimeout, 15*time.Second)))
 		}
 	}()
 
@@ -73,17 +75,25 @@ func PipeBidirectional(
 		abortUpload.Store(true)
 		_ = clientConn.Close()
 		_ = remoteConn.Close()
-	} else if !tryHalfCloseWrite(clientConn) {
-		// Framing protocols without half-close (VMess, WS, SS) cannot notify peer via CloseWrite:
-		// atomically flag abortUpload BEFORE SetReadDeadline(now) so the upload loop can never clobber it back to +idleTimeout!
-		abortUpload.Store(true)
-		_ = clientConn.SetReadDeadline(time.Now())
 	} else {
-		// Bound half-closed client linger to at most 15s once remote has already closed.
-		_ = clientConn.SetReadDeadline(time.Now().Add(min(idleTimeout, 15*time.Second)))
+		flushResponseHeader(clientConn)
+		if !tryHalfCloseWrite(clientConn) {
+			// Framing protocols without half-close (VMess, WS, SS, AnyTLS) cannot notify peer via CloseWrite:
+			// atomically flag abortUpload BEFORE SetReadDeadline(now) so the upload loop can never clobber it back to +idleTimeout!
+			abortUpload.Store(true)
+			_ = clientConn.SetReadDeadline(time.Now())
+		} else {
+			// Bound half-closed client linger to at most 15s once remote has already closed.
+			_ = clientConn.SetReadDeadline(time.Now().Add(min(idleTimeout, 15*time.Second)))
+		}
 	}
 
 	<-uploadDone
+}
+
+func isNetTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func copyOneWay(
@@ -96,28 +106,29 @@ func copyOneWay(
 	enableZeroCopy bool,
 	abortPeer *atomic.Bool,
 ) {
-	var userLim *limiter.Bucket
-	if user != nil {
-		userLim = user.EffectiveLimiter()
-	}
-
 	srcTCP, srcIsTCP := unwrapTCP(src)
 
 	// Fast-path 1: kernel splice(2) on Linux when both ends are raw *net.TCPConn and no token-bucket throttle is active.
-	if enableZeroCopy && srcIsTCP && userLim == nil && nodeLim.IsUnlimited() {
+	// Re-checks user & node limiters every 256 KiB so dynamic speed limits (`dy_limit`) take effect mid-stream,
+	// and preserves active low-rate streams (SSH, IM, HTTP/2 upload ACKs) when `n > 0` bytes moved before read deadline!
+	if enableZeroCopy && srcIsTCP {
 		if dstTCP, ok1 := unwrapTCP(dst); ok1 {
 			for {
 				if (user != nil && user.IsDisabled()) || (abortPeer != nil && abortPeer.Load()) {
 					return
 				}
+				if (user != nil && user.EffectiveLimiter() != nil) || !nodeLim.IsUnlimited() {
+					// Dynamic or panel rate limit became active -> seamlessly drop down to throttled path!
+					break
+				}
 				now := time.Now()
 				_ = srcTCP.SetReadDeadline(now.Add(idleTimeout))
-				_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout))
+				_ = dstTCP.SetWriteDeadline(now.Add(idleTimeout + 15*time.Second))
 				if abortPeer != nil && abortPeer.Load() {
 					_ = srcTCP.SetReadDeadline(now)
 					return
 				}
-				n, err := io.CopyN(dstTCP, srcTCP, spliceChunkSize)
+				n, err := dstTCP.ReadFrom(io.LimitReader(srcTCP, spliceChunkSize))
 				if n > 0 && user != nil {
 					if isUpload {
 						user.AddUpload(n)
@@ -125,9 +136,17 @@ func copyOneWay(
 						user.AddDownload(n)
 					}
 				}
-				if err != nil {
-					return
+				if err == nil {
+					if n == 0 {
+						return
+					}
+					continue
 				}
+				if n > 0 && isNetTimeout(err) && time.Since(now) < idleTimeout+10*time.Second {
+					// `srcTCP` transferred `n` bytes and then hit its read deadline (pipe is empty) -> refresh idle window!
+					continue
+				}
+				return
 			}
 		}
 	}
@@ -239,10 +258,37 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
+type halfCloseChecker interface {
+	CanHalfCloseWrite() bool
+}
+
+type responseHeaderFlusher interface {
+	FlushResponseHeader() error
+}
+
+func flushResponseHeader(c net.Conn) {
+	if rf, ok := c.(responseHeaderFlusher); ok {
+		_ = rf.FlushResponseHeader()
+	}
+}
+
+func canConnHalfCloseWrite(c net.Conn) bool {
+	if c == nil {
+		return false
+	}
+	if hc, ok := c.(halfCloseChecker); ok {
+		return hc.CanHalfCloseWrite()
+	}
+	_, ok := c.(closeWriter)
+	return ok
+}
+
 func tryHalfCloseWrite(c net.Conn) bool {
+	if !canConnHalfCloseWrite(c) {
+		return false
+	}
 	if cw, ok := c.(closeWriter); ok {
-		_ = cw.CloseWrite()
-		return true
+		return cw.CloseWrite() == nil
 	}
 	return false
 }
@@ -261,11 +307,15 @@ func (p *PrependConn) RawWriteConn() net.Conn {
 	return p.Conn
 }
 
+func (p *PrependConn) CanHalfCloseWrite() bool {
+	return canConnHalfCloseWrite(p.Conn)
+}
+
 func (p *PrependConn) CloseWrite() error {
 	if cw, ok := p.Conn.(closeWriter); ok {
 		return cw.CloseWrite()
 	}
-	return p.Conn.SetReadDeadline(time.Now())
+	return errors.New("half-close unsupported")
 }
 
 func (p *PrependConn) Read(b []byte) (int, error) {

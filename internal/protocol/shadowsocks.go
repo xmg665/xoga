@@ -13,8 +13,10 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -168,7 +170,7 @@ func (s *Server) handleSSClassicAEADTCP(conn net.Conn) {
 		initialData = make([]byte, pr.Len())
 		_, _ = pr.Read(initialData)
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	ssConn := &ssAEADStreamConn{
 		Conn:      conn,
@@ -315,7 +317,7 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 		initialData = make([]byte, pr.Len())
 		_, _ = pr.Read(initialData)
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	reqSaltCopy := make([]byte, cs.saltSize)
 	copy(reqSaltCopy, reqSalt[:cs.saltSize])
@@ -489,7 +491,7 @@ type ssUDPSession struct {
 	user      *stats.UserEntry
 	sessID    uint64
 	masterKey []byte
-	lastSeen  int64
+	lastSeen  atomic.Int64
 }
 
 func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
@@ -502,12 +504,93 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 
 	var natMu sync.Mutex
 	sessions := make(map[string]*ssUDPSession)
+	asyncSem := make(chan struct{}, 32)
+
+	defer func() {
+		natMu.Lock()
+		for _, sess := range sessions {
+			_ = sess.natConn.Close()
+		}
+		sessions = nil
+		natMu.Unlock()
+	}()
 
 	bp := bufpool.Get(bufpool.MaxUDPSize)
 	buf := *bp
 	defer bufpool.Put(bp)
 
 	var zeroNonce [12]byte
+
+	dispatchUDP := func(clientAddr net.Addr, clientIP netip.Addr, matchedUser *stats.UserEntry, matchedKey []byte, host string, port uint16, payload []byte) {
+		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
+		if route.Action == acl.ActionBlock {
+			return
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dstUDP, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
+		if err != nil {
+			rcancel()
+			return
+		}
+
+		keyStr := clientAddr.String()
+		natMu.Lock()
+		if sessions == nil {
+			natMu.Unlock()
+			rcancel()
+			return
+		}
+		sess, exists := sessions[keyStr]
+		// Prevent CGNAT / credential-rotation session hijacking across different users!
+		if exists && (sess.user != matchedUser || !bytes.Equal(sess.masterKey, matchedKey)) {
+			delete(sessions, keyStr)
+			_ = sess.natConn.Close()
+			exists = false
+		}
+		if !exists {
+			if len(sessions) >= 2048 {
+				natMu.Unlock()
+				rcancel()
+				return
+			}
+			natPC, lerr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, s.dnsRes)
+			if lerr != nil {
+				natMu.Unlock()
+				rcancel()
+				return
+			}
+			sessID, aerr := matchedUser.AcquireUDPSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), natPC)
+			if aerr != nil {
+				_ = natPC.Close()
+				natMu.Unlock()
+				rcancel()
+				return
+			}
+			sess = &ssUDPSession{
+				natConn:   natPC,
+				user:      matchedUser,
+				sessID:    sessID,
+				masterKey: matchedKey,
+			}
+			sess.lastSeen.Store(time.Now().Unix())
+			sessions[keyStr] = sess
+			go s.pipeSSUDPReply(pc, clientAddr, sess, &natMu, sessions, keyStr)
+		} else {
+			sess.lastSeen.Store(time.Now().Unix())
+		}
+		natMu.Unlock()
+		rcancel()
+
+		if ul := matchedUser.EffectiveLimiter(); ul != nil {
+			ul.Wait(len(payload))
+		}
+		s.tracker.NodeLimiter.Wait(len(payload))
+		matchedUser.AddUpload(int64(len(payload)))
+		if matchedUser.IsDisabled() {
+			return
+		}
+		_, _ = sess.natConn.WriteTo(payload, dstUDP)
+	}
 
 	for {
 		n, clientAddr, err := pc.ReadFrom(buf)
@@ -564,62 +647,38 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		if matchedUser == nil || matchedUser.IsDisabled() {
 			continue
 		}
+		// Reject replayed Shadowsocks UDP packets so attackers cannot amplify traffic or drain user quota!
+		if s.replay.CheckAndMark(salt) {
+			continue
+		}
 
 		pr := bytes.NewReader(plain)
 		host, port, err := parseSOCKS5Addr(pr)
 		if err != nil || pr.Len() == 0 {
 			continue
 		}
-		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
-		if route.Action == acl.ActionBlock {
-			continue
-		}
-		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-		dstUDP, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
-		rcancel()
-		if err != nil {
-			continue
-		}
 		payload := plain[len(plain)-pr.Len():]
-		matchedUser.AddUpload(int64(len(payload)))
-		if matchedUser.IsDisabled() {
+
+		// Fast inline path when destination is already an IP literal and NAT session exists;
+		// offload domain resolution / new session setup to bounded worker pool so slow DNS never stalls other users!
+		natMu.Lock()
+		_, hasSess := sessions[clientAddr.String()]
+		natMu.Unlock()
+		if _, isIP := netip.ParseAddr(host); isIP == nil && hasSess && matchedUser.EffectiveLimiter() == nil && s.tracker.NodeLimiter.IsUnlimited() {
+			dispatchUDP(clientAddr, clientIP, matchedUser, matchedKey, host, port, payload)
 			continue
 		}
 
-		keyStr := clientAddr.String()
-		natMu.Lock()
-		sess, exists := sessions[keyStr]
-		if !exists {
-			localBind := ""
-			if lu := relay.LocalUDPAddrForRoute(route, dstUDP.IP.To4() == nil); lu != nil {
-				localBind = net.JoinHostPort(lu.IP.String(), "0")
-			}
-			natPC, lerr := net.ListenPacket("udp", localBind)
-			if lerr != nil {
-				natMu.Unlock()
-				continue
-			}
-			sessID, aerr := matchedUser.AcquireSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), natPC)
-			if aerr != nil {
-				_ = natPC.Close()
-				natMu.Unlock()
-				continue
-			}
-			sess = &ssUDPSession{
-				natConn:   natPC,
-				user:      matchedUser,
-				sessID:    sessID,
-				masterKey: matchedKey,
-				lastSeen:  time.Now().Unix(),
-			}
-			sessions[keyStr] = sess
-			go s.pipeSSUDPReply(pc, clientAddr, sess, &natMu, sessions, keyStr)
-		} else {
-			sess.lastSeen = time.Now().Unix()
+		payCopy := make([]byte, len(payload))
+		copy(payCopy, payload)
+		select {
+		case asyncSem <- struct{}{}:
+			go func(ca net.Addr, cip netip.Addr, u *stats.UserEntry, mk []byte, h string, p uint16, data []byte) {
+				defer func() { <-asyncSem }()
+				dispatchUDP(ca, cip, u, mk, h, p, data)
+			}(clientAddr, clientIP, matchedUser, matchedKey, host, port, payCopy)
+		default:
 		}
-		natMu.Unlock()
-
-		_, _ = sess.natConn.WriteTo(payload, dstUDP)
 	}
 }
 
@@ -634,10 +693,12 @@ func (s *Server) pipeSSUDPReply(
 	defer func() {
 		_ = sess.natConn.Close()
 		if sess.user != nil {
-			sess.user.ReleaseSession(sess.sessID)
+			sess.user.ReleaseUDPSession(sess.sessID)
 		}
 		natMu.Lock()
-		delete(sessions, keyStr)
+		if sessions != nil && sessions[keyStr] == sess {
+			delete(sessions, keyStr)
+		}
 		natMu.Unlock()
 	}()
 
@@ -646,21 +707,31 @@ func (s *Server) pipeSSUDPReply(
 		idle = 60 * time.Second
 	}
 	cs := s.ssSpec
-	bp := bufpool.Get(bufpool.MaxUDPSize)
-	rbuf := *bp
-	defer bufpool.Put(bp)
 	var zeroNonce [12]byte
 
 	for {
+		if sess.user.IsDisabled() {
+			return
+		}
 		_ = sess.natConn.SetReadDeadline(time.Now().Add(idle))
-		n, raddr, err := sess.natConn.ReadFrom(rbuf)
+		n, raddr, rbuf, bp, err := relay.ReadPacketZeroIdle(sess.natConn)
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idle {
+				continue
+			}
 			return
 		}
 		ua, ok := raddr.(*net.UDPAddr)
 		if !ok {
+			bufpool.Put(bp)
 			continue
 		}
+		sess.lastSeen.Store(time.Now().Unix())
+		if ul := sess.user.EffectiveLimiter(); ul != nil {
+			ul.Wait(n)
+		}
+		s.tracker.NodeLimiter.Wait(n)
 		sess.user.AddDownload(int64(n))
 
 		// Build SOCKS5Addr + payload
@@ -677,6 +748,7 @@ func (s *Server) pipeSSUDPReply(
 		binary.BigEndian.PutUint16(pb[:], uint16(ua.Port))
 		plain = append(plain, pb[:]...)
 		plain = append(plain, rbuf[:n]...)
+		bufpool.Put(bp)
 
 		out := make([]byte, cs.saltSize, cs.saltSize+len(plain)+16)
 		_, _ = rand.Read(out[:cs.saltSize])

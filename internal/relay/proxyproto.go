@@ -3,11 +3,13 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +20,7 @@ var proxyV2Sig = [12]byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 
 // while still exposing the underlying *net.TCPConn for TCP_NODELAY and Linux splice(2) zero-copy.
 type ProxyProtoListener struct {
 	net.Listener
+	RequireHeader bool // when `force_proxy_protocol=true`, reject non-PROXY connections
 }
 
 func (l *ProxyProtoListener) Accept() (net.Conn, error) {
@@ -25,20 +28,26 @@ func (l *ProxyProtoListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &proxyProtoConn{Conn: c}, nil
+	return &proxyProtoConn{Conn: c, requireHdr: l.RequireHeader}, nil
 }
 
 type proxyProtoConn struct {
 	net.Conn
+	requireHdr bool
 	parseOnce  sync.Once
 	parseErr   error
 	remoteAddr net.Addr
+	readMu     sync.Mutex
 	leftover   []byte
+	drained    atomic.Bool
 }
 
 func (p *proxyProtoConn) ensureParsed() error {
 	p.parseOnce.Do(func() {
 		p.parseErr = p.parseHeader()
+		if p.parseErr == nil && len(p.leftover) == 0 {
+			p.drained.Store(true)
+		}
 	})
 	return p.parseErr
 }
@@ -56,7 +65,7 @@ func (p *proxyProtoConn) RawWriteConn() net.Conn {
 // UnwrapTCP exposes the raw *net.TCPConn once any peeked PROXY header leftover bytes are drained,
 // enabling Linux kernel `splice(2)` zero-copy even when `proxy_protocol=true`!
 func (p *proxyProtoConn) UnwrapTCP() (*net.TCPConn, bool) {
-	if err := p.ensureParsed(); err != nil || len(p.leftover) > 0 {
+	if err := p.ensureParsed(); err != nil || !p.drained.Load() {
 		return nil, false
 	}
 	return unwrapTCP(p.Conn)
@@ -66,7 +75,11 @@ func (p *proxyProtoConn) CloseWrite() error {
 	if cw, ok := p.Conn.(closeWriter); ok {
 		return cw.CloseWrite()
 	}
-	return p.Conn.SetReadDeadline(time.Now())
+	return errors.New("half-close unsupported")
+}
+
+func (p *proxyProtoConn) CanHalfCloseWrite() bool {
+	return canConnHalfCloseWrite(p.Conn)
 }
 
 func (p *proxyProtoConn) RemoteAddr() net.Addr {
@@ -81,21 +94,36 @@ func (p *proxyProtoConn) Read(b []byte) (int, error) {
 	if err := p.ensureParsed(); err != nil {
 		return 0, err
 	}
-	if len(p.leftover) > 0 {
-		n := copy(b, p.leftover)
-		p.leftover = p.leftover[n:]
-		return n, nil
+	if !p.drained.Load() {
+		p.readMu.Lock()
+		if len(p.leftover) > 0 {
+			n := copy(b, p.leftover)
+			p.leftover = p.leftover[n:]
+			if len(p.leftover) == 0 {
+				p.leftover = nil
+				p.drained.Store(true)
+			}
+			p.readMu.Unlock()
+			return n, nil
+		}
+		p.drained.Store(true)
+		p.readMu.Unlock()
 	}
 	return p.Conn.Read(b)
 }
 
 func (p *proxyProtoConn) parseHeader() error {
 	_ = p.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	defer func() { _ = p.Conn.SetReadDeadline(time.Time{}) }()
+	// Restore a bounded 12s handshake deadline (instead of infinite time.Time{}) so post-PROXY
+	// TLS/WS/protocol Slowloris stalls always time out cleanly!
+	defer func() { _ = p.Conn.SetReadDeadline(time.Now().Add(12 * time.Second)) }()
 
 	var hdr [16]byte
 	n, err := io.ReadAtLeast(p.Conn, hdr[:], 6)
 	if err != nil {
+		if p.requireHdr {
+			return errors.New("missing required PROXY protocol header")
+		}
 		p.leftover = append(p.leftover, hdr[:n]...)
 		return nil
 	}
@@ -126,6 +154,9 @@ func (p *proxyProtoConn) parseHeader() error {
 			}
 			return nil
 		}
+		if p.requireHdr {
+			return errors.New("malformed PROXY protocol v1 header")
+		}
 		p.leftover = append(p.leftover, buf[:total]...)
 		return nil
 	}
@@ -135,24 +166,38 @@ func (p *proxyProtoConn) parseHeader() error {
 		m, rerr := io.ReadFull(p.Conn, hdr[n:16])
 		n += m
 		if rerr != nil {
+			if p.requireHdr {
+				return errors.New("incomplete PROXY protocol v2 header")
+			}
 			p.leftover = append(p.leftover, hdr[:n]...)
 			return nil
 		}
 	}
 	if bytes.Equal(hdr[:12], proxyV2Sig[:]) && (hdr[12]&0xF0) == 0x20 {
 		addrLen := int(binary.BigEndian.Uint16(hdr[14:16]))
-		if addrLen > 0 && addrLen <= 512 {
-			addrBuf := make([]byte, addrLen)
-			if _, err := io.ReadFull(p.Conn, addrBuf); err != nil {
+		if addrLen > 4096 {
+			return errors.New("PROXY protocol v2 TLV payload exceeds 4096 bytes")
+		}
+		if addrLen > 0 {
+			readBytes := min(addrLen, 64)
+			var addrBuf [64]byte
+			if _, err := io.ReadFull(p.Conn, addrBuf[:readBytes]); err != nil {
 				return err
 			}
+			if rem := addrLen - readBytes; rem > 0 {
+				if _, err := io.CopyN(io.Discard, p.Conn, int64(rem)); err != nil {
+					return err
+				}
+			}
 			fam := hdr[13] >> 4
-			if fam == 0x1 && addrLen >= 12 { // AF_INET
-				srcIP := net.IP(addrBuf[0:4])
+			if fam == 0x1 && readBytes >= 12 { // AF_INET
+				srcIP := make(net.IP, 4)
+				copy(srcIP, addrBuf[0:4])
 				srcPort := int(binary.BigEndian.Uint16(addrBuf[8:10]))
 				p.remoteAddr = &net.TCPAddr{IP: srcIP, Port: srcPort}
-			} else if fam == 0x2 && addrLen >= 36 { // AF_INET6
-				srcIP := net.IP(addrBuf[0:16])
+			} else if fam == 0x2 && readBytes >= 36 { // AF_INET6
+				srcIP := make(net.IP, 16)
+				copy(srcIP, addrBuf[0:16])
 				srcPort := int(binary.BigEndian.Uint16(addrBuf[32:34]))
 				p.remoteAddr = &net.TCPAddr{IP: srcIP, Port: srcPort}
 			}
@@ -160,6 +205,9 @@ func (p *proxyProtoConn) parseHeader() error {
 		return nil
 	}
 
+	if p.requireHdr {
+		return errors.New("connection lacks required PROXY protocol header")
+	}
 	p.leftover = append(p.leftover, hdr[:n]...)
 	return nil
 }

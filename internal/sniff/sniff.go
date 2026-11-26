@@ -3,6 +3,8 @@ package sniff
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -125,8 +127,11 @@ func SniffTLSClientHello(b []byte) (string, bool) {
 					break
 				}
 				if nameType == 0x00 && nameLen > 0 {
-					host := strings.ToLower(string(p[q : q+nameLen]))
-					return host, true
+					host := normalizeSniffedDomain(string(p[q : q+nameLen]))
+					if host != "" {
+						return host, true
+					}
+					return "", false
 				}
 				q += nameLen
 			}
@@ -134,6 +139,25 @@ func SniffTLSClientHello(b []byte) (string, bool) {
 		pos += extLen
 	}
 	return "", false
+}
+
+// isValidSniffDomain rejects IP literals, oversized names (>253 chars), and control/whitespace characters
+// so sniffed SNI/Host values can never smuggle ports/CRLF into outbounds or bypass BanPrivateIP.
+func normalizeSniffedDomain(raw string) string {
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	if host == "" || len(host) > 253 {
+		return ""
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return ""
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if c <= 0x20 || c >= 0x7f || c == '/' || c == '\\' || c == ':' || c == '@' {
+			return ""
+		}
+	}
+	return host
 }
 
 // SniffHTTPHost extracts the Host header from an HTTP/1.x request.
@@ -174,13 +198,16 @@ func SniffHTTPHost(b []byte) (string, bool) {
 			(line[2] == 's' || line[2] == 'S') &&
 			(line[3] == 't' || line[3] == 'T') && line[4] == ':' {
 			val := strings.TrimSpace(string(line[5:]))
-			if colon := strings.LastIndexByte(val, ':'); colon > 0 && !strings.Contains(val, "]") {
-				val = val[:colon]
+			if h, _, err := net.SplitHostPort(val); err == nil {
+				val = h
+			} else if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
+				val = val[1 : len(val)-1]
 			}
-			val = strings.ToLower(strings.Trim(val, "[]"))
-			if val != "" {
-				return val, true
+			host := normalizeSniffedDomain(val)
+			if host != "" {
+				return host, true
 			}
+			return "", false
 		}
 	}
 	return "", false

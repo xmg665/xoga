@@ -61,6 +61,8 @@ type UserIndex struct {
 	ByPassword  map[string]*stats.UserEntry   // Hysteria2 O(1) password / UUID / id:pass lookup
 	SSUsers     []SSUserEntry
 	SSEIHMap    map[[16]byte]*SSUserEntry
+	ssExactMode bool
+	ssCipher    string
 	VMessUsers  []VMessUserEntry
 	VMessBlocks []cipher.Block // compact 16B/user parallel slice for L1/L2 cache-friendly AuthID scan
 }
@@ -81,13 +83,33 @@ func (idx *UserIndex) LookupPassword(cred string) *stats.UserEntry {
 }
 
 func BuildUserIndex(users []*stats.UserEntry, ssKeyLen int) *UserIndex {
-	return BuildUserIndexForProtocol("", users, ssKeyLen)
+	return buildUserIndexInternal("", "", users, ssKeyLen, false, false)
+}
+
+// BuildUserIndexForCipher constructs lookup structures using exact Shadowsocks cipher semantics
+// (SIP004 `EVP_BytesToKey` for classic AEAD vs SIP022 base64 / UUID-prefix for Shadowsocks-2022).
+func BuildUserIndexForCipher(proto, cipherName string, users []*stats.UserEntry) *UserIndex {
+	ssKeyLen := 0
+	is2022 := false
+	if proto == "shadowsocks" {
+		if cs, err := parseSSCipher(cipherName); err == nil {
+			ssKeyLen = cs.keySize
+			is2022 = cs.is2022
+		} else {
+			ssKeyLen = 32
+		}
+	}
+	return buildUserIndexInternal(proto, strings.ToLower(strings.TrimSpace(cipherName)), users, ssKeyLen, is2022, true)
 }
 
 // BuildUserIndexForProtocol constructs only the lookup structures required by `proto`
 // ("vmess", "vless", "trojan", "shadowsocks", "hysteria2", "anytls", or "" for all),
 // saving ~35 MiB of unused map buckets across multi-node instances and reusing cached VMess key schedules.
 func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen int) *UserIndex {
+	return buildUserIndexInternal(proto, "", users, ssKeyLen, false, false)
+}
+
+func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, ssKeyLen int, ssIs2022, exactSS bool) *UserIndex {
 	needTrojan := proto == "" || proto == "trojan"
 	needVLESS := proto == "" || proto == "vless"
 	needVMess := proto == "" || proto == "vmess"
@@ -96,7 +118,9 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 	needSS := ssKeyLen > 0 || proto == "shadowsocks"
 
 	idx := &UserIndex{
-		Users: users,
+		Users:       users,
+		ssExactMode: exactSS,
+		ssCipher:    cipherName,
 	}
 	if needTrojan {
 		idx.ByTrojan = make(map[[56]byte]*stats.UserEntry, len(users))
@@ -125,6 +149,11 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 		}
 		if needTrojan {
 			idx.ByTrojan[u.TrojanHash] = u
+			if u.UUID != "" && u.UUID != u.Passwd {
+				var altTrojan [56]byte
+				encodeAltTrojanHash(u.UUID, &altTrojan)
+				idx.ByTrojan[altTrojan] = u
+			}
 			if u.Passwd != "" && u.Passwd != u.UUID {
 				var altTrojan [56]byte
 				encodeAltTrojanHash(u.Passwd, &altTrojan)
@@ -149,28 +178,26 @@ func BuildUserIndexForProtocol(proto string, users []*stats.UserEntry, ssKeyLen 
 			if needVLESS {
 				idx.ByUUID[u.UUIDBytes] = u
 			}
-			if needVMess {
-				if !u.VMessAuthReady || u.VMessAuthBlock == nil {
-					cmdKey := vmessCmdKey(u.UUIDBytes)
-					authKey := vmessKDF(cmdKey[:], "AES Auth ID Encryption")[:16]
-					if blk, err := aes.NewCipher(authKey); err == nil {
-						u.VMessCmdKey = cmdKey
-						u.VMessAuthBlock = blk
-						u.VMessAuthReady = true
-					}
-				}
-				if u.VMessAuthReady && u.VMessAuthBlock != nil {
-					idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
-						User:      u,
-						CmdKey:    u.VMessCmdKey,
-						AuthBlock: u.VMessAuthBlock,
-					})
-					idx.VMessBlocks = append(idx.VMessBlocks, u.VMessAuthBlock)
-				}
+			if needVMess && u.VMessAuthReady && u.VMessAuthBlock != nil {
+				idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
+					User:      u,
+					CmdKey:    u.VMessCmdKey,
+					AuthBlock: u.VMessAuthBlock,
+				})
+				idx.VMessBlocks = append(idx.VMessBlocks, u.VMessAuthBlock)
 			}
 		}
 		if needSS && ssKeyLen > 0 {
-			mk := deriveSSUserKey(u.Passwd, ssKeyLen)
+			secret := u.Passwd
+			if secret == "" {
+				secret = u.UUID
+			}
+			var mk []byte
+			if exactSS {
+				mk = deriveSSKeyExact(secret, ssKeyLen, ssIs2022)
+			} else {
+				mk = deriveSSUserKey(secret, ssKeyLen)
+			}
 			var eih [16]byte
 			blake3DeriveKey("shadowsocks 2022 identity subkey", mk, eih[:])
 			entry := SSUserEntry{
@@ -192,11 +219,39 @@ func encodeAltTrojanHash(secret string, dst *[56]byte) {
 	hex.Encode(dst[:], sum[:])
 }
 
-func deriveSSUserKey(secret string, keyLen int) []byte {
+func deriveSSKeyExact(secret string, keyLen int, is2022 bool) []byte {
+	if !is2022 {
+		// Classic SIP004 AEAD ciphers always derive master keys via EVP_BytesToKey (never base64!)
+		return evpBytesToKey(secret, keyLen)
+	}
+	// SIP022 (Shadowsocks-2022): try standard base64 PSK first, then V2Board/Xboard UUID byte prefix!
 	if raw, err := base64.StdEncoding.DecodeString(secret); err == nil && len(raw) >= keyLen {
 		out := make([]byte, keyLen)
 		copy(out, raw[:keyLen])
 		return out
+	}
+	if !strings.Contains(secret, "-") {
+		if raw, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(secret, "=")); err == nil && len(raw) >= keyLen {
+			out := make([]byte, keyLen)
+			copy(out, raw[:keyLen])
+			return out
+		}
+	}
+	if len(secret) >= keyLen {
+		out := make([]byte, keyLen)
+		copy(out, secret[:keyLen])
+		return out
+	}
+	return evpBytesToKey(secret, keyLen)
+}
+
+func deriveSSUserKey(secret string, keyLen int) []byte {
+	if strings.HasSuffix(secret, "=") {
+		if raw, err := base64.StdEncoding.DecodeString(secret); err == nil && len(raw) == keyLen {
+			out := make([]byte, keyLen)
+			copy(out, raw)
+			return out
+		}
 	}
 	return evpBytesToKey(secret, keyLen)
 }
@@ -239,8 +294,43 @@ type Server struct {
 	hy2Transport *quic.Transport
 	hy2Listener  *quic.Listener
 
-	closed atomic.Bool
-	wg     sync.WaitGroup
+	closed      atomic.Bool
+	wg          sync.WaitGroup
+	connsMu     sync.Mutex
+	nextSrvConn uint64
+	activeConns map[uint64]io.Closer
+}
+
+func (s *Server) trackConn(c io.Closer) uint64 {
+	if s.closed.Load() {
+		_ = c.Close()
+		return 0
+	}
+	s.connsMu.Lock()
+	if s.closed.Load() {
+		s.connsMu.Unlock()
+		_ = c.Close()
+		return 0
+	}
+	if s.activeConns == nil {
+		s.activeConns = make(map[uint64]io.Closer, 32)
+	}
+	s.nextSrvConn++
+	id := s.nextSrvConn
+	s.activeConns[id] = c
+	s.connsMu.Unlock()
+	return id
+}
+
+func (s *Server) untrackConn(id uint64) {
+	if id == 0 {
+		return
+	}
+	s.connsMu.Lock()
+	if s.activeConns != nil {
+		delete(s.activeConns, id)
+	}
+	s.connsMu.Unlock()
 }
 
 func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker, initialIdx *UserIndex, initialACL *acl.Engine, dnsResolver ...*dns.Resolver) (*Server, error) {
@@ -256,7 +346,6 @@ func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker,
 		tracker: tracker,
 		dnsRes:  res,
 	}
-	s.userIdx.Store(initialIdx)
 	s.aclEng.Store(initialACL)
 
 	if spec.Protocol == "shadowsocks" {
@@ -265,19 +354,18 @@ func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker,
 			return nil, err
 		}
 		s.ssSpec = cs
+		if initialIdx != nil && (!initialIdx.ssExactMode || initialIdx.ssCipher != cs.name) {
+			initialIdx = BuildUserIndexForCipher("shadowsocks", spec.Cipher, initialIdx.Users)
+		}
 		if cs.is2022 && spec.ServerKey != "" {
-			psk, err := base64.StdEncoding.DecodeString(spec.ServerKey)
-			if err != nil || len(psk) < cs.keySize {
-				psk = evpBytesToKey(spec.ServerKey, cs.keySize)
-			} else {
-				psk = psk[:cs.keySize]
-			}
+			psk := deriveSSKeyExact(spec.ServerKey, cs.keySize, true)
 			s.ssPSK = psk
 			if blk, err := aes.NewCipher(psk); err == nil {
 				s.ssPSKBlk = blk
 			}
 		}
 	}
+	s.userIdx.Store(initialIdx)
 	return s, nil
 }
 
@@ -328,7 +416,10 @@ func (s *Server) Start() error {
 
 	ln := rawLn
 	if s.cfg.ProxyProtocol {
-		ln = &relay.ProxyProtoListener{Listener: ln}
+		ln = &relay.ProxyProtoListener{
+			Listener:      ln,
+			RequireHeader: s.cfg.ForceProxyProtocol,
+		}
 	}
 
 	needReality := !s.cfg.ForceCloseSSL && s.spec.TLSMode == 2
@@ -397,6 +488,15 @@ func (s *Server) Close() {
 	if s.tlsProv != nil {
 		s.tlsProv.Close()
 	}
+	s.connsMu.Lock()
+	conns := s.activeConns
+	s.activeConns = nil
+	s.connsMu.Unlock()
+	for _, c := range conns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
 	s.wg.Wait()
 }
 
@@ -420,12 +520,19 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
+	cid := s.trackConn(conn)
+	if cid == 0 {
+		return
+	}
+	defer func() {
+		s.untrackConn(cid)
+		_ = conn.Close()
+	}()
 	relay.TuneTCP(conn)
-	_ = conn.SetReadDeadline(time.Now().Add(12 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
 
 	if s.spec.Network == "ws" {
-		wsConn, err := transport.AcceptWebSocket(conn, s.spec.WSPath)
+		wsConn, err := transport.AcceptWebSocket(conn, s.spec.WSPath, s.cfg.ProxyProtocol)
 		if err != nil {
 			logger.Debugf("ws upgrade failed from %s: %v", conn.RemoteAddr(), err)
 			return
@@ -445,6 +552,56 @@ func (s *Server) handleConn(conn net.Conn) {
 	case "anytls":
 		s.handleAnyTLS(conn)
 	}
+}
+
+// peekInitialPayload reads up to 2 KiB of initial client payload within 150ms (reassembling fragmented
+// TLS ClientHello records when split across 2 TCP segments) and IMMEDIATELY returns the pooled buffer
+// so idle streams never pin 2 KiB slabs in `bufpool`!
+func (s *Server) peekInitialPayload(clientConn net.Conn) ([]byte, error) {
+	bp := bufpool.Get(bufpool.SmallSize)
+	defer bufpool.Put(bp)
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	_ = clientConn.SetReadDeadline(deadline)
+	defer func() { _ = clientConn.SetReadDeadline(time.Time{}) }()
+
+	buf := *bp
+	n, err := clientConn.Read(buf)
+	if n == 0 {
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	// Reassemble fragmented TLS ClientHello (e.g. Xray/sing-box 5-byte TLS record fragment) within same 150ms budget
+	for attempt := 0; attempt < 2 && n < len(buf); attempt++ {
+		needMore := false
+		if n < 5 && buf[0] == 0x16 {
+			needMore = true
+		} else if n >= 5 && buf[0] == 0x16 && buf[1] == 0x03 {
+			recLen := 5 + int(binary.BigEndian.Uint16(buf[3:5]))
+			if n < recLen && recLen <= len(buf) {
+				needMore = true
+			}
+		}
+		if !needMore {
+			break
+		}
+		m, rerr := clientConn.Read(buf[n:])
+		n += m
+		if rerr != nil || m == 0 {
+			break
+		}
+	}
+
+	out := make([]byte, n)
+	copy(out, buf[:n])
+	return out, nil
 }
 
 // connectAndRelay acquires a tracked user session (so account expiry / quota exhaustion immediately
@@ -476,25 +633,14 @@ func (s *Server) connectStreamNoAcquire(
 		return
 	}
 
-	// For multiplexed AnyTLS v2 (`onDial != nil`), client waits for `cmdSYNACK` BEFORE sending first application payload!
-	// So only peek prior to dialing when `onDial == nil`.
 	var peeked []byte
-	var peekBuf *[]byte
 	if len(preread) > 0 {
 		peeked = preread
 	} else if onDial == nil {
-		peekBuf = bufpool.Get(bufpool.SmallSize)
-		defer bufpool.Put(peekBuf)
-		_ = clientConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-		n, err := clientConn.Read((*peekBuf)[:])
-		_ = clientConn.SetReadDeadline(time.Time{})
-		if n > 0 {
-			peeked = (*peekBuf)[:n]
-		} else if err != nil {
-			var ne net.Error
-			if !errors.As(err, &ne) || !ne.Timeout() {
-				return
-			}
+		var perr error
+		peeked, perr = s.peekInitialPayload(clientConn)
+		if perr != nil {
+			return
 		}
 	}
 
@@ -512,7 +658,7 @@ func (s *Server) connectStreamNoAcquire(
 	effectiveHost := destHost
 	if sn.Domain != "" && s.cfg.DomainSniff {
 		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
-			if s.cfg.ForceDomainSniff || route.Action == acl.ActionProxy || s.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
+			if s.cfg.ForceDomainSniff || route.IsRemoteProxy || s.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
 				effectiveHost = sn.Domain
 			}
 		}

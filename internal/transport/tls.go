@@ -23,17 +23,34 @@ import (
 	"github.com/xmg665/xoga/internal/logger"
 )
 
+type acmeDomainEntry struct {
+	mgr  *autocert.Manager
+	refs int
+}
+
 var (
-	acmeHubMu   sync.RWMutex
-	acmeManagers = make(map[string]*autocert.Manager)
-	acmeServer  *http.Server
-	acmeRefCnt  int
+	acmeHubMu    sync.RWMutex
+	acmeManagers = make(map[string]*acmeDomainEntry)
+	acmeServer   *http.Server
+	acmeRefCnt   int
 )
 
-func registerACMEManager(domain string, mgr *autocert.Manager) {
+func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 	key := strings.ToLower(strings.TrimSpace(domain))
 	acmeHubMu.Lock()
-	acmeManagers[key] = mgr
+	ent := acmeManagers[key]
+	if ent == nil {
+		ent = &acmeDomainEntry{
+			mgr: &autocert.Manager{
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(domain),
+				Cache:      autocert.DirCache(cacheDir),
+			},
+		}
+		acmeManagers[key] = ent
+	}
+	ent.refs++
+	mgr := ent.mgr
 	acmeRefCnt++
 	needStart := acmeServer == nil
 	var srv *http.Server
@@ -47,10 +64,12 @@ func registerACMEManager(domain string, mgr *autocert.Manager) {
 				}
 				host = strings.ToLower(strings.TrimSpace(host))
 				acmeHubMu.RLock()
-				m := acmeManagers[host]
-				if m == nil {
+				var m *autocert.Manager
+				if e := acmeManagers[host]; e != nil {
+					m = e.mgr
+				} else {
 					for _, cand := range acmeManagers {
-						m = cand
+						m = cand.mgr
 						break
 					}
 				}
@@ -74,12 +93,18 @@ func registerACMEManager(domain string, mgr *autocert.Manager) {
 			}
 		}()
 	}
+	return mgr
 }
 
 func unregisterACMEManager(domain string) {
 	key := strings.ToLower(strings.TrimSpace(domain))
 	acmeHubMu.Lock()
-	delete(acmeManagers, key)
+	if ent := acmeManagers[key]; ent != nil {
+		ent.refs--
+		if ent.refs <= 0 {
+			delete(acmeManagers, key)
+		}
+	}
 	if acmeRefCnt > 0 {
 		acmeRefCnt--
 	}
@@ -138,12 +163,7 @@ func BuildTLSConfigWithALPN(cfg *config.Config, serverName string, nextProtos []
 			cacheDir = "/etc/xoga/certs"
 		}
 		_ = os.MkdirAll(cacheDir, 0700)
-		mgr := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(domain),
-			Cache:      autocert.DirCache(cacheDir),
-		}
-		registerACMEManager(domain, mgr)
+		mgr := registerACMEManager(domain, cacheDir)
 		tc := mgr.TLSConfig()
 		tc.MinVersion = tls.VersionTLS12
 		tc.NextProtos = append(tc.NextProtos, nextProtos...)

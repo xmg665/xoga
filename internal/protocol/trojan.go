@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -53,7 +54,7 @@ func (s *Server) handleTrojan(conn net.Conn) {
 	if _, err := io.ReadFull(br, crlf[:]); err != nil || crlf[0] != '\r' || crlf[1] != '\n' {
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	switch cmd[0] {
 	case 0x01: // TCP Connect
@@ -80,12 +81,10 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	}
 	defer user.ReleaseSession(connID)
 
-	localBind := ""
-	nodeRoute := s.aclEng.Load().DecideForNode(s.cfg.NodeID, "0.0.0.0", 53, "", "")
-	if lu := relay.LocalUDPAddrForRoute(nodeRoute, false); lu != nil {
-		localBind = net.JoinHostPort(lu.IP.String(), "0")
-	}
-	udpConn, err := net.ListenPacket("udp", localBind)
+	nodeRoute := s.aclEng.Load().DecideForNode(s.cfg.NodeID, "1.1.1.1", 443, "", "")
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	udpConn, err := relay.DialUDPForRoute(dctx, nodeRoute, false, s.dnsRes)
+	dcancel()
 	if err != nil {
 		return
 	}
@@ -95,6 +94,9 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
 	}
+
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().Unix())
 
 	// Remote UDP -> Trojan stream
 	done := make(chan struct{})
@@ -108,12 +110,17 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 			_ = udpConn.SetReadDeadline(time.Now().Add(idleDur))
 			n, raddr, err := udpConn.ReadFrom(buf)
 			if err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
 				return
 			}
 			ua, ok := raddr.(*net.UDPAddr)
 			if !ok {
 				continue
 			}
+			lastActive.Store(time.Now().Unix())
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -137,6 +144,10 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		host, port, err := parseSOCKS5Addr(conn)
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				continue
+			}
 			break
 		}
 		var lenCRLF [4]byte
@@ -150,6 +161,7 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		if _, err := io.ReadFull(conn, payload[:pktLen]); err != nil {
 			break
 		}
+		lastActive.Store(time.Now().Unix())
 
 		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {

@@ -31,29 +31,31 @@ type UniProxyClient struct {
 	baseURL  string
 	nodeType string
 
-	mu             sync.Mutex
-	configETag     string
-	usersETag      string
-	lastUsersHash  [32]byte
-	hasUsersHash   bool
-	nextUserExpiry int64 // earliest upcoming ExpiredAt Unix timestamp among active users
-	lastBodyLen    atomic.Int64
-	legacyV2       bool // fallback node_type="v2ray" when older V2Board rejects "vmess"
-	legacyHy       bool // fallback node_type="hysteria" when Xboard/V2Board uses "hysteria" (v2) instead of "hysteria2"
+	mu                sync.Mutex
+	configETag        string
+	usersETag         string
+	lastUsersHash     [32]byte
+	hasUsersHash      bool
+	nextUserExpiry    int64 // earliest upcoming ExpiredAt Unix timestamp among active users
+	lastBodyLen       atomic.Int64
+	effectiveNodeType string // dynamically negotiated UniProxy `node_type` (`vmess`<->`v2ray`, `hysteria2`<->`hysteria`)
 }
 
 func NewUniProxyClient(cfg *config.Config, httpCli *http.Client) *UniProxyClient {
 	nt := cfg.NormalizedServerType()
-	if strings.EqualFold(cfg.ServerType, "v2ray") {
+	// Only preserve `"v2ray"` / `"hysteria"` raw string when normalized protocol is actually vmess/hysteria2
+	// (never overwrite `"vless"` when `server_type=v2ray` + `vless=true` or `reality=true`!).
+	if nt == "vmess" && strings.EqualFold(cfg.ServerType, "v2ray") {
 		nt = "v2ray"
-	} else if strings.EqualFold(cfg.ServerType, "hysteria") {
+	} else if nt == "hysteria2" && strings.EqualFold(cfg.ServerType, "hysteria") {
 		nt = "hysteria"
 	}
 	return &UniProxyClient{
-		cfg:      cfg,
-		http:     httpCli,
-		baseURL:  strings.TrimRight(cfg.WebAPIURL, "/"),
-		nodeType: nt,
+		cfg:               cfg,
+		http:              httpCli,
+		baseURL:           strings.TrimRight(cfg.WebAPIURL, "/"),
+		nodeType:          nt,
+		effectiveNodeType: nt,
 	}
 }
 
@@ -61,14 +63,26 @@ func (c *UniProxyClient) Name() string {
 	return "UniProxy(" + c.cfg.Type + ")"
 }
 
+func alternateUniProxyNodeType(nt string) string {
+	switch nt {
+	case "vmess":
+		return "v2ray"
+	case "v2ray":
+		return "vmess"
+	case "hysteria2":
+		return "hysteria"
+	case "hysteria":
+		return "hysteria2"
+	default:
+		return ""
+	}
+}
+
 func (c *UniProxyClient) endpoint(action string) string {
 	c.mu.Lock()
-	nt := c.nodeType
-	if c.legacyV2 && nt == "vmess" {
-		nt = "v2ray"
-	}
-	if c.legacyHy && nt == "hysteria2" {
-		nt = "hysteria"
+	nt := c.effectiveNodeType
+	if nt == "" {
+		nt = c.nodeType
 	}
 	c.mu.Unlock()
 	return c.endpointWithType(action, nt)
@@ -119,24 +133,16 @@ type uniConfigResp struct {
 func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) {
 	c.mu.Lock()
 	etag := c.configETag
-	alreadyLegacyV2 := c.legacyV2
-	alreadyLegacyHy := c.legacyHy
+	curNT := c.effectiveNodeType
 	c.mu.Unlock()
 
-	body, newETag, status, err := c.doGet(ctx, c.endpoint("config"), etag)
+	body, newETag, status, err := c.doGet(ctx, c.endpointWithType("config", curNT), etag)
 	if err != nil && (status == 400 || status == 404 || status == 422 || status == 500) {
-		// Only latch legacyV2/legacyHy if the fallback node_type actually succeeds, so a transient HTTP 500 never poisons modern Xboard!
-		if c.nodeType == "vmess" && !alreadyLegacyV2 {
-			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", "v2ray"), ""); altErr == nil {
+		// Bidirectional negotiation (`vmess`<->`v2ray`, `hysteria2`<->`hysteria`): only latch if fallback returns 200 OK!
+		if altNT := alternateUniProxyNodeType(curNT); altNT != "" {
+			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", altNT), ""); altErr == nil {
 				c.mu.Lock()
-				c.legacyV2 = true
-				c.mu.Unlock()
-				body, newETag, status, err = altBody, altETag, altStatus, nil
-			}
-		} else if c.nodeType == "hysteria2" && !alreadyLegacyHy {
-			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", "hysteria"), ""); altErr == nil {
-				c.mu.Lock()
-				c.legacyHy = true
+				c.effectiveNodeType = altNT
 				c.mu.Unlock()
 				body, newETag, status, err = altBody, altETag, altStatus, nil
 			}
@@ -471,7 +477,7 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 	return out, nil
 }
 
-func (c *UniProxyClient) FetchAliveList(ctx context.Context) (map[int][]string, error) {
+func (c *UniProxyClient) FetchAliveList(ctx context.Context) (*AliveList, error) {
 	body, _, status, err := c.doGet(ctx, c.endpoint("alivelist"), "")
 	if err != nil {
 		if status == 404 {
@@ -481,20 +487,40 @@ func (c *UniProxyClient) FetchAliveList(ctx context.Context) (map[int][]string, 
 		return nil, err
 	}
 	var wrapper struct {
-		Alive map[string]json.RawMessage `json:"alive"`
+		Alive json.RawMessage `json:"alive"`
 	}
 	if err := json.Unmarshal(body, &wrapper); err != nil || len(wrapper.Alive) == 0 {
-		return nil, nil
+		return &AliveList{}, nil
 	}
-	res := make(map[int][]string, len(wrapper.Alive))
-	for uidStr, raw := range wrapper.Alive {
+	// Note: PHP panels serialize empty associative arrays as `[]`; return non-nil empty AliveList so stale remoteIPs clear!
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(wrapper.Alive, &rawMap); err != nil || len(rawMap) == 0 {
+		return &AliveList{}, nil
+	}
+
+	res := &AliveList{}
+	for uidStr, raw := range rawMap {
 		uid, err := strconv.Atoi(uidStr)
 		if err != nil {
 			continue
 		}
 		var ips []string
-		if json.Unmarshal(raw, &ips) == nil && len(ips) > 0 {
-			res[uid] = ips
+		if json.Unmarshal(raw, &ips) == nil {
+			if len(ips) > 0 {
+				if res.IPs == nil {
+					res.IPs = make(map[int][]string)
+				}
+				res.IPs[uid] = ips
+			}
+			continue
+		}
+		// Xboard / wyx2685 NewV2Board return integer alive_ip counts (`{"alive": {"101": 2}}`)
+		var cnt int
+		if json.Unmarshal(raw, &cnt) == nil && cnt > 0 {
+			if res.Counts == nil {
+				res.Counts = make(map[int]int)
+			}
+			res.Counts[uid] = cnt
 		}
 	}
 	return res, nil
@@ -505,9 +531,12 @@ func (c *UniProxyClient) PushTraffic(ctx context.Context, batch []stats.TrafficD
 		return nil
 	}
 	// UniProxy /push expects: {"<user_id>": [upload_bytes, download_bytes]}
+	// Sum multiple deltas for the same UserID (e.g. retiredTraffic + post-renewal active traffic) so zero bytes are lost!
 	payload := make(map[string][2]int64, len(batch))
 	for _, item := range batch {
-		payload[strconv.Itoa(item.UserID)] = [2]int64{item.Upload, item.Download}
+		k := strconv.Itoa(item.UserID)
+		prev := payload[k]
+		payload[k] = [2]int64{prev[0] + item.Upload, prev[1] + item.Download}
 	}
 	return c.doPostJSON(ctx, c.endpoint("push"), payload, false)
 }

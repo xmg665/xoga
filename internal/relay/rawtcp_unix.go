@@ -106,3 +106,78 @@ func tryCopyFromRawTCP(
 		}
 	}
 }
+
+// ReadPacketZeroIdle reads one UDP datagram without holding a 64 KiB `bufpool` buffer while parked in epoll!
+// On EAGAIN/EWOULDBLOCK, `bp` is immediately returned to `bufpool` before Go's netpoller suspends the goroutine.
+func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, error) {
+	uc, ok := pc.(*net.UDPConn)
+	if !ok {
+		bp := bufpool.Get(bufpool.MaxUDPSize)
+		buf := *bp
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			bufpool.Put(bp)
+			return 0, nil, nil, nil, err
+		}
+		return n, addr, buf, bp, nil
+	}
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		bp := bufpool.Get(bufpool.MaxUDPSize)
+		buf := *bp
+		n, addr, rerr := pc.ReadFrom(buf)
+		if rerr != nil {
+			bufpool.Put(bp)
+			return 0, nil, nil, nil, rerr
+		}
+		return n, addr, buf, bp, nil
+	}
+
+	var bp *[]byte
+	var nr int
+	var raddr net.Addr
+	var recvErr error
+
+	err = rc.Read(func(fd uintptr) bool {
+		if bp == nil {
+			bp = bufpool.Get(bufpool.MaxUDPSize)
+		}
+		for {
+			n, sa, serr := syscall.Recvfrom(int(fd), *bp, 0)
+			if serr == syscall.EINTR {
+				continue
+			}
+			if serr == syscall.EAGAIN || serr == syscall.EWOULDBLOCK {
+				bufpool.Put(bp)
+				bp = nil
+				return false
+			}
+			if serr != nil {
+				recvErr = serr
+				return true
+			}
+			nr = n
+			switch a := sa.(type) {
+			case *syscall.SockaddrInet4:
+				ip := make(net.IP, 4)
+				copy(ip, a.Addr[:])
+				raddr = &net.UDPAddr{IP: ip, Port: a.Port}
+			case *syscall.SockaddrInet6:
+				ip := make(net.IP, 16)
+				copy(ip, a.Addr[:])
+				raddr = &net.UDPAddr{IP: ip, Port: a.Port}
+			}
+			return true
+		}
+	})
+	if err != nil || recvErr != nil || raddr == nil {
+		if bp != nil {
+			bufpool.Put(bp)
+		}
+		if recvErr != nil {
+			return 0, nil, nil, nil, recvErr
+		}
+		return 0, nil, nil, nil, err
+	}
+	return nr, raddr, *bp, bp, nil
+}

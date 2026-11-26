@@ -67,13 +67,14 @@ const (
 )
 
 type upstreamRule struct {
-	server    string // e.g. "154.12.1.1:53", "tcp://8.8.8.8:53", "https://dns.example.com/dns-query"
-	strategy  Strategy
-	isCatch   bool // true when server has no rules or `else` wildcard
-	exact     map[string]struct{}
-	suffixMap map[string]struct{}
-	keywords  []string
-	regexps   []*regexp.Regexp
+	server      string // e.g. "154.12.1.1:53", "tcp://8.8.8.8:53", "tls://1.1.1.1:853", "https://dns.example.com/dns-query"
+	strategy    Strategy
+	isCatch     bool // true when server has no rules key or `else` wildcard
+	sawRulesKey bool
+	exact       map[string]struct{}
+	suffixMap   map[string]struct{}
+	keywords    []string
+	regexps     []*regexp.Regexp
 }
 
 func (u *upstreamRule) matches(domain string) bool {
@@ -123,25 +124,36 @@ func (u *upstreamRule) addPattern(raw string) {
 		}
 		return
 	}
-	if strings.HasPrefix(p, "full:") {
-		u.exact[strings.ToLower(strings.TrimSpace(p[5:]))] = struct{}{}
+	lower := strings.ToLower(p)
+	if strings.HasPrefix(lower, "geosite:") {
 		return
 	}
-	if strings.HasPrefix(p, "domain:") {
-		p = strings.TrimSpace(p[7:])
-	} else if strings.HasPrefix(p, "keyword:") {
-		kw := strings.ToLower(strings.TrimSpace(p[8:]))
+	if strings.HasPrefix(lower, "full:") {
+		d := strings.TrimSuffix(strings.TrimSpace(lower[5:]), ".")
+		if d != "" {
+			u.exact[d] = struct{}{}
+		}
+		return
+	}
+	if strings.HasPrefix(lower, "domain:") {
+		p = strings.TrimSpace(lower[7:])
+	} else if strings.HasPrefix(lower, "keyword:") {
+		kw := strings.TrimSpace(lower[8:])
 		if kw != "" {
 			u.keywords = append(u.keywords, kw)
 		}
 		return
-	} else if strings.HasPrefix(p, "regexp:") {
-		if re, err := regexp.Compile(strings.TrimSpace(p[7:])); err == nil {
+	} else if strings.HasPrefix(lower, "regexp:") {
+		expr := strings.TrimSpace(p[7:])
+		if expr != "" && !strings.HasPrefix(expr, "(?i)") {
+			expr = "(?i)" + expr
+		}
+		if re, err := regexp.Compile(expr); err == nil {
 			u.regexps = append(u.regexps, re)
 		}
 		return
 	}
-	s := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "*."), "."))
+	s := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(p, "*."), "."), "."))
 	if s != "" {
 		if u.suffixMap == nil {
 			u.suffixMap = make(map[string]struct{})
@@ -253,21 +265,33 @@ func (r *Resolver) HasRuleForDomain(domain string) bool {
 // Resolve resolves host (or returns literal IP directly) according to `dns.yml`, `default_dns`,
 // and an optional per-route strategy override.
 func (r *Resolver) Resolve(ctx context.Context, host string, overrideStrategy Strategy, hasOverride bool) (netip.Addr, error) {
+	addrs, err := r.ResolveAll(ctx, host, overrideStrategy, hasOverride)
+	if err != nil || len(addrs) == 0 {
+		if err == nil {
+			err = fmt.Errorf("no IP found for %s", host)
+		}
+		return netip.Addr{}, err
+	}
+	return addrs[0], nil
+}
+
+// ResolveAll returns all candidate IPs for host ordered by strategy so outbound dialers can fail over across CDN IPs / dual-stack.
+func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy Strategy, hasOverride bool) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		ip = ip.Unmap()
 		if hasOverride {
 			if overrideStrategy == StrategyIPv4Only && !ip.Is4() {
-				return netip.Addr{}, errors.New("ipv4_only strategy rejected IPv6 literal")
+				return nil, errors.New("ipv4_only strategy rejected IPv6 literal")
 			}
 			if overrideStrategy == StrategyIPv6Only && !ip.Is6() {
-				return netip.Addr{}, errors.New("ipv6_only strategy rejected IPv4 literal")
+				return nil, errors.New("ipv6_only strategy rejected IPv4 literal")
 			}
 		}
-		return ip, nil
+		return []netip.Addr{ip}, nil
 	}
 
 	if r == nil {
-		return fallbackSystemResolve(ctx, host, overrideStrategy, hasOverride)
+		return fallbackSystemResolveAll(ctx, host, overrideStrategy, hasOverride)
 	}
 
 	r.maybeHotReload()
@@ -295,83 +319,81 @@ func (r *Resolver) Resolve(ctx context.Context, host string, overrideStrategy St
 
 	// If no custom DNS server matched and default_dns is empty, use Go system resolver with strategy filter
 	if len(servers) == 0 {
-		return fallbackSystemResolve(ctx, domain, strat, true)
+		return fallbackSystemResolveAll(ctx, domain, strat, true)
 	}
 
 	ck := cacheKey{domain: domain, server: servers[0], strategy: strat}
 	now := time.Now().Unix()
 
-	var staleAddr netip.Addr
+	var staleAddrs []netip.Addr
 	r.cacheMu.RLock()
 	if ce, ok := r.cache[ck]; ok && len(ce.addrs) > 0 {
 		if ce.expires > now {
-			addr := ce.addrs[0]
+			addrs := ce.addrs
 			r.cacheMu.RUnlock()
-			return addr, nil
+			return addrs, nil
 		}
-		// Keep recently expired IP (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
+		// Keep recently expired IPs (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
 		if now-ce.expires <= 1800 {
-			staleAddr = ce.addrs[0]
+			staleAddrs = ce.addrs
 		}
 	}
 	r.cacheMu.RUnlock()
 
-	// Coalesce concurrent identical lookups via zero-dependency singleflight
+	// Coalesce concurrent identical lookups via context-isolated singleflight so a single impatient
+	// caller disconnecting never cancels the upstream lookup for sibling callers!
 	r.inflightMu.Lock()
-	if call, dup := r.inflight[ck]; dup {
-		r.inflightMu.Unlock()
-		select {
-		case <-call.done:
-			if call.err == nil && len(call.addrs) > 0 {
-				return call.addrs[0], nil
+	call, dup := r.inflight[ck]
+	if !dup {
+		call = &inflightCall{done: make(chan struct{})}
+		r.inflight[ck] = call
+		go func(srvs []string) {
+			sfCtx, sfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer sfCancel()
+
+			var addrs []netip.Addr
+			var ttl uint32
+			var lastErr error
+			for _, srv := range srvs {
+				addrs, ttl, lastErr = r.queryServerWithStrategy(sfCtx, srv, domain, strat)
+				if lastErr == nil && len(addrs) > 0 {
+					r.putCache(ck, addrs, ttl)
+					break
+				}
 			}
-			if staleAddr.IsValid() {
-				return staleAddr, nil
+			if lastErr == nil && len(addrs) == 0 {
+				lastErr = fmt.Errorf("no DNS answer for %s", domain)
+			} else if lastErr != nil {
+				lastErr = fmt.Errorf("dns resolve %s via %v: %w", domain, srvs, lastErr)
 			}
-			return netip.Addr{}, call.err
-		case <-ctx.Done():
-			if staleAddr.IsValid() {
-				return staleAddr, nil
-			}
-			return netip.Addr{}, ctx.Err()
-		}
+
+			call.addrs = addrs
+			call.ttl = ttl
+			call.err = lastErr
+			close(call.done)
+
+			r.inflightMu.Lock()
+			delete(r.inflight, ck)
+			r.inflightMu.Unlock()
+		}(servers)
 	}
-	call := &inflightCall{done: make(chan struct{})}
-	r.inflight[ck] = call
 	r.inflightMu.Unlock()
 
-	var addrs []netip.Addr
-	var ttl uint32
-	var lastErr error
-	for _, srv := range servers {
-		addrs, ttl, lastErr = r.queryServerWithStrategy(ctx, srv, domain, strat)
-		if lastErr == nil && len(addrs) > 0 {
-			r.putCache(ck, addrs, ttl)
-			break
+	select {
+	case <-call.done:
+		if call.err == nil && len(call.addrs) > 0 {
+			return call.addrs, nil
 		}
+		if len(staleAddrs) > 0 {
+			return staleAddrs, nil
+		}
+		return nil, call.err
+	case <-ctx.Done():
+		if len(staleAddrs) > 0 {
+			return staleAddrs, nil
+		}
+		return nil, ctx.Err()
 	}
-	if lastErr == nil && len(addrs) == 0 {
-		lastErr = fmt.Errorf("no DNS answer for %s", domain)
-	} else if lastErr != nil {
-		lastErr = fmt.Errorf("dns resolve %s via %v: %w", domain, servers, lastErr)
-	}
-
-	call.addrs = addrs
-	call.ttl = ttl
-	call.err = lastErr
-	close(call.done)
-
-	r.inflightMu.Lock()
-	delete(r.inflight, ck)
-	r.inflightMu.Unlock()
-
-	if lastErr == nil && len(addrs) > 0 {
-		return addrs[0], nil
-	}
-	if staleAddr.IsValid() {
-		return staleAddr, nil
-	}
-	return netip.Addr{}, lastErr
 }
 
 func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
@@ -411,6 +433,9 @@ func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
 	r.cache[ck] = cacheEntry{addrs: addrs, expires: exp}
 }
 
+var errDNSNXDomain = errors.New("DNS rcode=3 (NXDOMAIN)")
+var errDNSTruncated = errors.New("DNS response truncated (TC=1)")
+
 func (r *Resolver) queryServerWithStrategy(ctx context.Context, srv, domain string, strat Strategy) ([]netip.Addr, uint32, error) {
 	switch strat {
 	case StrategyIPv4Only:
@@ -418,13 +443,29 @@ func (r *Resolver) queryServerWithStrategy(ctx context.Context, srv, domain stri
 	case StrategyIPv6Only:
 		return r.querySingleType(ctx, srv, domain, qTypeAAAA)
 	case StrategyIPv6First:
-		if a6, ttl, err := r.querySingleType(ctx, srv, domain, qTypeAAAA); err == nil && len(a6) > 0 {
+		a6, ttl, err := r.querySingleType(ctx, srv, domain, qTypeAAAA)
+		if err == nil && len(a6) > 0 {
 			return a6, ttl, nil
+		}
+		if errors.Is(err, errDNSNXDomain) || ctx.Err() != nil {
+			return nil, 0, err
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, 0, err
 		}
 		return r.querySingleType(ctx, srv, domain, qTypeA)
 	default: // StrategyIPv4First
-		if a4, ttl, err := r.querySingleType(ctx, srv, domain, qTypeA); err == nil && len(a4) > 0 {
+		a4, ttl, err := r.querySingleType(ctx, srv, domain, qTypeA)
+		if err == nil && len(a4) > 0 {
 			return a4, ttl, nil
+		}
+		if errors.Is(err, errDNSNXDomain) || ctx.Err() != nil {
+			return nil, 0, err
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, 0, err
 		}
 		return r.querySingleType(ctx, srv, domain, qTypeAAAA)
 	}
@@ -437,21 +478,38 @@ func (r *Resolver) querySingleType(ctx context.Context, srv, domain string, qtyp
 	}
 
 	var respWire []byte
+	allowZeroID := false
+	isUDP := false
+	udpTarget := ""
 	lower := strings.ToLower(srv)
 	switch {
 	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		allowZeroID = true
 		respWire, err = r.exchangeDoH(ctx, srv, reqWire)
+	case strings.HasPrefix(lower, "tls://"):
+		respWire, err = exchangeDoT(ctx, srv[6:], reqWire)
 	case strings.HasPrefix(lower, "tcp://"):
 		respWire, err = exchangeTCP(ctx, ensurePort53(srv[6:]), reqWire)
 	case strings.HasPrefix(lower, "udp://"):
-		respWire, err = exchangeUDP(ctx, ensurePort53(srv[6:]), reqWire)
+		isUDP = true
+		udpTarget = ensurePort53(srv[6:])
+		respWire, err = exchangeUDP(ctx, udpTarget, reqWire)
 	default:
-		respWire, err = exchangeUDP(ctx, ensurePort53(srv), reqWire)
+		isUDP = true
+		udpTarget = ensurePort53(srv)
+		respWire, err = exchangeUDP(ctx, udpTarget, reqWire)
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	return decodeDNSAnswers(respWire, txID, qtype)
+	addrs, ttl, decErr := decodeDNSAnswers(respWire, txID, qtype, allowZeroID)
+	if isUDP && errors.Is(decErr, errDNSTruncated) {
+		// RFC 1035 TC=1 fallback over TCP when large CNAME chains truncate 512-byte UDP packet
+		if tcpWire, terr := exchangeTCP(ctx, udpTarget, reqWire); terr == nil {
+			return decodeDNSAnswers(tcpWire, txID, qtype, false)
+		}
+	}
+	return addrs, ttl, decErr
 }
 
 func (r *Resolver) exchangeDoH(ctx context.Context, dohURL string, wire []byte) ([]byte, error) {
@@ -537,11 +595,63 @@ func exchangeTCP(ctx context.Context, addr string, wire []byte) ([]byte, error) 
 	return resp, nil
 }
 
+func exchangeDoT(ctx context.Context, rawHost string, wire []byte) ([]byte, error) {
+	rawHost = strings.TrimSpace(rawHost)
+	if slash := strings.IndexByte(rawHost, '/'); slash >= 0 {
+		rawHost = rawHost[:slash]
+	}
+	host, port, err := net.SplitHostPort(rawHost)
+	if err != nil {
+		host = strings.Trim(rawHost, "[]")
+		port = "853"
+	}
+	addr := net.JoinHostPort(host, port)
+	d := &net.Dialer{Timeout: 4 * time.Second}
+	rawConn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: host,
+		MinVersion: tls.VersionTLS12,
+	})
+	defer tlsConn.Close()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = tlsConn.SetDeadline(deadline)
+
+	var lenHdr [2]byte
+	binary.BigEndian.PutUint16(lenHdr[:], uint16(len(wire)))
+	if _, err := tlsConn.Write(append(lenHdr[:], wire...)); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(tlsConn, lenHdr[:]); err != nil {
+		return nil, err
+	}
+	respLen := int(binary.BigEndian.Uint16(lenHdr[:]))
+	if respLen <= 12 || respLen > 16384 {
+		return nil, errors.New("invalid DoT DNS response length")
+	}
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(tlsConn, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 // encodeDNSQuery constructs an RFC 1035 standard recursive query packet.
 func encodeDNSQuery(domain string, qtype uint16) ([]byte, uint16, error) {
 	var idBytes [2]byte
 	_, _ = rand.Read(idBytes[:])
 	txID := binary.BigEndian.Uint16(idBytes[:])
+	if txID == 0 {
+		txID = 1
+	}
 
 	buf := make([]byte, 12, 128)
 	binary.BigEndian.PutUint16(buf[0:2], txID)
@@ -564,19 +674,26 @@ func encodeDNSQuery(domain string, qtype uint16) ([]byte, uint16, error) {
 	return buf, txID, nil
 }
 
-func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16) ([]netip.Addr, uint32, error) {
+func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID bool) ([]netip.Addr, uint32, error) {
 	if len(msg) < 12 {
 		return nil, 0, errors.New("short DNS packet")
 	}
 	id := binary.BigEndian.Uint16(msg[0:2])
-	if id != expectedID && id != 0 {
+	if id != expectedID && (!allowZeroID || id != 0) {
 		return nil, 0, errors.New("DNS transaction ID mismatch")
 	}
 	flags := binary.BigEndian.Uint16(msg[2:4])
+	if (flags & 0x8000) == 0 {
+		return nil, 0, errors.New("DNS QR bit not set (not a response)")
+	}
 	rcode := flags & 0x000F
+	if rcode == 3 {
+		return nil, 0, errDNSNXDomain
+	}
 	if rcode != 0 {
 		return nil, 0, fmt.Errorf("DNS rcode=%d", rcode)
 	}
+	truncated := (flags & 0x0200) != 0
 	qdCount := int(binary.BigEndian.Uint16(msg[4:6]))
 	anCount := int(binary.BigEndian.Uint16(msg[6:8]))
 
@@ -625,6 +742,9 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16) ([]netip.Addr
 			}
 		}
 	}
+	if len(addrs) == 0 && truncated {
+		return nil, 0, errDNSTruncated
+	}
 	return addrs, minTTL, nil
 }
 
@@ -650,7 +770,7 @@ func skipDNSName(msg []byte, pos int) (int, error) {
 	return 0, errors.New("unterminated DNS name")
 }
 
-func fallbackSystemResolve(ctx context.Context, host string, strat Strategy, filter bool) (netip.Addr, error) {
+func fallbackSystemResolveAll(ctx context.Context, host string, strat Strategy, filter bool) ([]netip.Addr, error) {
 	network := "ip"
 	if filter {
 		switch strat {
@@ -665,24 +785,29 @@ func fallbackSystemResolve(ctx context.Context, host string, strat Strategy, fil
 		if err == nil {
 			err = fmt.Errorf("no IP found for %s", host)
 		}
-		return netip.Addr{}, err
+		return nil, err
 	}
-	if filter {
-		if strat == StrategyIPv4First {
-			for _, ip := range ips {
-				if ip.Unmap().Is4() {
-					return ip.Unmap(), nil
-				}
-			}
-		} else if strat == StrategyIPv6First {
-			for _, ip := range ips {
-				if ip.Unmap().Is6() {
-					return ip.Unmap(), nil
-				}
+	out := make([]netip.Addr, 0, len(ips))
+	if filter && (strat == StrategyIPv4First || strat == StrategyIPv6First) {
+		wantV4 := strat == StrategyIPv4First
+		for _, ip := range ips {
+			u := ip.Unmap()
+			if u.Is4() == wantV4 {
+				out = append(out, u)
 			}
 		}
+		for _, ip := range ips {
+			u := ip.Unmap()
+			if u.Is4() != wantV4 {
+				out = append(out, u)
+			}
+		}
+		return out, nil
 	}
-	return ips[0].Unmap(), nil
+	for _, ip := range ips {
+		out = append(out, ip.Unmap())
+	}
+	return out, nil
 }
 
 // maybeHotReload checks `/etc/xoga/dns.yml` mtime at most once every 5 seconds and hot-swaps rules!
@@ -769,10 +894,13 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 
 	flush := func() {
 		if cur != nil && cur.server != "" {
-			if len(cur.exact) == 0 && len(cur.suffixMap) == 0 && len(cur.keywords) == 0 && len(cur.regexps) == 0 {
+			hasPatterns := len(cur.exact) > 0 || len(cur.suffixMap) > 0 || len(cur.keywords) > 0 || len(cur.regexps) > 0
+			if !hasPatterns && !cur.sawRulesKey {
 				cur.isCatch = true
 			}
-			rules = append(rules, *cur)
+			if hasPatterns || cur.isCatch {
+				rules = append(rules, *cur)
+			}
 			cur = nil
 		}
 	}
@@ -809,11 +937,28 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 		}
 
 		if inServersList && strings.HasPrefix(trimmed, "-") {
-			srv := strings.Trim(strings.TrimSpace(trimmed[1:]), "\"'")
-			if srv != "" {
-				defaultServers = append(defaultServers, srv)
+			item := strings.TrimSpace(trimmed[1:])
+			lowerItem := strings.ToLower(item)
+			// Support soga structured `servers:\n  - address: 1.1.1.1\n    domains: [...]` list items!
+			if strings.HasPrefix(lowerItem, "address:") || strings.HasPrefix(lowerItem, "server:") {
+				flush()
+				inRulesList = false
+				_, addrVal, _ := strings.Cut(item, ":")
+				srv := strings.Trim(strings.TrimSpace(addrVal), "\"'")
+				cur = &upstreamRule{
+					server:   srv,
+					strategy: defStrat,
+					exact:    make(map[string]struct{}),
+				}
+				continue
 			}
-			continue
+			if cur == nil || !inRulesList {
+				srv := strings.Trim(item, "\"'")
+				if srv != "" && !strings.Contains(srv, ": ") {
+					defaultServers = append(defaultServers, srv)
+				}
+				continue
+			}
 		}
 
 		if cur == nil {
@@ -833,19 +978,32 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 		k = strings.ToLower(strings.TrimSpace(k))
 		v = strings.Trim(strings.TrimSpace(v), "\"'")
 		switch k {
+		case "address", "server":
+			if v != "" {
+				cur.server = v
+			}
+			inRulesList = false
 		case "strategy":
 			cur.strategy = ParseStrategy(v)
 			inRulesList = false
 		case "rules", "domains", "match":
+			cur.sawRulesKey = true
 			inRulesList = true
 			if strings.HasPrefix(v, "[") && strings.HasSuffix(v, "]") {
-				for _, item := range strings.Split(v[1:len(v)-1], ",") {
-					cur.addPattern(strings.Trim(strings.TrimSpace(item), "\"'"))
+				for _, item := range acl.SplitQuotedArrayItems(v[1 : len(v)-1]) {
+					cur.addPattern(item)
 				}
 			}
 		}
 	}
 	flush()
+	if len(defaultServers) == 0 {
+		for _, r := range rules {
+			if r.isCatch {
+				defaultServers = append(defaultServers, r.server)
+			}
+		}
+	}
 	return rules, normalizeServerList(defaultServers)
 }
 

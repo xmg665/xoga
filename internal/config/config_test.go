@@ -91,4 +91,16 @@ log_level=false
 	if envCfg.NodeID != 851 || !envCfg.ProxyProtocol || envCfg.NormalizedServerType() != "vmess" {
 		t.Fatalf("unexpected docker env config: %+v", envCfg)
 	}
+
+	// Verify uppercase `NODE_ID` env var & empty `reality_short_ids=` not producing `[""]`
+	t.Setenv("node_id", "")
+	t.Setenv("NODE_ID", "999")
+	upperCfg, err := LoadWithEnv(filepath.Join(t.TempDir(), "missing2.conf"))
+	if err != nil || upperCfg.NodeID != 999 {
+		t.Fatalf("expected uppercase NODE_ID=999 to be honored, got NodeID=%d err=%v", upperCfg.NodeID, err)
+	}
+	upperCfg.ApplyKV("reality_short_ids", "")
+	if len(upperCfg.RealityShortIDs) != 0 {
+		t.Fatalf("empty reality_short_ids= must leave slice empty, got %v", upperCfg.RealityShortIDs)
+	}
 }

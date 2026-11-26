@@ -198,3 +198,49 @@ func TestRedisIPLimiterEvictsRejectedIP(t *testing.T) {
 		t.Fatalf("existing valid IP 1 was falsely locked out after IP 3 rejection! ok=%v err=%v", ok, err)
 	}
 }
+
+func TestCredentialRotationKicksOldSessionsAndPreservesTraffic(t *testing.T) {
+	cfg := config.Default()
+	tr := NewTracker(cfg)
+
+	entries, _, _, _ := tr.ReconcileUsers([]SyncUserSpec{
+		{ID: 7, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811", AltPasswd: "old-pass", DeviceLimit: 1},
+	})
+	oldU := entries[0]
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	_, err := oldU.AcquireSession(netip.MustParseAddr("1.1.1.1"), 60, nil, c1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldU.AddUpload(4096)
+
+	// Rotate password (and drop AltPasswd) -> old socket must be kicked, old password revoked, 4096B preserved!
+	entries2, _, updated, _ := tr.ReconcileUsers([]SyncUserSpec{
+		{ID: 7, UUIDOrPass: "c942492e-7435-4e64-be50-9deb59c41922", DeviceLimit: 1},
+	})
+	if updated != 1 || entries2[0] == oldU || entries2[0].Passwd == "old-pass" {
+		t.Fatalf("expected fresh UserEntry on credential rotation, updated=%d pass=%q", updated, entries2[0].Passwd)
+	}
+	_ = c2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var one [1]byte
+	if _, rerr := c2.Read(one[:]); rerr == nil {
+		t.Fatal("expected pre-existing session on rotated credentials to be closed immediately")
+	}
+	deltas := tr.HarvestTraffic(0)
+	if len(deltas) != 1 || deltas[0].Upload != 4096 {
+		t.Fatalf("expected 4096B unpushed traffic carried over across credential rotation, got %+v", deltas)
+	}
+
+	// Verify Xboard integer remote alive count enforcement + clearing when empty
+	u := entries2[0]
+	tr.ApplyRemoteAliveCounts(map[int]int{7: 1})
+	if err := u.AcquireConn(netip.MustParseAddr("9.9.9.9"), 60, nil); err != ErrIPLimit {
+		t.Fatalf("expected ErrIPLimit when Xboard remoteCount=1 == DeviceLimit=1, got %v", err)
+	}
+	tr.ApplyRemoteAliveList(map[int][]string{}) // cluster goes idle -> clears remoteCount!
+	if err := u.AcquireConn(netip.MustParseAddr("9.9.9.9"), 60, nil); err != nil {
+		t.Fatalf("expected new IP to succeed after empty /alivelist cleared stale remoteCount, got %v", err)
+	}
+	u.ReleaseConn()
+}

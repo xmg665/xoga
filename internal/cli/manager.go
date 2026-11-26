@@ -25,7 +25,10 @@ const (
 	InstallRepoURL = "https://raw.githubusercontent.com/xmg665/xoga/main/install.sh"
 )
 
-var validInstanceRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,48}$`)
+var (
+	validInstanceRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,48}$`)
+	validVersionRe  = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([0-9A-Za-z.-]*)$`)
+)
 
 type InstanceInfo struct {
 	Name          string // "xoga" for default instance, otherwise template instance name
@@ -305,7 +308,21 @@ func printDetailedStatus(instance string) {
 	fmt.Printf("配置文件:   %s\n", info.ConfigPath)
 }
 
+func ValidateInstanceName(instance string) error {
+	instance = strings.TrimSpace(instance)
+	if instance == "" || instance == "xoga" || instance == "default" {
+		return nil
+	}
+	if !validInstanceRe.MatchString(instance) {
+		return fmt.Errorf("无效实例名 %q (仅支持字母/数字/下划线/短横线)", instance)
+	}
+	return nil
+}
+
 func LifecycleAction(action, instance string) error {
+	if err := ValidateInstanceName(instance); err != nil {
+		return err
+	}
 	name, unit, confPath := ResolveUnitAndConfig(instance)
 	if (action == "start" || action == "restart") && !fileExists(confPath) {
 		return fmt.Errorf("配置文件 %s 不存在", confPath)
@@ -373,8 +390,11 @@ func RemoveInstances(names []string) error {
 		return errors.New("用法: xoga remove <name> [name...]")
 	}
 	for _, n := range names {
-		if n == "xoga" {
+		if n == "xoga" || n == "default" {
 			return errors.New("默认实例不可通过 remove 删除，若需完全卸载请使用 `xoga uninstall`")
+		}
+		if !validInstanceRe.MatchString(strings.TrimSpace(n)) {
+			return fmt.Errorf("无效实例名 %q", n)
 		}
 		_, unit, confPath := ResolveUnitAndConfig(n)
 		_ = exec.Command("systemctl", "stop", unit).Run()
@@ -425,6 +445,9 @@ func HandleConfigCmd(args []string) error {
 			instance = a
 		}
 	}
+	if err := ValidateInstanceName(instance); err != nil {
+		return err
+	}
 	name, _, confPath := ResolveUnitAndConfig(instance)
 	if len(pairs) == 0 {
 		data, err := os.ReadFile(confPath)
@@ -433,6 +456,9 @@ func HandleConfigCmd(args []string) error {
 		}
 		fmt.Printf("%s# === %s (%s) ===%s\n%s", ansiCyan, name, confPath, ansiPlain, string(data))
 		return nil
+	}
+	if name != "xoga" && !fileExists(confPath) {
+		return fmt.Errorf("实例 %q 不存在 (%s)，如需新建请使用 `xoga new %s ...`", name, confPath, name)
 	}
 
 	applied, err := config.UpdateFile(confPath, pairs)
@@ -480,11 +506,19 @@ func ShowLogs(args []string) int {
 }
 
 func RunOnlineUpdate(targetVer string) int {
-	shCmd := fmt.Sprintf("bash <(curl -Ls %s)", InstallRepoURL)
-	if targetVer != "" {
-		shCmd += " " + targetVer
+	targetVer = strings.TrimSpace(targetVer)
+	if targetVer != "" && !validVersionRe.MatchString(targetVer) {
+		fmt.Fprintf(os.Stderr, "%s无效版本号 %q (示例: v1.3.2 或 1.3.2)%s\n", ansiRed, targetVer, ansiPlain)
+		return 1
 	}
-	cmd := exec.Command("bash", "-c", shCmd)
+	// Download installer safely to mktemp with curl -fsSL (failing on HTTP/DNS errors instead of running empty/HTML body)
+	// and pass targetVer as positional `$1` (never interpolated into bash source!).
+	const safeRunner = `set -eo pipefail; tmp="$(mktemp /tmp/xoga-install.XXXXXX.sh)"; trap 'rm -f "$tmp"' EXIT; curl -fsSL --retry 3 "$1" -o "$tmp"; shift; bash "$tmp" "$@"`
+	cmdArgs := []string{"-c", safeRunner, "xoga-update", InstallRepoURL}
+	if targetVer != "" {
+		cmdArgs = append(cmdArgs, targetVer)
+	}
+	cmd := exec.Command("bash", cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

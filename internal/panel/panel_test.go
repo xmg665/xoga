@@ -205,3 +205,79 @@ func TestSSPanelTrafficRateQuotaScaling(t *testing.T) {
 		t.Fatalf("expected scaled RemainBytes=5000 for traffic_rate=0.2, got %d", users[0].RemainBytes)
 	}
 }
+
+func TestSSPanelDualCredentialsAndUniProxyAliveSumFixes(t *testing.T) {
+	// 1. SSPanel user with BOTH uuid and passwd must preserve passwd in AltPasswd (fixing Shadowsocks auth!)
+	ssSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mod_mu/nodes/1/info":
+			_, _ = w.Write([]byte(`{"ret":1,"data":{"method":"aes-256-gcm","server":"1.1.1.1;8388","sort":0}}`))
+		case "/mod_mu/users":
+			_, _ = w.Write([]byte(`{"ret":1,"data":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","passwd":"real-ss-password","enable":1,"u":0,"d":0,"transfer_enable":10000}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"ret":1,"data":[]}`))
+		}
+	}))
+	defer ssSrv.Close()
+
+	ssCfg := config.Default()
+	ssCfg.Type = "sspanel"
+	ssCfg.ServerType = "ss"
+	ssCfg.NodeID = 1
+	ssCfg.WebAPIURL = ssSrv.URL
+	ssCfg.WebAPIKey = "k"
+	ssCli, _ := NewClient(ssCfg)
+	specs, err := ssCli.FetchUsers(context.Background())
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("FetchUsers failed: %v", err)
+	}
+	tr := stats.NewTracker(ssCfg)
+	entries, _, _, _ := tr.ReconcileUsers(specs)
+	if entries[0].Passwd != "real-ss-password" || entries[0].UUID != "b831381d-6324-4d53-ad4f-8cda48b30811" {
+		t.Fatalf("SSPanel dual credentials corrupted: UUID=%q Passwd=%q", entries[0].UUID, entries[0].Passwd)
+	}
+
+	// 2. UniProxy: `server_type=v2ray` auto-negotiates `vmess` on modern Xboard, sums duplicate UserID deltas in PushTraffic,
+	//    and parses Xboard integer `/alivelist` counts!
+	var gotSum [2]int64
+	uniSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/UniProxy/config":
+			if r.URL.Query().Get("node_type") != "vmess" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"protocol":"vmess","server_port":12345}`))
+		case "/api/v1/server/UniProxy/alivelist":
+			_, _ = w.Write([]byte(`{"alive":{"101":2}}`))
+		case "/api/v1/server/UniProxy/push":
+			var m map[string][2]int64
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			gotSum = m["101"]
+			_, _ = w.Write([]byte(`{"data":true}`))
+		}
+	}))
+	defer uniSrv.Close()
+
+	uCfg := config.Default()
+	uCfg.Type = "xboard"
+	uCfg.ServerType = "v2ray" // legacy soga setting against modern Xboard!
+	uCfg.NodeID = 1
+	uCfg.WebAPIURL = uniSrv.URL
+	uCfg.WebAPIKey = "tok"
+	uCli, _ := NewClient(uCfg)
+	if _, err := uCli.FetchNodeConfig(context.Background()); err != nil {
+		t.Fatalf("expected server_type=v2ray -> vmess negotiation to succeed, got %v", err)
+	}
+	alive, err := uCli.FetchAliveList(context.Background())
+	if err != nil || alive == nil || alive.Counts[101] != 2 {
+		t.Fatalf("expected Xboard integer alive count 2 for user 101, got %+v err=%v", alive, err)
+	}
+	_ = uCli.PushTraffic(context.Background(), []stats.TrafficDelta{
+		{UserID: 101, Upload: 1000, Download: 2000},
+		{UserID: 101, Upload: 500, Download: 300},
+	})
+	if gotSum != [2]int64{1500, 2300} {
+		t.Fatalf("expected summed traffic [1500, 2300], got %+v", gotSum)
+	}
+}

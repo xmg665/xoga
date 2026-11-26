@@ -195,12 +195,17 @@ func (h *hy2ConnState) writeAuthOK(w http.ResponseWriter) {
 }
 
 func (s *Server) handleHy2Conn(qconn *quic.Conn) {
+	srvCID := s.trackConn(&hy2QuicCloser{qconn: qconn})
+	if srvCID == 0 {
+		return
+	}
 	state := &hy2ConnState{
 		srv:      s,
 		qconn:    qconn,
 		clientIP: relay.ExtractClientIP(qconn.RemoteAddr()),
 	}
 	defer func() {
+		s.untrackConn(srvCID)
 		_ = qconn.CloseWithError(0, "")
 		state.authMu.Lock()
 		u := state.user.Swap(nil)
@@ -302,20 +307,10 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 		return
 	}
 
-	// Peek initial payload for SNI / HTTP / BitTorrent sniffing
-	var peeked []byte
-	peekBuf := bufpool.Get(bufpool.SmallSize)
-	defer bufpool.Put(peekBuf)
-	_ = sc.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	n, rerr := sc.Read((*peekBuf)[:])
-	_ = sc.SetReadDeadline(time.Time{})
-	if n > 0 {
-		peeked = (*peekBuf)[:n]
-	} else if rerr != nil {
-		var ne net.Error
-		if !errors.As(rerr, &ne) || !ne.Timeout() {
-			return
-		}
+	// Peek initial payload for SNI / HTTP / BitTorrent sniffing (releasing 2 KiB pooled buffer immediately!)
+	peeked, perr := h.srv.peekInitialPayload(sc)
+	if perr != nil {
+		return
 	}
 
 	sn := sniff.Inspect(peeked)
@@ -327,7 +322,7 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	effectiveHost := host
 	if sn.Domain != "" && h.srv.cfg.DomainSniff {
 		if _, isIP := netip.ParseAddr(host); isIP == nil {
-			if h.srv.cfg.ForceDomainSniff || route.Action == acl.ActionProxy || h.srv.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
+			if h.srv.cfg.ForceDomainSniff || route.IsRemoteProxy || h.srv.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
 				effectiveHost = sn.Domain
 			}
 		}
@@ -349,9 +344,10 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 }
 
 type hy2UDPSess struct {
-	udpConn  *net.UDPConn
-	lastSeen atomic.Int64
-	lastAddr string
+	udpConn   net.PacketConn
+	udpSlotID uint64
+	lastSeen  atomic.Int64
+	lastAddr  string
 }
 
 type hy2FragAssembly struct {
@@ -473,50 +469,60 @@ func (h *hy2ConnState) serveDatagrams() {
 			continue
 		}
 
-		rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)
+		rctx, rcancel := context.WithTimeout(context.Background(), 4*time.Second)
 		dstUDP, err := relay.ResolveUDPTargetForRoute(rctx, host, uint16(portNum), route, h.srv.dnsRes)
-		rcancel()
 		if err != nil {
+			rcancel()
 			continue
 		}
 
 		mu.Lock()
 		us, exists := sessions[sessID]
 		if !exists {
-			if len(sessions) >= 512 {
+			if len(sessions) >= 128 {
 				mu.Unlock()
+				rcancel()
 				continue
 			}
-			localUDP := relay.LocalUDPAddrForRoute(route, dstUDP.IP.To4() == nil)
-			uconn, lerr := net.ListenUDP("udp", localUDP)
+			uconn, lerr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, h.srv.dnsRes)
 			if lerr != nil {
 				mu.Unlock()
+				rcancel()
 				continue
 			}
-			us = &hy2UDPSess{udpConn: uconn, lastAddr: addrStr}
+			slotID, serr := user.AcquireUDPSession(h.clientIP, h.srv.tracker.IPTTLSeconds(), h.srv.tracker.RedisLimiter(), uconn)
+			if serr != nil {
+				_ = uconn.Close()
+				mu.Unlock()
+				rcancel()
+				continue
+			}
+			us = &hy2UDPSess{udpConn: uconn, udpSlotID: slotID, lastAddr: addrStr}
 			us.lastSeen.Store(time.Now().Unix())
 			sessions[sessID] = us
 
 			go func(sid uint32, sess *hy2UDPSess) {
 				defer func() {
 					_ = sess.udpConn.Close()
+					user.ReleaseUDPSession(sess.udpSlotID)
 					mu.Lock()
 					if sessions != nil && sessions[sid] == sess {
 						delete(sessions, sid)
 					}
 					mu.Unlock()
 				}()
-				bp := bufpool.Get(bufpool.MaxUDPSize)
-				buf := *bp
-				defer bufpool.Put(bp)
 
 				for {
 					if user.IsDisabled() {
 						return
 					}
 					_ = sess.udpConn.SetReadDeadline(time.Now().Add(idleDur))
-					rn, raddr, rerr := sess.udpConn.ReadFromUDP(buf)
+					rn, raddr, rbuf, bp, rerr := relay.ReadPacketZeroIdle(sess.udpConn)
 					if rerr != nil {
+						var ne net.Error
+						if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idleDur {
+							continue
+						}
 						return
 					}
 					sess.lastSeen.Store(time.Now().Unix())
@@ -528,29 +534,42 @@ func (h *hy2ConnState) serveDatagrams() {
 
 					srcStr := raddr.String()
 					pid := uint16(outPktID.Add(1))
-					sendHy2UDPDatagrams(h.qconn, sid, pid, srcStr, buf[:rn])
+					sendHy2UDPDatagrams(h.qconn, sid, pid, srcStr, rbuf[:rn])
+					bufpool.Put(bp)
 				}
 			}(sessID, us)
 		} else {
 			us.lastSeen.Store(time.Now().Unix())
 		}
 		mu.Unlock()
+		rcancel()
 
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(len(payload))
 		}
 		h.srv.tracker.NodeLimiter.Wait(len(payload))
 		user.AddUpload(int64(len(payload)))
-		_, _ = us.udpConn.WriteToUDP(payload, dstUDP)
+		_, _ = us.udpConn.WriteTo(payload, dstUDP)
 	}
 }
 
 func sendHy2UDPDatagrams(qconn *quic.Conn, sessID uint32, pktID uint16, addr string, data []byte) {
-	const maxFragPayload = 1100
+	maxFragPayload := 1100
 	if len(data) <= maxFragPayload {
 		frame := encodeHy2UDPMessage(sessID, pktID, 0, 1, addr, data)
-		_ = qconn.SendDatagram(frame)
-		return
+		err := qconn.SendDatagram(frame)
+		if err == nil {
+			return
+		}
+		var tooLarge *quic.DatagramTooLargeError
+		if !errors.As(err, &tooLarge) {
+			return
+		}
+		overhead := 8 + 4 + len(addr)
+		if int(tooLarge.MaxDatagramPayloadSize) <= overhead+64 {
+			return
+		}
+		maxFragPayload = int(tooLarge.MaxDatagramPayloadSize) - overhead
 	}
 	fragCnt := (len(data) + maxFragPayload - 1) / maxFragPayload
 	if fragCnt > 255 {
@@ -563,7 +582,19 @@ func sendHy2UDPDatagrams(qconn *quic.Conn, sessID uint32, pktID uint16, addr str
 			end = len(data)
 		}
 		frame := encodeHy2UDPMessage(sessID, pktID, uint8(i), uint8(fragCnt), addr, data[start:end])
+		var tooLarge *quic.DatagramTooLargeError
 		if err := qconn.SendDatagram(frame); err != nil {
+			if errors.As(err, &tooLarge) && i == 0 {
+				overhead := 8 + 4 + len(addr)
+				if nextMax := int(tooLarge.MaxDatagramPayloadSize) - overhead; nextMax >= 64 && nextMax < maxFragPayload {
+					maxFragPayload = nextMax
+					fragCnt = (len(data) + maxFragPayload - 1) / maxFragPayload
+					if fragCnt <= 255 {
+						i = -1
+						continue
+					}
+				}
+			}
 			return
 		}
 	}

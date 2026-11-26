@@ -65,12 +65,19 @@ type SystemStatus struct {
 	UptimeSec uint64
 }
 
+// AliveList captures cluster-wide active device state returned by `/alivelist`
+// (either IP slices from V2Board or integer device counts from Xboard / NewV2Board).
+type AliveList struct {
+	IPs    map[int][]string
+	Counts map[int]int
+}
+
 // Client abstracts communication with V2Board/Xboard (UniProxy) and SSPanel (mod_mu).
 type Client interface {
 	Name() string
 	FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error)
-	FetchAliveList(ctx context.Context) (map[int][]string, error)
+	FetchAliveList(ctx context.Context) (*AliveList, error)
 	PushTraffic(ctx context.Context, batch []stats.TrafficDelta) error
 	PushAlive(ctx context.Context, alive map[int][]string) error
 	PushStatus(ctx context.Context, st SystemStatus) error

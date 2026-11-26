@@ -38,15 +38,17 @@ type SSPanelClient struct {
 	http    *http.Client
 	baseURL string
 
-	mu            sync.Mutex
-	nodeETag      string
-	usersETag     string
-	lastUsersHash [32]byte
-	hasUsersHash  bool
-	lastUsersLen  atomic.Int64
-	nodeSpeed     float64
-	nodeConn      int
-	nodeRate      float64
+	mu              sync.Mutex
+	nodeETag        string
+	usersETag       string
+	lastUsersHash   [32]byte
+	hasUsersHash    bool
+	lastUsersLen    atomic.Int64
+	nodeSpeed       float64
+	nodeConn        int
+	nodeRate        float64
+	lastDetectRules []string
+	lastNodeBody    []byte
 }
 
 func NewSSPanelClient(cfg *config.Config, httpCli *http.Client) *SSPanelClient {
@@ -92,9 +94,19 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	u := c.modURL(fmt.Sprintf("/mod_mu/nodes/%d/info", c.cfg.NodeID), false)
 	body, newETag, status, err := c.doGet(ctx, u, etag)
 	if errors.Is(err, ErrNotModified) {
-		return nil, ErrNotModified
-	}
-	if err != nil {
+		// Even when node info returns 304, check if cached dynamic detect_rules expired and changed!
+		rules, changed := c.checkDetectRulesChanged(ctx)
+		if !changed {
+			return nil, ErrNotModified
+		}
+		c.mu.Lock()
+		body = append([]byte(nil), c.lastNodeBody...)
+		c.mu.Unlock()
+		if len(body) == 0 {
+			return nil, ErrNotModified
+		}
+		_ = rules
+	} else if err != nil {
 		return nil, fmt.Errorf("fetch SSPanel node info (HTTP %d): %w", status, err)
 	}
 
@@ -114,6 +126,7 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	if newETag != "" {
 		c.nodeETag = newETag
 	}
+	c.lastNodeBody = append(c.lastNodeBody[:0], body...)
 	if c.nodeSpeed != resp.Data.NodeSpeedlimit || c.nodeConn != resp.Data.NodeConnector || c.nodeRate != rate {
 		c.usersETag = ""
 		c.hasUsersHash = false
@@ -258,8 +271,35 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	return spec, nil
 }
 
+func (c *SSPanelClient) checkDetectRulesChanged(ctx context.Context) ([]string, bool) {
+	cacheKey := fmt.Sprintf("%s|%s|%d", c.baseURL, c.cfg.WebAPIKey, c.cfg.NodeID)
+	now := time.Now().Unix()
+	detectCacheMu.RLock()
+	_, fresh := detectCache[cacheKey]
+	if fresh && detectCache[cacheKey].expires > now {
+		detectCacheMu.RUnlock()
+		return nil, false
+	}
+	detectCacheMu.RUnlock()
+
+	c.mu.Lock()
+	prev := append([]string(nil), c.lastDetectRules...)
+	c.mu.Unlock()
+
+	cur := c.fetchDetectRules(ctx)
+	if len(cur) != len(prev) {
+		return cur, true
+	}
+	for i := range cur {
+		if cur[i] != prev[i] {
+			return cur, true
+		}
+	}
+	return cur, false
+}
+
 func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
-	cacheKey := c.baseURL + "|" + c.cfg.WebAPIKey
+	cacheKey := fmt.Sprintf("%s|%s|%d", c.baseURL, c.cfg.WebAPIKey, c.cfg.NodeID)
 	now := time.Now().Unix()
 
 	detectCacheMu.RLock()
@@ -270,9 +310,18 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 	}
 	detectCacheMu.RUnlock()
 
-	body, _, _, err := c.doGet(ctx, c.modURL("/mod_mu/func/detect_rules", true), "")
+	fallback := func() []string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return append([]string(nil), c.lastDetectRules...)
+	}
+
+	body, _, status, err := c.doGet(ctx, c.modURL("/mod_mu/func/detect_rules", true), "")
 	if err != nil {
-		return nil
+		if status == http.StatusNotFound {
+			return nil
+		}
+		return fallback()
 	}
 	var resp struct {
 		Ret  int `json:"ret"`
@@ -282,7 +331,7 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 		} `json:"data"`
 	}
 	if json.Unmarshal(body, &resp) != nil || resp.Ret != 1 {
-		return nil
+		return fallback()
 	}
 	var out []string
 	for _, r := range resp.Data {
@@ -290,6 +339,10 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 			out = append(out, "regexp:"+r.Regex)
 		}
 	}
+
+	c.mu.Lock()
+	c.lastDetectRules = append([]string(nil), out...)
+	c.mu.Unlock()
 
 	detectCacheMu.Lock()
 	detectCache[cacheKey] = cachedDetectEntry{
@@ -486,7 +539,6 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	}
 	c.mu.Unlock()
 
-	needUUID := c.cfg.NormalizedServerType() == "vless" || c.cfg.NormalizedServerType() == "vmess"
 	out := make([]stats.SyncUserSpec, 0, len(resp.Data))
 	for _, item := range resp.Data {
 		if item.Enable != nil && *item.Enable == 0 {
@@ -513,19 +565,22 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 				}
 			}
 		}
-		uuid := item.UUID
+		uuid := strings.TrimSpace(item.UUID)
 		if uuid == "" && item.V2rayUser != nil {
-			uuid = item.V2rayUser.UUID
+			uuid = strings.TrimSpace(item.V2rayUser.UUID)
 		}
-		cred := item.Passwd
-		altPass := ""
-		if needUUID && uuid != "" {
-			cred = uuid
-			altPass = item.Passwd
-		} else if cred == "" {
-			cred = uuid
-		} else if uuid != "" && uuid != cred {
-			altPass = uuid
+		passwd := strings.TrimSpace(item.Passwd)
+		// Preserve `UUID` in `UUIDOrPass` and `Passwd` in `AltPasswd` consistently so:
+		// - VLESS/VMess use `u.UUID`
+		// - Shadowsocks uses `u.Passwd` (never overwritten by UUID!)
+		// - Trojan/AnyTLS/Hysteria2 accept both `u.Passwd` and `u.UUID`
+		cred := uuid
+		altPass := passwd
+		if cred == "" {
+			cred = passwd
+			altPass = ""
+		} else if altPass == cred {
+			altPass = ""
 		}
 		if item.ID <= 0 || cred == "" {
 			continue
@@ -550,7 +605,7 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 	return out, nil
 }
 
-func (c *SSPanelClient) FetchAliveList(_ context.Context) (map[int][]string, error) {
+func (c *SSPanelClient) FetchAliveList(_ context.Context) (*AliveList, error) {
 	return nil, nil
 }
 

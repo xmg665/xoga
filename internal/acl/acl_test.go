@@ -172,6 +172,28 @@ port = 40000
 	if r851Direct.Action != ActionDirect {
 		t.Fatalf("expected node 851 www.apple.com -> ActionDirect, got %+v", r851Direct)
 	}
+	if r781.IsRemoteProxy {
+		t.Fatal("direct source-IP exit binding must NOT set IsRemoteProxy=true")
+	}
+
+	// Verify quoted comma-containing rules (`node_id:781,782` & `{1,3}` regex) + SIP002 base64 ss:// + panel direct route
+	toml2 := filepath.Join(t.TempDir(), "routes2.toml")
+	_ = os.WriteFile(toml2, []byte(`
+[[routes]]
+rules = ["node_id:781,782", "regexp:^Video[0-9]{1,3}\\.example\\.com$"]
+outbound = "ss://YWVzLTEyOC1nY206bXlzZWNyZXQ=@10.0.0.9:8388"
+`), 0644)
+	eng2 := NewEngine(true, "", "", toml2, []DynamicRoute{
+		{Matches: []string{"domain:direct-panel.com"}, Action: "direct", ActionValue: ""},
+	})
+	d782 := eng2.DecideForNode(782, "video42.example.com", 443, "", "tls")
+	if d782.Action != ActionProxy || d782.Outbounds[0].Cipher != "aes-128-gcm" || d782.Outbounds[0].Password != "mysecret" {
+		t.Fatalf("quoted comma / case-insensitive regex / SIP002 ss:// failed: %+v", d782)
+	}
+	dp := eng2.DecideForNode(782, "sub.direct-panel.com", 443, "", "tls")
+	if dp.Action != ActionDirect || !dp.MatchedRule {
+		t.Fatalf("panel direct route with empty ActionValue was dropped: %+v", dp)
+	}
 }
 
 func BenchmarkACLSuffixMap10000Domains(b *testing.B) {

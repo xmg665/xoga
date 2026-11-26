@@ -42,9 +42,17 @@ func (b *Bucket) SetMbps(mbps float64) {
 func (b *Bucket) SetBytesPerSec(bps int64) {
 	if bps <= 0 {
 		b.rateBps.Store(0)
+		b.nextFreeNano.Store(0)
 		return
 	}
-	b.rateBps.Store(bps)
+	prev := b.rateBps.Swap(bps)
+	if bps > prev {
+		// Clamp accumulated future debt when rate limit increases (e.g., exiting dynamic penalty)
+		now := time.Now().UnixNano()
+		if b.nextFreeNano.Load() > now+int64(250*time.Millisecond) {
+			b.nextFreeNano.Store(now)
+		}
+	}
 }
 
 func (b *Bucket) BytesPerSec() int64 {
@@ -70,11 +78,14 @@ func (b *Bucket) Wait(n int) {
 
 	// Cost of n bytes in nanoseconds: n * 1e9 / bps
 	costNano := (int64(n) * 1_000_000_000) / bps
-	// Allow up to 250ms burst window for smooth TCP congestion window ramp-up
+	// Allow up to 250ms burst window for smooth TCP congestion window ramp-up,
+	// and cap queued future delay at 2s so mass concurrent streams never sleep indefinitely after close/kick.
 	const burstWindowNano = int64(250 * time.Millisecond)
+	const maxQueueDelayNano = int64(2 * time.Second)
 
 	now := time.Now().UnixNano()
 	minBase := now - burstWindowNano
+	maxNext := now + maxQueueDelayNano
 
 	var waitNano int64
 	for {
@@ -84,6 +95,9 @@ func (b *Bucket) Wait(n int) {
 			base = minBase
 		}
 		next := base + costNano
+		if next > maxNext {
+			next = maxNext
+		}
 		if b.nextFreeNano.CompareAndSwap(prev, next) {
 			if next > now {
 				waitNano = next - now

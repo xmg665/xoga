@@ -2,6 +2,7 @@ package acl
 
 import (
 	"bufio"
+	"encoding/base64"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -16,6 +17,24 @@ import (
 
 	"github.com/xmg665/xoga/internal/logger"
 )
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// IsReservedOrPrivateIP reports whether ip belongs to loopback, RFC1918 private, link-local,
+// unspecified (`0.0.0.0`/`::`), multicast, or RFC6598 CGNAT (`100.64.0.0/10`, cloud metadata `100.100.100.200`) space.
+func IsReservedOrPrivateIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	return ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() ||
+		(ip.Is4() && cgnatPrefix.Contains(ip))
+}
 
 type Action uint8
 
@@ -47,10 +66,36 @@ type OutboundNode struct {
 // OutboundTarget represents the resolved routing decision for a connection, including
 // ordered candidate outbounds for load-balancing and automatic failover.
 type OutboundTarget struct {
-	Action    Action
-	RuleName  string
-	MatchedRule bool
-	Outbounds []OutboundNode
+	Action        Action
+	RuleName      string
+	MatchedRule   bool
+	IsRemoteProxy bool
+	ForbidPrivate bool
+	Outbounds     []OutboundNode
+	eng           *Engine
+}
+
+// AllowResolvedIP validates post-DNS resolved target IPs against both `blockList` CIDRs and
+// `ban_private_ip=true` (preventing DNS rebinding / `127.0.0.1.nip.io` SSRF bypasses).
+func (o OutboundTarget) AllowResolvedIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	if o.eng != nil {
+		if sn := o.eng.snap.Load(); sn != nil {
+			if sn.whitelist.matchesIP(ip) {
+				return true
+			}
+			if sn.blocklist.matchesIP(ip) {
+				return false
+			}
+		}
+	}
+	if o.ForbidPrivate && IsReservedOrPrivateIP(ip) {
+		return false
+	}
+	return true
 }
 
 type compiledRule struct {
@@ -70,12 +115,14 @@ type compiledRule struct {
 }
 
 func (r *compiledRule) selectOutbounds() OutboundTarget {
+	isRemote := r.action == ActionProxy && len(r.outs) > 0 && r.outs[0].Type != "direct" && r.outs[0].Type != ""
 	if r.action != ActionProxy || len(r.outs) <= 1 {
 		return OutboundTarget{
-			Action:      r.action,
-			RuleName:    r.name,
-			MatchedRule: true,
-			Outbounds:   r.outs,
+			Action:        r.action,
+			RuleName:      r.name,
+			MatchedRule:   true,
+			IsRemoteProxy: isRemote,
+			Outbounds:     r.outs,
 		}
 	}
 	n := len(r.outs)
@@ -93,10 +140,11 @@ func (r *compiledRule) selectOutbounds() OutboundTarget {
 		ordered[i] = r.outs[(start+i)%n]
 	}
 	return OutboundTarget{
-		Action:      r.action,
-		RuleName:    r.name,
-		MatchedRule: true,
-		Outbounds:   ordered,
+		Action:        r.action,
+		RuleName:      r.name,
+		MatchedRule:   true,
+		IsRemoteProxy: ordered[0].Type != "direct" && ordered[0].Type != "",
+		Outbounds:     ordered,
 	}
 }
 
@@ -193,7 +241,21 @@ func (e *Engine) reloadNow(initial bool) {
 		switch act {
 		case "block":
 			cr = newCompiledRule("panel-block", ActionBlock)
-		case "proxy", "socks5", "http", "ss", "trojan", "vless", "direct":
+		case "direct", "default_out":
+			val := strings.TrimSpace(pr.ActionValue)
+			if val == "" {
+				cr = newCompiledRule("panel-direct", ActionDirect)
+			} else if node, ok := ParseOutboundURL(val); ok {
+				a := ActionProxy
+				if node.Type == "direct" && node.ListenIPv4 == "" && node.ListenIPv6 == "" && node.ListenStrategy == "" {
+					a = ActionDirect
+				}
+				cr = newCompiledRule("panel-route", a)
+				cr.outs = []OutboundNode{node}
+			} else {
+				cr = newCompiledRule("panel-direct", ActionDirect)
+			}
+		case "proxy", "socks5", "http", "ss", "trojan", "vless":
 			node, ok := ParseOutboundURL(strings.TrimSpace(pr.ActionValue))
 			if !ok {
 				continue
@@ -287,18 +349,27 @@ func (e *Engine) DecideForNode(nodeID int, destHost string, destPort uint16, sni
 	}
 	if e != nil && e.banPrivateIP {
 		if ip, err := netip.ParseAddr(destHost); err == nil {
-			ip = ip.Unmap()
-			if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			if IsReservedOrPrivateIP(ip) {
 				return OutboundTarget{Action: ActionBlock, RuleName: "ban-private-ip", MatchedRule: true}
 			}
 		}
 	}
-	return e.decideInternal(nodeID, destHost, sniffDomain, sniffProto)
+	res := e.decideInternal(nodeID, destHost, sniffDomain, sniffProto)
+	if e != nil {
+		res.eng = e
+		res.ForbidPrivate = e.banPrivateIP && res.RuleName != "whitelist"
+	}
+	return res
 }
 
 // Decide evaluates target host/IP and sniffed protocol/domain, returning the outbound action.
 func (e *Engine) Decide(destHost string, sniffDomain string, sniffProto string) OutboundTarget {
-	return e.decideInternal(0, destHost, sniffDomain, sniffProto)
+	res := e.decideInternal(0, destHost, sniffDomain, sniffProto)
+	if e != nil {
+		res.eng = e
+		res.ForbidPrivate = e.banPrivateIP && res.RuleName != "whitelist"
+	}
+	return res
 }
 
 func (e *Engine) decideInternal(nodeID int, destHost string, sniffDomain string, sniffProto string) OutboundTarget {
@@ -398,6 +469,9 @@ func (r *compiledRule) addPattern(raw string) {
 		}
 		return
 	}
+	if strings.HasPrefix(lower, "geosite:") {
+		return
+	}
 	if strings.HasPrefix(lower, "protocol:") {
 		r.hasTargetCriteria = true
 		r.protocols[strings.TrimSpace(lower[9:])] = struct{}{}
@@ -409,12 +483,15 @@ func (r *compiledRule) addPattern(raw string) {
 		return
 	}
 	if strings.HasPrefix(lower, "full:") {
-		r.hasTargetCriteria = true
-		r.exactDomains[strings.TrimSpace(lower[5:])] = struct{}{}
+		d := strings.TrimSuffix(strings.TrimSpace(lower[5:]), ".")
+		if d != "" {
+			r.hasTargetCriteria = true
+			r.exactDomains[d] = struct{}{}
+		}
 		return
 	}
 	if strings.HasPrefix(lower, "domain:") {
-		s := strings.TrimPrefix(strings.TrimSpace(lower[7:]), ".")
+		s := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(lower[7:]), "."), ".")
 		if s != "" {
 			r.hasTargetCriteria = true
 			r.suffixMap[s] = struct{}{}
@@ -430,7 +507,11 @@ func (r *compiledRule) addPattern(raw string) {
 		return
 	}
 	if strings.HasPrefix(lower, "regexp:") {
-		if re, err := regexp.Compile(strings.TrimSpace(p[7:])); err == nil {
+		expr := strings.TrimSpace(p[7:])
+		if expr != "" && !strings.HasPrefix(expr, "(?i)") {
+			expr = "(?i)" + expr
+		}
+		if re, err := regexp.Compile(expr); err == nil {
 			r.hasTargetCriteria = true
 			r.regexps = append(r.regexps, re)
 		}
@@ -490,6 +571,18 @@ func (r *compiledRule) matches(nodeID int, host, sdom string, ip netip.Addr, pro
 	}
 	if sdom != "" && sdom != host && r.matchDomain(sdom) {
 		return true
+	}
+	return false
+}
+
+func (r *compiledRule) matchesIP(ip netip.Addr) bool {
+	if !ip.IsValid() || len(r.nodeIDs) > 0 {
+		return false
+	}
+	for _, pfx := range r.prefixes {
+		if pfx.Contains(ip) {
+			return true
+		}
 	}
 	return false
 }
@@ -611,10 +704,14 @@ func ParseOutboundURL(raw string) (OutboundNode, bool) {
 		case "ss", "shadowsocks":
 			node.Type = "ss"
 			if hasPw {
-				node.Cipher = usr
+				node.Cipher = strings.ToLower(usr)
 				node.Password = pw
+			} else if decoded, ok := decodeSIP002Userinfo(usr); ok {
+				m, p, _ := strings.Cut(decoded, ":")
+				node.Cipher = strings.ToLower(m)
+				node.Password = p
 			} else {
-				node.Cipher = firstNonEmpty(q.Get("method"), "aes-256-gcm")
+				node.Cipher = strings.ToLower(firstNonEmpty(q.Get("method"), "aes-256-gcm"))
 				node.Password = usr
 			}
 		case "trojan":
@@ -942,18 +1039,65 @@ func stripTOMLComment(s string) string {
 	return s
 }
 
+func decodeSIP002Userinfo(s string) (string, bool) {
+	trimmed := strings.TrimRight(s, "=")
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.StdEncoding} {
+		in := trimmed
+		if enc == base64.URLEncoding || enc == base64.StdEncoding {
+			in = s
+		}
+		if b, err := enc.DecodeString(in); err == nil && strings.Contains(string(b), ":") {
+			return string(b), true
+		}
+	}
+	return "", false
+}
+
+// SplitQuotedArrayItems splits a comma-separated array body while respecting `"..."` and `'...'`
+// quotes so patterns like `"node_id:781,782"` or `"regexp:^a{1,3}\\.com$"` are never split mid-string!
+func SplitQuotedArrayItems(v string) []string {
+	var out []string
+	var cur strings.Builder
+	inQ := byte(0)
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if inQ != 0 {
+			if c == '\\' && i+1 < len(v) {
+				i++
+				cur.WriteByte(v[i])
+				continue
+			}
+			if c == inQ {
+				inQ = 0
+				continue
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			inQ = c
+		case ',':
+			item := strings.TrimSpace(cur.String())
+			if item != "" {
+				out = append(out, item)
+			}
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if last := strings.TrimSpace(cur.String()); last != "" {
+		out = append(out, last)
+	}
+	return out
+}
+
 func parseTOMLStringArray(v string) []string {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "[")
 	v = strings.TrimSuffix(v, "]")
-	var out []string
-	for _, item := range strings.Split(v, ",") {
-		item = strings.Trim(strings.TrimSpace(item), "\"'")
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
+	return SplitQuotedArrayItems(v)
 }
 
 func firstNonEmpty(vals ...string) string {

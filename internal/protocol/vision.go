@@ -5,12 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/big"
 	"net"
 	"reflect"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/xtls/reality"
@@ -88,6 +88,8 @@ type visionConn struct {
 	reader        io.Reader
 	withinPadding bool
 	checkedInit   bool
+	initHdr       [21]byte
+	initRead      int
 	needNextBlock bool
 	remContent    int
 	remPadding    int
@@ -122,11 +124,43 @@ func (v *visionConn) NetConn() net.Conn {
 	return v.Conn
 }
 
+func (v *visionConn) CanHalfCloseWrite() bool {
+	if hc, ok := v.Conn.(interface{ CanHalfCloseWrite() bool }); ok {
+		return hc.CanHalfCloseWrite()
+	}
+	_, ok := v.Conn.(interface{ CloseWrite() error })
+	return ok
+}
+
 func (v *visionConn) CloseWrite() error {
 	if cw, ok := v.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
-	return v.Conn.SetReadDeadline(time.Now())
+	return errors.New("half-close unsupported")
+}
+
+func (v *visionConn) FlushResponseHeader() error {
+	v.writeMu.Lock()
+	defer v.writeMu.Unlock()
+	if !v.sentVLESSResp {
+		v.sentVLESSResp = true
+		var out [23]byte
+		pos := copy(out[:], []byte{0x00, 0x00})
+		if v.writePadding && !v.wroteUUID {
+			v.wroteUUID = true
+			v.writePadding = false
+			pos += copy(out[pos:], v.userUUID[:])
+			out[pos] = visionCmdEnd
+			pos += 5
+		}
+		_ = writeAllConn(v.Conn, out[:pos])
+	}
+	return nil
+}
+
+func isVisionTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (v *visionConn) Read(p []byte) (int, error) {
@@ -144,30 +178,37 @@ func (v *visionConn) Read(p []byte) (int, error) {
 		}
 
 		if !v.checkedInit {
-			v.checkedInit = true
-			var initHdr [21]byte
-			n, err := io.ReadFull(v.reader, initHdr[:])
-			if n < 21 {
-				if n > 0 {
-					v.withinPadding = false
-					nc := copy(p, initHdr[:n])
-					if nc < n {
-						v.leftover = append(v.leftover[:0], initHdr[nc:n]...)
+			for v.initRead < 21 {
+				n, err := v.reader.Read(v.initHdr[v.initRead:21])
+				v.initRead += n
+				if err != nil {
+					if isVisionTimeout(err) {
+						// Preserve `checkedInit = false` & `initRead` across 150ms SNI peek timeouts!
+						return 0, err
 					}
-					return nc, nil
+					v.checkedInit = true
+					if v.initRead > 0 {
+						v.withinPadding = false
+						nc := copy(p, v.initHdr[:v.initRead])
+						if nc < v.initRead {
+							v.leftover = append(v.leftover[:0], v.initHdr[nc:v.initRead]...)
+						}
+						return nc, nil
+					}
+					return 0, err
 				}
-				return 0, err
 			}
-			if bytes.Equal(initHdr[:16], v.userUUID[:]) {
-				v.curCmd = initHdr[16]
-				v.remContent = int(binary.BigEndian.Uint16(initHdr[17:19]))
-				v.remPadding = int(binary.BigEndian.Uint16(initHdr[19:21]))
+			v.checkedInit = true
+			if bytes.Equal(v.initHdr[:16], v.userUUID[:]) {
+				v.curCmd = v.initHdr[16]
+				v.remContent = int(binary.BigEndian.Uint16(v.initHdr[17:19]))
+				v.remPadding = int(binary.BigEndian.Uint16(v.initHdr[19:21]))
 				v.withinPadding = true
 			} else {
 				v.withinPadding = false
-				nc := copy(p, initHdr[:21])
+				nc := copy(p, v.initHdr[:21])
 				if nc < 21 {
-					v.leftover = append(v.leftover[:0], initHdr[nc:21]...)
+					v.leftover = append(v.leftover[:0], v.initHdr[nc:21]...)
 				}
 				return nc, nil
 			}
@@ -341,15 +382,10 @@ func (v *visionConn) Write(p []byte) (int, error) {
 		return v.Conn.Write(p)
 	}
 
-	// Inspect inner TLS records during initial handshake packets
+	// Inspect inner TLS records (scanning across coalesced ServerHello + CCS + EncryptedExtensions records)
 	if v.packetsFiltered < 8 {
 		v.packetsFiltered++
-		if len(p) >= 3 && p[0] == 0x16 && p[1] == 0x03 {
-			v.innerIsTLS = true
-		}
-		if v.innerIsTLS && len(p) >= 5 && p[0] == 0x17 && p[1] == 0x03 && p[2] == 0x03 {
-			v.innerTLS13AppSeen = true
-		}
+		scanInnerTLSRecords(p, &v.innerIsTLS, &v.innerTLS13AppSeen)
 	}
 
 	total := 0
@@ -400,6 +436,29 @@ func (v *visionConn) Write(p []byte) (int, error) {
 		total += len(chunk)
 	}
 	return total, nil
+}
+
+func scanInnerTLSRecords(b []byte, innerIsTLS, innerAppSeen *bool) {
+	pos := 0
+	for pos+5 <= len(b) {
+		ct := b[pos]
+		if b[pos+1] != 0x03 || b[pos+2] > 0x04 {
+			break
+		}
+		rlen := int(binary.BigEndian.Uint16(b[pos+3 : pos+5]))
+		if ct == 0x16 {
+			*innerIsTLS = true
+		} else if ct == 0x17 && *innerIsTLS && b[pos+2] == 0x03 {
+			*innerAppSeen = true
+			return
+		} else if ct != 0x14 && ct != 0x15 {
+			break
+		}
+		if rlen <= 0 || pos+5+rlen > len(b) {
+			break
+		}
+		pos += 5 + rlen
+	}
 }
 
 func computeVisionPaddingLen(contentLen int, longPadding bool) int {

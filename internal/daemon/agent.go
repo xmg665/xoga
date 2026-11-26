@@ -90,7 +90,7 @@ func NewAgent(cfg *config.Config) (*Agent, error) {
 
 func (a *Agent) applyRuntimeTuning() {
 	gcPct := a.cfg.GCPercent
-	if a.cfg.V2rayReduceMemory && gcPct >= 100 {
+	if a.cfg.V2rayReduceMemory && gcPct == 100 {
 		gcPct = 75
 	}
 	if gcPct > 0 {
@@ -129,19 +129,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		}(i, w)
 	}
 
-	scavengeTicker := time.NewTicker(2 * time.Minute)
-	defer scavengeTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return nil
-		case <-scavengeTicker.C:
-			// Gently return unused heap spans to Linux kernel (`MADV_DONTNEED`)
-			debug.FreeOSMemory()
-		}
-	}
+	<-ctx.Done()
+	wg.Wait()
+	return nil
 }
 
 func (w *nodeWorker) runLoop(ctx context.Context, bootstrapSem chan struct{}) {
@@ -217,6 +207,9 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 	defer cancel()
 
 	var configChanged bool
+	var aclOnlyChanged bool
+	effectiveSpec := w.curSpec
+
 	newSpec, err := w.client.FetchNodeConfig(reqCtx)
 	if err != nil {
 		if !errors.Is(err, panel.ErrNotModified) {
@@ -225,14 +218,13 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 	} else if newSpec != nil {
 		if w.curSpec == nil || listenerNeedsRestart(w.curSpec, newSpec) {
 			configChanged = true
-		} else if w.curSpec.ConfigChecksum != newSpec.ConfigChecksum && w.curServer != nil {
-			w.curServer.UpdateACL(w.buildACL(newSpec.Routes))
-			logger.Infof("[node %d] Hot-reloaded ACL & panel routes (%d rules)", w.nodeID, len(newSpec.Routes))
+		} else if w.curSpec.ConfigChecksum != newSpec.ConfigChecksum {
+			aclOnlyChanged = true
 		}
-		w.curSpec = newSpec
+		effectiveSpec = newSpec
 	}
 
-	if w.curSpec == nil {
+	if effectiveSpec == nil {
 		return fmt.Errorf("empty node config")
 	}
 
@@ -251,29 +243,29 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 		usersModified = (added+updated+removed > 0) || first
 	}
 
-	if aliveMap, aerr := w.client.FetchAliveList(reqCtx); aerr == nil && aliveMap != nil {
-		w.tracker.ApplyRemoteAliveList(aliveMap)
-	}
-
-	ssKeySize := 0
-	if w.curSpec.Protocol == "shadowsocks" {
-		if w.curSpec.Cipher == "aes-128-gcm" || w.curSpec.Cipher == "2022-blake3-aes-128-gcm" {
-			ssKeySize = 16
+	if aliveList, aerr := w.client.FetchAliveList(reqCtx); aerr == nil && aliveList != nil {
+		if aliveList.Counts != nil {
+			w.tracker.ApplyRemoteAliveCounts(aliveList.Counts)
 		} else {
-			ssKeySize = 32
+			w.tracker.ApplyRemoteAliveList(aliveList.IPs)
 		}
 	}
 
 	if configChanged || w.curServer == nil {
-		idx := protocol.BuildUserIndexForProtocol(w.curSpec.Protocol, w.curUsers, ssKeySize)
-		aclEng := w.buildACL(w.curSpec.Routes)
-		srv, err := protocol.NewServer(w.cfg, w.curSpec, w.tracker, idx, aclEng, w.dnsRes)
+		idx := protocol.BuildUserIndexForCipher(effectiveSpec.Protocol, effectiveSpec.Cipher, w.curUsers)
+		aclEng := w.buildACL(effectiveSpec.Routes)
+		srv, err := protocol.NewServer(w.cfg, effectiveSpec, w.tracker, idx, aclEng, w.dnsRes)
 		if err != nil {
+			// Keep old w.curServer & w.curSpec untouched if constructing new server failed!
 			return err
 		}
+		w.curSpec = effectiveSpec
 		if w.curServer != nil {
 			logger.Infof("[node %d] Listener config changed; restarting inbound gracefully...", w.nodeID)
 			w.curServer.Close()
+			// Clear curServer immediately so if srv.Start() fails (e.g. transient port/cert issue),
+			// subsequent polling ticks see w.curServer == nil and retry Start() even on HTTP 304!
+			w.curServer = nil
 		}
 		if err := srv.Start(); err != nil {
 			return err
@@ -283,8 +275,14 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 		return nil
 	}
 
+	if aclOnlyChanged && w.curServer != nil {
+		w.curSpec = effectiveSpec
+		w.curServer.UpdateACL(w.buildACL(effectiveSpec.Routes))
+		logger.Infof("[node %d] Hot-reloaded ACL & panel routes (%d rules)", w.nodeID, len(effectiveSpec.Routes))
+	}
+
 	if usersModified && w.curServer != nil {
-		idx := protocol.BuildUserIndexForProtocol(w.curSpec.Protocol, w.curUsers, w.curServer.SSKeySize())
+		idx := protocol.BuildUserIndexForCipher(w.curSpec.Protocol, w.curSpec.Cipher, w.curUsers)
 		w.curServer.UpdateUsers(idx)
 		logger.Infof("[node %d] Users synced (total=%d, +%d ~%d -%d)", w.nodeID, len(w.curUsers), added, updated, removed)
 	}
@@ -321,6 +319,7 @@ func (w *nodeWorker) pushToPanel(ctx context.Context) {
 func (w *nodeWorker) shutdown() {
 	if w.curServer != nil {
 		w.curServer.Close()
+		w.curServer = nil
 	}
 	flushCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()

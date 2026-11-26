@@ -43,10 +43,11 @@ type Config struct {
 	ForceCloseSSL bool
 
 	// Transit / Relay
-	ProxyProtocol    bool
-	UDPProxyProtocol bool
-	ListenIP         string
-	ListenPort       int // optional local port override (0 = follow panel server_port)
+	ProxyProtocol      bool
+	ForceProxyProtocol bool
+	UDPProxyProtocol   bool
+	ListenIP           string
+	ListenPort         int // optional local port override (0 = follow panel server_port)
 
 	// Redis global IP limit (RESP wire protocol, zero heavy SDK)
 	RedisIPLimitEnable   bool
@@ -261,7 +262,7 @@ func (c *Config) ApplyKV(key, val string) {
 			c.DyLimitTriggerSpeed = f
 		}
 	case "dy_limit_speed":
-		if f, err := strconv.ParseFloat(val, 64); err == nil && f >= 0 {
+		if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 {
 			c.DyLimitSpeed = f
 		}
 	case "dy_limit_time":
@@ -309,8 +310,10 @@ func (c *Config) ApplyKV(key, val string) {
 		c.RealityPrivateKey = strings.TrimSpace(val)
 	case "reality_short_ids", "reality_short_id", "short_id", "short_ids":
 		c.RealityShortIDs = nil
-		for _, p := range strings.Split(val, ",") {
-			c.RealityShortIDs = append(c.RealityShortIDs, strings.TrimSpace(p))
+		if strings.TrimSpace(val) != "" {
+			for _, p := range strings.Split(val, ",") {
+				c.RealityShortIDs = append(c.RealityShortIDs, strings.TrimSpace(p))
+			}
 		}
 	case "reality_server_names", "server_names":
 		c.RealityServerNames = nil
@@ -330,12 +333,9 @@ func (c *Config) ApplyKV(key, val string) {
 	case "hy2_ignore_client_bandwidth", "ignore_client_bandwidth":
 		c.Hy2IgnoreClientBW = parseBool(val, false)
 	case "anytls_padding_scheme", "padding_scheme":
-		c.AnyTLSPadding = val
+		c.AnyTLSPadding = strings.ReplaceAll(val, `\n`, "\n")
 	case "v2ray_reduce_memory":
 		c.V2rayReduceMemory = parseBool(val, false)
-		if c.V2rayReduceMemory && c.GCPercent == 100 {
-			c.GCPercent = 80
-		}
 	case "dns_cache_time":
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			c.DNSCacheTime = n
@@ -390,7 +390,12 @@ func (c *Config) ApplyKV(key, val string) {
 		}
 	case "pprof_addr":
 		c.PprofAddr = strings.TrimSpace(val)
-	case "forward_extra_port_enable", "dns_cache_enable", "tunnel_enable", "force_proxy_protocol":
+	case "force_proxy_protocol":
+		c.ForceProxyProtocol = parseBool(val, false)
+		if c.ForceProxyProtocol {
+			c.ProxyProtocol = true
+		}
+	case "forward_extra_port_enable", "dns_cache_enable", "tunnel_enable":
 		// Accepted for 100% compatibility with soga.conf / Docker env vars
 	}
 }
@@ -430,14 +435,21 @@ func (c *Config) CloneForNode(nodeID int) *Config {
 	return &cp
 }
 
-// LoadWithEnv loads `path` (allowing missing file when `IS_DOCKER=true` or env `node_id` is set),
+// LoadWithEnv loads `path` (falling back to `/etc/soga/soga.conf` or env-only bootstrap in Docker mode),
 // overlays environment variables, and falls back to `/etc/soga/{routes.toml,dns.yml,blockList,whiteList}`
 // in Docker mode when `/etc/xoga/` rule files are absent.
 func LoadWithEnv(path string) (*Config, error) {
+	isDocker := parseBool(os.Getenv("IS_DOCKER"), false)
 	cfg, err := Load(path)
+	if err != nil && isDocker && errors.Is(err, os.ErrNotExist) && path == DefaultConfigPath {
+		if _, serr := os.Stat("/etc/soga/soga.conf"); serr == nil {
+			cfg, err = Load("/etc/soga/soga.conf")
+		}
+	}
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && (os.Getenv("node_id") != "" || os.Getenv("NODE_ID") != "" || parseBool(os.Getenv("IS_DOCKER"), false)) {
+		if errors.Is(err, os.ErrNotExist) && (os.Getenv("node_id") != "" || os.Getenv("NODE_ID") != "" || os.Getenv("XOGA_NODE_ID") != "" || isDocker) {
 			cfg = Default()
+			cfg.NodeID = 0
 			baseDir := DefaultConfigDir
 			if path != "" {
 				baseDir = filepath.Dir(path)
@@ -453,7 +465,7 @@ func LoadWithEnv(path string) (*Config, error) {
 	cfg.ApplyEnv()
 
 	// Seamless vaxilu/soga Docker bind-mount compatibility (`/etc/soga/routes.toml`, etc.)
-	if parseBool(os.Getenv("IS_DOCKER"), false) {
+	if isDocker {
 		cfg.RoutesPath = fallbackSogaRulePath(cfg.RoutesPath, "/etc/soga/routes.toml")
 		cfg.DNSConfigPath = fallbackSogaRulePath(cfg.DNSConfigPath, "/etc/soga/dns.yml")
 		cfg.BlockListPath = fallbackSogaRulePath(cfg.BlockListPath, "/etc/soga/blockList")
@@ -476,7 +488,7 @@ var knownEnvKeys = []string{
 	"type", "server_type", "node_id", "soga_key", "api",
 	"webapi_url", "webapi_key", "webapi_mukey",
 	"cert_file", "key_file", "cert_mode", "cert_domain", "cert_key_length", "dns_provider", "force_close_ssl",
-	"proxy_protocol", "udp_proxy_protocol", "listen_ip", "listen_port",
+	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "listen_ip", "listen_port",
 	"redis_ip_limit_enable", "redis_enable", "redis_ip_limit_addr", "redis_addr",
 	"redis_ip_limit_password", "redis_password", "redis_ip_limit_db", "redis_db",
 	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",
@@ -485,22 +497,27 @@ var knownEnvKeys = []string{
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
 	"vless", "vless_flow", "v2ray_reduce_memory",
-	"reality", "enable_reality", "reality_dest", "reality_private_key", "reality_short_ids", "reality_short_id", "reality_server_names",
-	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps", "hy2_ignore_client_bandwidth",
+	"reality", "enable_reality", "reality_dest", "dest", "reality_private_key", "private_key",
+	"reality_short_ids", "reality_short_id", "short_id", "short_ids", "reality_server_names", "server_names",
+	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps",
+	"hy2_ignore_client_bandwidth", "ignore_client_bandwidth",
 	"anytls_padding_scheme", "padding_scheme",
 	"dns_cache_time", "default_dns", "dns_strategy", "dns_config_url",
 	"domain_sniff", "force_domain_sniff", "dns_file", "dns_config_file",
 	"log_level", "block_list_file", "white_list_file", "routes_file",
-	"enable_zero_copy", "mem_limit_mb", "gc_percent", "conn_idle_sec", "udp_idle_sec",
+	"enable_zero_copy", "mem_limit_mb", "gc_percent", "conn_idle_sec", "udp_idle_sec", "pprof_addr",
 }
 
-// ApplyEnv overlays soga-compatible environment variables (both lowercase `node_id` and uppercase `XOGA_NODE_ID`).
+// ApplyEnv overlays soga-compatible environment variables (lowercase `node_id`, uppercase `NODE_ID`, and `XOGA_NODE_ID`).
 func (c *Config) ApplyEnv() {
 	for _, k := range knownEnvKeys {
+		upper := strings.ToUpper(k)
 		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
 			c.ApplyKV(k, strings.TrimSpace(v))
+		} else if v, ok := os.LookupEnv(upper); ok && strings.TrimSpace(v) != "" {
+			c.ApplyKV(k, strings.TrimSpace(v))
 		}
-		if v, ok := os.LookupEnv("XOGA_" + strings.ToUpper(k)); ok && strings.TrimSpace(v) != "" {
+		if v, ok := os.LookupEnv("XOGA_" + upper); ok && strings.TrimSpace(v) != "" {
 			c.ApplyKV(k, strings.TrimSpace(v))
 		}
 	}
