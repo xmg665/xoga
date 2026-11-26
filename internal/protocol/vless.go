@@ -99,8 +99,22 @@ func (s *Server) handleVLESS(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 
 	switch cmd {
-	case 0x01: // TCP
+	case 0x01: // TCP (or Mux.Cool when destHost == "v1.mux.cool")
 		if nodeWantsVision && flow == "" {
+			return
+		}
+		if strings.EqualFold(destHost, "v1.mux.cool") {
+			var muxStream net.Conn
+			if flow == FlowVision || flow == FlowVisionUDP443 {
+				muxStream = newVisionConn(conn, br, uuid)
+			} else {
+				var r io.Reader = conn
+				if br.Buffered() > 0 {
+					r = br
+				}
+				muxStream = &vlessRespConn{Conn: &relay.PrependConn{Conn: conn, Reader: r}}
+			}
+			s.handleVLESSMux(muxStream, user, flow)
 			return
 		}
 		if flow == FlowVision || flow == FlowVisionUDP443 {
@@ -353,24 +367,33 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
 	}
+	muxIdleDur := idleDur
+	if connIdle := time.Duration(s.cfg.ConnIdleSec) * time.Second; connIdle > muxIdleDur {
+		muxIdleDur = connIdle
+	}
 
 	var writeMu sync.Mutex
 	writeXUDP := func(frame []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		_ = conn.SetWriteDeadline(time.Now().Add(idleDur))
+		_ = conn.SetWriteDeadline(time.Now().Add(muxIdleDur))
 		_, werr := conn.Write(frame)
 		return werr
 	}
 
 	var sessMu sync.Mutex
 	sessions := make(map[uint16]*xudpSubSession)
+	tcpSessions := make(map[uint16]*muxTCPSubSession)
 	defer func() {
 		sessMu.Lock()
 		for _, us := range sessions {
 			_ = us.pc.Close()
 		}
+		for _, ts := range tcpSessions {
+			ts.abort()
+		}
 		sessions = nil
+		tcpSessions = nil
 		sessMu.Unlock()
 	}()
 
@@ -385,7 +408,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		if user.IsDisabled() {
 			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
+		_ = conn.SetReadDeadline(time.Now().Add(muxIdleDur))
 		if _, err := io.ReadFull(conn, metaLenBuf[:]); err != nil {
 			return
 		}
@@ -441,15 +464,76 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		}
 		if status == 0x03 { // End
 			sessMu.Lock()
-			if us := sessions[sid]; us != nil {
+			tSub := tcpSessions[sid]
+			if tSub != nil && (opt&0x02) != 0 {
+				delete(tcpSessions, sid)
+			}
+			us := sessions[sid]
+			if us != nil {
 				delete(sessions, sid)
-				_ = us.pc.Close()
 			}
 			sessMu.Unlock()
+			if tSub != nil {
+				if len(payload) > 0 {
+					tSub.enqueue(payload)
+				}
+				if (opt & 0x02) != 0 {
+					tSub.abort()
+				} else {
+					tSub.closeClientTx()
+				}
+			}
+			if us != nil {
+				_ = us.pc.Close()
+			}
 			continue
 		}
+		if status == 0x01 && hasAddr && netType == 0x01 { // Mux.Cool TCP sub-session
+			sessMu.Lock()
+			if prev := tcpSessions[sid]; prev != nil {
+				delete(tcpSessions, sid)
+				prev.abort()
+			}
+			tooMany := len(tcpSessions) >= 256
+			var tSub *muxTCPSubSession
+			if !tooMany {
+				if user.AcquireSubStream() != nil {
+					tooMany = true
+				} else {
+					tSub = newMuxTCPSubSession()
+					tcpSessions[sid] = tSub
+				}
+			}
+			sessMu.Unlock()
+			if tooMany {
+				_ = writeXUDP(encodeMuxTCPEndFrame(sid, true))
+				continue
+			}
+			if len(payload) > 0 {
+				tSub.enqueue(payload)
+			}
+			subID := sid
+			go s.runMuxTCPSubSession(subID, host, port, user, tSub, writeXUDP, func() {
+				sessMu.Lock()
+				if tcpSessions != nil && tcpSessions[subID] == tSub {
+					delete(tcpSessions, subID)
+				}
+				sessMu.Unlock()
+			})
+			continue
+		}
+		if status == 0x02 {
+			sessMu.Lock()
+			tSub := tcpSessions[sid]
+			sessMu.Unlock()
+			if tSub != nil {
+				if len(payload) > 0 {
+					tSub.enqueue(payload)
+				}
+				continue
+			}
+		}
 		if hasAddr && netType != 0x02 {
-			// Only UDP XUDP sessions are carried over Mux in VLESS/Vision; reject unexpected inner TCP mux cleanly
 			continue
 		}
 		if (flow == FlowVision || s.spec.Flow == FlowVision) && hasAddr && port == 443 {

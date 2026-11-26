@@ -14,9 +14,9 @@ import (
 	"errors"
 	"hash"
 	"hash/crc32"
-	"hash/fnv"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,6 +205,15 @@ func checkVMessCandidate(cand *VMessUserEntry, authID, scratch []byte, now int64
 	return checkVMessBlock(cand.AuthBlock, authID, scratch, uint64(now-120))
 }
 
+func fnv1a32(b []byte) uint32 {
+	var h uint32 = 2166136261
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	return h
+}
+
 // handleVMess isolates the stack-heavy AEAD KDF handshake into a `//go:noinline` helper so
 // Go's stack shrinker reclaims the ~2.5 KiB handshake stack frame as soon as streaming begins.
 func (s *Server) handleVMess(conn net.Conn) {
@@ -213,6 +222,10 @@ func (s *Server) handleVMess(conn net.Conn) {
 		return
 	}
 	defer vmConn.releaseReadBuf()
+	if cmd == 0x03 || (cmd == 0x01 && strings.EqualFold(destHost, "v1.mux.cool")) {
+		s.handleVLESSMux(vmConn, user, "")
+		return
+	}
 	if cmd == 0x02 {
 		s.handleVMessUDP(vmConn, user, destHost, destPort)
 		return
@@ -364,9 +377,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	}
 
 	// Verify FNV1a32 checksum at end of VMess command header
-	fnvHash := fnv.New32a()
-	_, _ = fnvHash.Write(hdrPlain[:len(hdrPlain)-4])
-	if fnvHash.Sum32() != binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:]) || hdrPlain[0] != 0x01 {
+	if fnv1a32(hdrPlain[:len(hdrPlain)-4]) != binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:]) || hdrPlain[0] != 0x01 {
 		return nil, nil, "", 0, 0, false
 	}
 
@@ -378,14 +389,25 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	pLen := int(hdrPlain[35] >> 4)
 	secType := hdrPlain[35] & 0x0F
 	cmd := hdrPlain[37]
-	destPort := binary.BigEndian.Uint16(hdrPlain[38:40])
 
-	if len(hdrPlain)-4-pLen <= 40 {
-		return nil, nil, "", 0, 0, false
-	}
-	addrReader := bytes.NewReader(hdrPlain[40 : len(hdrPlain)-4-pLen])
-	destHost, err := parseVLESSAddr(addrReader)
-	if err != nil || (cmd != 0x01 && cmd != 0x02) {
+	var destPort uint16
+	var destHost string
+	switch cmd {
+	case 0x01, 0x02:
+		if len(hdrPlain)-4-pLen <= 40 {
+			return nil, nil, "", 0, 0, false
+		}
+		destPort = binary.BigEndian.Uint16(hdrPlain[38:40])
+		addrReader := bytes.NewReader(hdrPlain[40 : len(hdrPlain)-4-pLen])
+		destHost, err = parseVLESSAddr(addrReader)
+		if err != nil {
+			return nil, nil, "", 0, 0, false
+		}
+	case 0x03: // RequestCommandMux (Mux.Cool without target address in VMess header)
+		if len(hdrPlain)-4-pLen < 38 {
+			return nil, nil, "", 0, 0, false
+		}
+	default:
 		return nil, nil, "", 0, 0, false
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -515,6 +537,7 @@ type vmessStreamConn struct {
 
 	readMu         sync.Mutex
 	readAEAD       cipher.AEAD
+	readLegacyCFB  bool
 	readMask       sha3.ShakeHash
 	readCount      uint16
 	hasPendingMask bool
@@ -529,6 +552,7 @@ type vmessStreamConn struct {
 	sentResp   bool
 	sentEOF    bool
 	writeAEAD  cipher.AEAD
+	writeCFB   cipher.Stream
 	writeMask  sha3.ShakeHash
 	writeCount uint16
 }
@@ -565,6 +589,24 @@ func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV,
 		wm := sha3.NewShake128()
 		_, _ = wm.Write(vc.respIV[:])
 		vc.writeMask = wm
+	}
+
+	if secType == 0x01 || secType == 0x02 { // Legacy AES-128-CFB + FNV1a32
+		reqBlk, err := aes.NewCipher(reqKey[:])
+		if err != nil {
+			return nil, err
+		}
+		respBlk, err := aes.NewCipher(vc.respKey[:])
+		if err != nil {
+			return nil, err
+		}
+		vc.reader = &cipher.StreamReader{
+			S: cipher.NewCFBDecrypter(reqBlk, reqIV[:]),
+			R: br,
+		}
+		vc.readLegacyCFB = true
+		vc.writeCFB = cipher.NewCFBEncrypter(respBlk, vc.respIV[:])
+		return vc, nil
 	}
 
 	var err error
@@ -680,6 +722,8 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	overhead := 0
 	if v.readAEAD != nil {
 		overhead = v.readAEAD.Overhead()
+	} else if v.readLegacyCFB {
+		overhead = 4
 	}
 	if size == overhead+padLen {
 		if size > 0 {
@@ -723,6 +767,12 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 			bufpool.Put(bp)
 			return 0, err
 		}
+	} else if v.readLegacyCFB {
+		if binary.BigEndian.Uint32(encData[:4]) != fnv1a32(encData[4:]) {
+			bufpool.Put(bp)
+			return 0, errors.New("vmess cfb fnv1a mismatch")
+		}
+		plain = encData[4:]
 	}
 	n := copy(dst, plain)
 	if n < len(plain) {
@@ -791,6 +841,11 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 		copy(nonce[2:12], v.respIV[2:12])
 		v.writeCount++
 		out = v.writeAEAD.Seal(out, nonce[:], part, nil)
+	} else if v.writeCFB != nil {
+		var fnvBytes [4]byte
+		binary.BigEndian.PutUint32(fnvBytes[:], fnv1a32(part))
+		out = append(out, fnvBytes[:]...)
+		out = append(out, part...)
 	} else {
 		out = append(out, part...)
 	}
@@ -801,6 +856,9 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 	}
 	wireSize := uint16(len(out)-(wsHeadroom+2)) ^ sizeMask
 	binary.BigEndian.PutUint16(out[wsHeadroom:wsHeadroom+2], wireSize)
+	if v.writeCFB != nil {
+		v.writeCFB.XORKeyStream(out[wsHeadroom:], out[wsHeadroom:])
+	}
 	var err error
 	if v.wsFast != nil {
 		err = v.wsFast.WritePrependWSFrame(out, wsHeadroom)
@@ -825,6 +883,14 @@ func (v *vmessStreamConn) Write(p []byte) (int, error) {
 		}
 	}
 	if v.rawStream {
+		if v.writeCFB != nil {
+			bp := bufpool.Get(len(p))
+			enc := (*bp)[:len(p)]
+			v.writeCFB.XORKeyStream(enc, p)
+			n, err := v.Conn.Write(enc)
+			bufpool.Put(bp)
+			return n, err
+		}
 		return v.Conn.Write(p)
 	}
 
