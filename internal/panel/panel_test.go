@@ -107,6 +107,86 @@ func TestSSPanelMetronStringParser(t *testing.T) {
 	}
 }
 
+func TestPanelAutoProtocolDetectionSSPanelAndUniProxy(t *testing.T) {
+	// 1. SSPanel with server_type=auto (and even server_type=v2ray) must detect VMess(11), VLESS(18), VLESS-REALITY(18), Hy2(15), Trojan(14), SS(0) from panel!
+	ssMux := http.NewServeMux()
+	ssMux.HandleFunc("/mod_mu/nodes/781/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":1,"data":{"sort":11,"method":"None","server":"hk5.v2api.xyz;2001;0;ws;;path=/mm|host=aomen.kugou.com"}}`))
+	})
+	ssMux.HandleFunc("/mod_mu/nodes/916/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":1,"data":{"sort":18,"method":"None","server":"apple.apple9.org;2086;0;ws;;path=/mm|host=xg2.apple9.org"}}`))
+	})
+	ssMux.HandleFunc("/mod_mu/nodes/948/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":1,"data":{"sort":18,"method":"None","server":"chun31.apple9.org;443;0;tcp;tls;publicKey=pub|privateKey=SPUSt4KA8qnkfgzWqnNmnAfxmkqGJsHHSXqCQE8RvnY|shortId=8d500d61|flow=xtls-rprx-vision|host=www.microsoft.com"}}`))
+	})
+	ssMux.HandleFunc("/mod_mu/nodes/972/info", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":1,"data":{"sort":15,"method":"None","server":"jp5.help600.com;port=443|ports=444-8443|up=1000|down=500|obfs=salamander|obfs-password=sec"}}`))
+	})
+	ssSrv := httptest.NewServer(ssMux)
+	defer ssSrv.Close()
+
+	checkSS := func(nodeID int) *NodeSpec {
+		c := config.Default() // ServerType == "auto"
+		c.Type = "sspanel-uim"
+		c.NodeID = nodeID
+		c.NodeIDs = []int{nodeID}
+		c.WebAPIURL = ssSrv.URL
+		c.WebAPIKey = "k"
+		cli, err := NewClient(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sp, err := cli.FetchNodeConfig(context.Background())
+		if err != nil {
+			t.Fatalf("node %d FetchNodeConfig failed: %v", nodeID, err)
+		}
+		return sp
+	}
+
+	if sp := checkSS(781); sp.Protocol != "vmess" || sp.ServerPort != 2001 || sp.Network != "ws" {
+		t.Fatalf("node 781 expected vmess/ws:2001, got %+v", sp)
+	}
+	if sp := checkSS(916); sp.Protocol != "vless" || sp.ServerPort != 2086 || sp.Network != "ws" {
+		t.Fatalf("node 916 expected vless/ws:2086, got %+v", sp)
+	}
+	if sp := checkSS(948); sp.Protocol != "vless" || sp.TLSMode != 2 || sp.RealityPrivateKey == "" || sp.RealityDest != "www.microsoft.com:443" || len(sp.RealityShortIDs) != 1 || sp.Flow != "xtls-rprx-vision" {
+		t.Fatalf("node 948 expected vless-reality dest=www.microsoft.com:443, got %+v", sp)
+	}
+	if sp := checkSS(972); sp.Protocol != "hysteria2" || sp.Network != "quic" || sp.TLSMode != 1 || sp.ServerName != "jp5.help600.com" || sp.Hy2UpMbps != 1000 || sp.Hy2DownMbps != 500 || sp.Hy2ObfsPassword != "sec" {
+		t.Fatalf("node 972 expected hysteria2 sni=jp5.help600.com 1000/500Mbps, got %+v", sp)
+	}
+
+	// 2. UniProxy with server_type=auto when panel requires `node_type=trojan` -> auto-probes & latches!
+	uniSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("node_type") != "trojan" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.URL.Path == "/api/v1/server/UniProxy/config" {
+			_, _ = w.Write([]byte(`{"protocol":"trojan","server_port":1443,"tls":1,"server_name":"tr.example.com"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"users":[{"id":9,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}`))
+	}))
+	defer uniSrv.Close()
+
+	uc := config.Default() // ServerType == "auto"
+	uc.Type = "v2board"
+	uc.NodeID = 3
+	uc.NodeIDs = []int{3}
+	uc.WebAPIURL = uniSrv.URL
+	uc.WebAPIKey = "tok"
+	ucli, _ := NewClient(uc)
+	usp, err := ucli.FetchNodeConfig(context.Background())
+	if err != nil || usp.Protocol != "trojan" || usp.ServerPort != 1443 {
+		t.Fatalf("expected UniProxy auto-probe to discover trojan:1443, got %+v err=%v", usp, err)
+	}
+	uusers, err := ucli.FetchUsers(context.Background())
+	if err != nil || len(uusers) != 1 {
+		t.Fatalf("expected latched node_type=trojan on FetchUsers, got %+v err=%v", uusers, err)
+	}
+}
+
 func TestUniProxyTransient500AndExpiryBypassETag(t *testing.T) {
 	var failConfig atomic.Bool
 	failConfig.Store(true)

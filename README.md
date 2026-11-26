@@ -132,7 +132,7 @@ xoga version                      # 查看版本号
 ```ini
 # 基础对接配置
 type=v2board                 # 可选: v2board, newv2board, xboard, sspanel
-server_type=vless            # 可选: vless, trojan, shadowsocks (ss), vmess (v2ray)
+server_type=auto             # 默认 auto 自动从面板获取协议 (亦支持手动指定 vless, trojan, ss, vmess, hy2, anytls)
 node_id=1
 api=webapi
 

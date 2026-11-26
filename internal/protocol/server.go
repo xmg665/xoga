@@ -464,8 +464,8 @@ func (s *Server) Start() error {
 		}
 	}
 
-	logger.Infof("Inbound started: protocol=%s addr=%s network=%s tls=%v reality=%v zerocopy=%v",
-		s.spec.Protocol, addr, s.spec.Network, needTLS, needReality, s.cfg.EnableZeroCopy)
+	logger.Infof("Inbound started: node=%d protocol=%s addr=%s network=%s tls=%v reality=%v zerocopy=%v",
+		s.cfg.NodeID, s.spec.Protocol, addr, s.spec.Network, needTLS, needReality, s.cfg.EnableZeroCopy)
 	return nil
 }
 

@@ -103,6 +103,19 @@ log_level=false
 		t.Fatalf("unexpected docker env config: %+v", envCfg)
 	}
 
+	// Verify default ServerType is "auto" (auto-detected from panel)
+	defCfg := Default()
+	if defCfg.ServerType != "auto" || defCfg.NormalizedServerType() != "auto" {
+		t.Fatalf("expected Default().ServerType=auto, got %q (%q)", defCfg.ServerType, defCfg.NormalizedServerType())
+	}
+	defCfg.NodeID = 1
+	defCfg.NodeIDs = []int{1}
+	defCfg.WebAPIURL = "https://panel.example.com"
+	defCfg.WebAPIKey = "tok"
+	if err := defCfg.Validate(); err != nil {
+		t.Fatalf("expected server_type=auto to pass Validate(), got %v", err)
+	}
+
 	// Verify uppercase `NODE_ID` env var & empty `reality_short_ids=` not producing `[""]`
 	t.Setenv("node_id", "")
 	t.Setenv("NODE_ID", "999")

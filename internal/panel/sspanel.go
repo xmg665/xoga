@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -81,9 +82,45 @@ type sspanelNodeResp struct {
 		TrafficRate    *float64        `json:"traffic_rate"`
 		Server         string          `json:"server"`
 		Method         string          `json:"method"`
-		Sort           int             `json:"sort"`
+		Sort           *int            `json:"sort"`
 		CustomConfig   json.RawMessage `json:"custom_config"`
 	} `json:"data"`
+}
+
+// sspanelProtocolFromSort maps SSPanel-UIM / Metron / Malio `sort` codes directly to xoga inbound protocols
+// so nodes automatically inherit their protocol from the panel (even in mixed-protocol multi-node instances).
+func sspanelProtocolFromSort(sortPtr *int, method string, cfg *config.Config) string {
+	fb := cfg.NormalizedServerType()
+	if fb == "" || fb == "auto" {
+		fb = "vmess"
+	}
+	if sortPtr == nil {
+		return fb
+	}
+	switch *sortPtr {
+	case 0, 9, 10:
+		return "shadowsocks"
+	case 11, 12:
+		if cfg.VLESS || cfg.IsRealityConfigured() {
+			return "vless"
+		}
+		return "vmess"
+	case 13:
+		if method != "" && !strings.EqualFold(method, "none") {
+			return "shadowsocks"
+		}
+		return "vless"
+	case 14:
+		return "trojan"
+	case 15:
+		return "hysteria2"
+	case 16, 17, 19, 20:
+		return "anytls"
+	case 18:
+		return "vless"
+	default:
+		return fb
+	}
 }
 
 func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) {
@@ -137,12 +174,12 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	c.mu.Unlock()
 
 	spec := &NodeSpec{
-		Protocol: c.cfg.NormalizedServerType(),
+		Protocol: sspanelProtocolFromSort(resp.Data.Sort, resp.Data.Method, c.cfg),
 		ListenIP: "0.0.0.0",
 		Network:  "tcp",
-		Cipher:   strings.ToLower(resp.Data.Method),
+		Cipher:   strings.ToLower(strings.TrimSpace(resp.Data.Method)),
 	}
-	if spec.Cipher == "" {
+	if spec.Cipher == "" || spec.Cipher == "none" {
 		spec.Cipher = "aes-256-gcm"
 	}
 
@@ -186,6 +223,15 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 				spec.TLSMode = 2
 			} else if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true {
 				spec.TLSMode = 1
+			}
+			if pStr, ok := cc["protocol"].(string); ok {
+				if np := normalizePanelProtoName(pStr); np != "" {
+					spec.Protocol = np
+				}
+			} else if tStr, ok := cc["type"].(string); ok {
+				if np := normalizePanelProtoName(tStr); np != "" {
+					spec.Protocol = np
+				}
 			}
 			if cc["enable_vless"] == "1" || cc["enable_vless"] == true || cc["vless"] == "1" || cc["vless"] == true {
 				spec.Protocol = "vless"
@@ -238,13 +284,26 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 		}
 	}
 
-	if c.cfg.IsRealityConfigured() && spec.TLSMode != 2 {
+	applyConfigProtocolOverrides(c.cfg, spec)
+	if spec.RealityPrivateKey != "" || c.cfg.IsRealityConfigured() {
 		spec.TLSMode = 2
+		if spec.RealityDest == "" && spec.ServerName != "" {
+			spec.RealityDest = net.JoinHostPort(spec.ServerName, "443")
+		}
+		if len(spec.RealityServerNames) == 0 && spec.ServerName != "" {
+			spec.RealityServerNames = []string{spec.ServerName}
+		}
 	}
-	if (spec.Protocol == "hysteria2" || spec.Protocol == "anytls") && spec.TLSMode == 0 {
+	if spec.Protocol == "hysteria2" {
+		if spec.Network == "" || spec.Network == "tcp" {
+			spec.Network = "quic"
+		}
+		if spec.TLSMode == 0 {
+			spec.TLSMode = 1
+		}
+	} else if spec.Protocol == "anytls" && spec.TLSMode == 0 {
 		spec.TLSMode = 1
 	}
-	applyConfigProtocolOverrides(c.cfg, spec)
 
 	// Local `listen_port` override in xoga.conf always takes final precedence when > 0
 	if c.cfg.ListenPort > 0 {
@@ -357,6 +416,7 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 	if srv == "" {
 		return
 	}
+	var firstHost string
 	parts := strings.Split(srv, ";")
 	for i, rawPart := range parts {
 		rawPart = strings.TrimSpace(rawPart)
@@ -364,16 +424,21 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 			continue
 		}
 		if i == 0 {
+			hostPart := rawPart
 			// Sometimes host:port#listenPort
 			if idx := strings.IndexByte(rawPart, '#'); idx > 0 {
+				hostPart = rawPart[:idx]
 				if p, err := strconv.Atoi(rawPart[idx+1:]); err == nil && p > 0 {
 					spec.ServerPort = p
 				}
-			} else if _, portStr, hasColon := strings.Cut(rawPart, ":"); hasColon {
+			}
+			if hOnly, portStr, hasColon := strings.Cut(hostPart, ":"); hasColon {
+				hostPart = hOnly
 				if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 && spec.ServerPort == 0 {
 					spec.ServerPort = p
 				}
 			}
+			firstHost = strings.TrimSpace(hostPart)
 			continue
 		}
 
@@ -440,29 +505,34 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 					}
 				case "flow":
 					spec.Flow = v
-				case "private_key", "pbk":
-					if k == "private_key" {
-						spec.RealityPrivateKey = v
-					}
-				case "short_id", "sid":
+				case "private_key", "privatekey":
+					spec.RealityPrivateKey = v
+				case "short_id", "shortid", "sid":
 					for _, sid := range strings.Split(v, ",") {
-						spec.RealityShortIDs = append(spec.RealityShortIDs, strings.TrimSpace(sid))
+						if s := strings.TrimSpace(sid); s != "" {
+							spec.RealityShortIDs = append(spec.RealityShortIDs, s)
+						}
 					}
 				case "dest", "reality_dest":
 					spec.RealityDest = v
+				case "servername", "server_name":
+					spec.ServerName = v
 				case "obfs":
 					spec.Hy2Obfs = strings.ToLower(v)
 				case "obfs_password", "obfs-password":
 					spec.Hy2ObfsPassword = v
-				case "up_mbps":
+				case "up_mbps", "up":
 					spec.Hy2UpMbps, _ = strconv.Atoi(v)
-				case "down_mbps":
+				case "down_mbps", "down":
 					spec.Hy2DownMbps, _ = strconv.Atoi(v)
 				case "server_key":
 					spec.ServerKey = v
 				}
 			}
 		}
+	}
+	if spec.ServerName == "" && firstHost != "" && net.ParseIP(firstHost) == nil {
+		spec.ServerName = firstHost
 	}
 }
 

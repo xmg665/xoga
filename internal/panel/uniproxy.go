@@ -91,13 +91,39 @@ func (c *UniProxyClient) endpoint(action string) string {
 func (c *UniProxyClient) endpointWithType(action, nt string) string {
 	q := url.Values{}
 	q.Set("node_id", strconv.Itoa(c.cfg.NodeID))
-	q.Set("node_type", nt)
+	if nt != "" && nt != "auto" {
+		q.Set("node_type", nt)
+	}
 	q.Set("token", c.cfg.WebAPIKey)
 	return c.baseURL + "/api/v1/server/UniProxy/" + action + "?" + q.Encode()
 }
 
+var autoUniProxyProbeTypes = []string{
+	"vless", "vmess", "v2ray", "trojan", "hysteria2", "hysteria", "shadowsocks", "anytls",
+}
+
+func normalizePanelProtoName(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "vless", "reality", "vless-reality":
+		return "vless"
+	case "vmess", "v2ray":
+		return "vmess"
+	case "trojan":
+		return "trojan"
+	case "ss", "shadowsocks":
+		return "shadowsocks"
+	case "hysteria2", "hysteria", "hy2":
+		return "hysteria2"
+	case "anytls":
+		return "anytls"
+	default:
+		return ""
+	}
+}
+
 type uniConfigResp struct {
 	Protocol        string          `json:"protocol"`
+	ServerType      string          `json:"server_type"`
 	ListenIP        string          `json:"listen_ip"`
 	ServerPort      int             `json:"server_port"`
 	Network         string          `json:"network"`
@@ -137,13 +163,26 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpointWithType("config", curNT), etag)
-	if err != nil && (status == 400 || status == 404 || status == 422 || status == 500) {
+	if err != nil && (curNT == "" || curNT == "auto") && (status == 400 || status == 404 || status == 422) {
+		// Auto-discover node_type from V2Board / NewV2Board / Xboard when `server_type=auto`
+		for _, cand := range autoUniProxyProbeTypes {
+			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", cand), ""); altErr == nil {
+				c.mu.Lock()
+				c.effectiveNodeType = cand
+				c.mu.Unlock()
+				curNT = cand
+				body, newETag, status, err = altBody, altETag, altStatus, nil
+				break
+			}
+		}
+	} else if err != nil && (status == 400 || status == 404 || status == 422 || status == 500) {
 		// Bidirectional negotiation (`vmess`<->`v2ray`, `hysteria2`<->`hysteria`): only latch if fallback returns 200 OK!
 		if altNT := alternateUniProxyNodeType(curNT); altNT != "" {
 			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", altNT), ""); altErr == nil {
 				c.mu.Lock()
 				c.effectiveNodeType = altNT
 				c.mu.Unlock()
+				curNT = altNT
 				body, newETag, status, err = altBody, altETag, altStatus, nil
 			}
 		}
@@ -166,12 +205,23 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 		c.mu.Unlock()
 	}
 
-	proto := strings.ToLower(raw.Protocol)
-	switch proto {
-	case "", "v2ray":
-		proto = c.cfg.NormalizedServerType()
-	case "hysteria", "hy2":
-		proto = "hysteria2"
+	proto := normalizePanelProtoName(raw.Protocol)
+	if proto == "" {
+		proto = normalizePanelProtoName(raw.ServerType)
+	}
+	if proto == "" {
+		proto = normalizePanelProtoName(curNT)
+	}
+	if proto == "" {
+		proto = normalizePanelProtoName(c.cfg.NormalizedServerType())
+	}
+	if proto == "" {
+		proto = "vless"
+	}
+	if c.cfg.VLESS || c.cfg.IsRealityConfigured() {
+		if proto == "vmess" {
+			proto = "vless"
+		}
 	}
 
 	spec := &NodeSpec{

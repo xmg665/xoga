@@ -122,7 +122,7 @@ type Config struct {
 func Default() *Config {
 	return &Config{
 		Type:                "v2board",
-		ServerType:          "vless",
+		ServerType:          "auto",
 		API:                 "webapi",
 		CertKeyLength:       "ec-256",
 		RedisIPLimitExpiry:  60,
@@ -194,7 +194,11 @@ func (c *Config) ApplyKV(key, val string) {
 	case "type":
 		c.Type = strings.ToLower(val)
 	case "server_type":
-		c.ServerType = strings.ToLower(val)
+		if strings.TrimSpace(val) == "" {
+			c.ServerType = "auto"
+		} else {
+			c.ServerType = strings.ToLower(strings.TrimSpace(val))
+		}
 	case "node_id":
 		c.NodeIDs = parseNodeIDList(val)
 		if len(c.NodeIDs) > 0 {
@@ -574,7 +578,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("unsupported panel type %q (supported: v2board, newv2board, xboard, sspanel)", c.Type)
 	}
 	switch c.NormalizedServerType() {
-	case "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "anytls":
+	case "auto", "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "anytls":
 	default:
 		return fmt.Errorf("unsupported server_type %q (supported: v2ray, vmess, vless, reality, trojan, ss, shadowsocks, hy2, hysteria2, anytls)", c.ServerType)
 	}
@@ -593,7 +597,12 @@ func (c *Config) NormalizedPanelType() string {
 }
 
 func (c *Config) NormalizedServerType() string {
-	switch strings.ToLower(c.ServerType) {
+	switch strings.ToLower(strings.TrimSpace(c.ServerType)) {
+	case "", "auto":
+		if c.VLESS || c.Reality {
+			return "vless"
+		}
+		return "auto"
 	case "v2ray", "vmess":
 		if c.VLESS || c.Reality {
 			return "vless"
@@ -684,7 +693,8 @@ func UpdateFile(path string, pairs []string) ([]string, error) {
 func DefaultTemplate() string {
 	return `# ==================== 基础对接配置 (兼容 soga.conf) ====================
 type=v2board
-server_type=vless
+# server_type 默认为 auto，自动从面板获取节点协议
+server_type=auto
 node_id=1
 api=webapi
 
