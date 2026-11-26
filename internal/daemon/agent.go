@@ -103,8 +103,8 @@ func (a *Agent) applyRuntimeTuning() {
 	if len(a.workers) > 0 {
 		panelName = a.workers[0].client.Name()
 	}
-	logger.Infof("Starting %s | panel=%s nodes=%s(%d) server_type=%s gc=%d%% mem_limit=%dMiB",
-		version.Summary(), panelName, a.cfg.FormatNodeIDs(), len(a.workers), a.cfg.NormalizedServerType(), gcPct, a.cfg.MemLimitMB)
+	logger.Infof("Starting %s | panel=%s nodes=%s(%d) server_type=%s device_limit=%v gc=%d%% mem_limit=%dMiB",
+		version.Summary(), panelName, a.cfg.FormatNodeIDs(), len(a.workers), a.cfg.NormalizedServerType(), a.cfg.DeviceLimitEnable, gcPct, a.cfg.MemLimitMB)
 }
 
 func (a *Agent) Run(ctx context.Context) error {

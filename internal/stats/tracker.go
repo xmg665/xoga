@@ -616,7 +616,7 @@ func NewTracker(cfg *config.Config) *Tracker {
 		NodeLimiter: limiter.NewBucketMbps(cfg.NodeSpeedLimit),
 		users:       make(map[int]*UserEntry),
 	}
-	if cfg.RedisIPLimitEnable && cfg.RedisIPLimitAddr != "" {
+	if cfg.DeviceLimitEnable && cfg.RedisIPLimitEnable && cfg.RedisIPLimitAddr != "" {
 		t.redisLim = newRedisIPLimiter(cfg)
 	}
 	return t
@@ -670,9 +670,12 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 		if staticSpeedBps > 0 && (effSpeed <= 0 || staticSpeedBps < effSpeed) {
 			effSpeed = staticSpeedBps
 		}
-		effDev := sp.DeviceLimit
-		if t.cfg.UserConnLimit > 0 && (effDev <= 0 || t.cfg.UserConnLimit < effDev) {
-			effDev = t.cfg.UserConnLimit
+		effDev := 0
+		if t.cfg.DeviceLimitEnable {
+			effDev = sp.DeviceLimit
+			if t.cfg.UserConnLimit > 0 && (effDev <= 0 || t.cfg.UserConnLimit < effDev) {
+				effDev = t.cfg.UserConnLimit
+			}
 		}
 		_, dyWhite := t.cfg.DyLimitWhiteUserIDs[sp.ID]
 

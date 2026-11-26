@@ -201,6 +201,7 @@ func TestRedisIPLimiterEvictsRejectedIP(t *testing.T) {
 
 func TestCredentialRotationKicksOldSessionsAndPreservesTraffic(t *testing.T) {
 	cfg := config.Default()
+	cfg.DeviceLimitEnable = true
 	tr := NewTracker(cfg)
 
 	entries, _, _, _ := tr.ReconcileUsers([]SyncUserSpec{
@@ -243,4 +244,32 @@ func TestCredentialRotationKicksOldSessionsAndPreservesTraffic(t *testing.T) {
 		t.Fatalf("expected new IP to succeed after empty /alivelist cleared stale remoteCount, got %v", err)
 	}
 	u.ReleaseConn()
+}
+
+func TestDeviceLimitDisabledByDefaultAndToggleable(t *testing.T) {
+	cfg := config.Default()
+	cfg.UserConnLimit = 1
+	tr := NewTracker(cfg)
+
+	entries, _, _, _ := tr.ReconcileUsers([]SyncUserSpec{
+		{ID: 42, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811", DeviceLimit: 1},
+	})
+	u := entries[0]
+
+	// Default: DeviceLimitEnable=false -> multiple IPs must NOT be blocked even when panel/static limit is 1
+	for _, ipStr := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"} {
+		if err := u.AcquireConn(netip.MustParseAddr(ipStr), 60, nil); err != nil {
+			t.Fatalf("expected IP %s to pass when DeviceLimitEnable=false, got %v", ipStr, err)
+		}
+		u.ReleaseConn()
+	}
+
+	// Enable device limit -> next reconcile enforces DeviceLimit=1
+	cfg.DeviceLimitEnable = true
+	tr.ReconcileUsers([]SyncUserSpec{
+		{ID: 42, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811", DeviceLimit: 1},
+	})
+	if err := u.AcquireConn(netip.MustParseAddr("5.5.5.5"), 60, nil); err != ErrIPLimit {
+		t.Fatalf("expected 5th IP to hit ErrIPLimit once DeviceLimitEnable=true, got %v", err)
+	}
 }

@@ -148,7 +148,8 @@ force_close_ssl=false        # 设为 true 强制关闭本地 TLS，便于前置
 
 # 中转与全局设备限制
 proxy_protocol=false         # 开启后自动解析 PROXY Protocol v1/v2 获取真实客户端 IP
-user_conn_limit=0            # 单用户在线 IP 数限制 (0 跟随面板 device_limit)
+device_limit_enable=false    # 是否开启在线设备/IP 数量限制 (默认 false 关闭；设为 true 时生效)
+user_conn_limit=0            # 单用户在线 IP 数限制 (device_limit_enable=true 时生效，0 跟随面板 device_limit)
 user_speed_limit=0           # 单用户限速 Mbps (0 跟随面板 speed_limit)
 user_tcp_limit=0             # 单用户最大并发 TCP 连接数
 node_speed_limit=0           # 节点总带宽上限 Mbps

@@ -36,6 +36,17 @@ func TestLoadAndUpdateFile(t *testing.T) {
 	if _, ok := cfg.DyLimitWhiteUserIDs[5]; !ok {
 		t.Fatalf("expected whitelist user 5")
 	}
+	if cfg.DeviceLimitEnable {
+		t.Fatalf("expected DeviceLimitEnable=false by default")
+	}
+	cfg.ApplyKV("device_limit_enable", "true")
+	if !cfg.DeviceLimitEnable {
+		t.Fatalf("expected device_limit_enable=true to enable DeviceLimitEnable")
+	}
+	cfg.ApplyKV("device_limit_enable", "false")
+	if cfg.DeviceLimitEnable {
+		t.Fatalf("expected device_limit_enable=false to disable DeviceLimitEnable")
+	}
 	_ = os.Remove(tmp)
 }
 

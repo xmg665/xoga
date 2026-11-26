@@ -67,7 +67,8 @@ type Config struct {
 	DyLimitWhiteUserIDs map[int]struct{}
 
 	// Static limits & intervals
-	UserConnLimit       int     // max concurrent IP/devices per user (0 = follow panel device_limit)
+	DeviceLimitEnable   bool    // enforce per-user online IP/device limit (default false)
+	UserConnLimit       int     // max concurrent IP/devices per user when DeviceLimitEnable=true (0 = follow panel device_limit)
 	UserSpeedLimit      float64 // Mbps static per-user cap (0 = follow panel speed_limit)
 	UserTCPLimit        int     // max concurrent TCP streams per user (0 = unlimited)
 	NodeSpeedLimit      float64 // Mbps total node cap (0 = unlimited)
@@ -276,6 +277,8 @@ func (c *Config) ApplyKV(key, val string) {
 				c.DyLimitWhiteUserIDs[id] = struct{}{}
 			}
 		}
+	case "device_limit_enable", "conn_limit_enable", "ip_limit_enable":
+		c.DeviceLimitEnable = parseBool(val, false)
 	case "user_conn_limit":
 		c.UserConnLimit, _ = strconv.Atoi(val)
 	case "user_speed_limit":
@@ -494,6 +497,7 @@ var knownEnvKeys = []string{
 	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",
 	"dy_limit_enable", "dy_limit_duration", "dy_limit_trigger_time", "dy_limit_trigger_speed",
 	"dy_limit_speed", "dy_limit_time", "dy_limit_white_user_id",
+	"device_limit_enable", "conn_limit_enable", "ip_limit_enable",
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
 	"vless", "vless_flow", "v2ray_reduce_memory",
@@ -718,7 +722,8 @@ dy_limit_speed=30
 dy_limit_time=600
 dy_limit_white_user_id=
 
-# 流控与同步间隔
+# 流控与设备限制开关 (device_limit_enable 默认关闭)
+device_limit_enable=false
 user_conn_limit=0
 user_speed_limit=0
 user_tcp_limit=0
