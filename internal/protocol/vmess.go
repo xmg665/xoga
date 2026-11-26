@@ -314,6 +314,13 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 			}
 		}
 	}
+	if matched == nil && len(s.cfg.VMessLegacyUsers) != 0 {
+		user, hdr := s.readLegacyVMessHeader(idx, br, authID)
+		if user == nil {
+			return nil, nil, "", 0, 0, false
+		}
+		return s.finishVMessHandshake(conn, br, user, hdr, true)
+	}
 	if matched == nil || matched.User.IsDisabled() {
 		return nil, nil, "", 0, 0, false
 	}
@@ -372,7 +379,14 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		return nil, nil, "", 0, 0, false
 	}
 	hdrPlain, err := payGCM.Open(encHdr[:0], payNonce[:12], encHdr, authID[:])
-	if err != nil || len(hdrPlain) < 41 {
+	if err != nil {
+		return nil, nil, "", 0, 0, false
+	}
+	return s.finishVMessHandshake(conn, br, matched, hdrPlain, false)
+}
+
+func (s *Server) finishVMessHandshake(conn net.Conn, br io.Reader, matched *VMessUserEntry, hdrPlain []byte, legacy bool) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, bool) {
+	if len(hdrPlain) < 42 {
 		return nil, nil, "", 0, 0, false
 	}
 
@@ -399,6 +413,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		}
 		destPort = binary.BigEndian.Uint16(hdrPlain[38:40])
 		addrReader := bytes.NewReader(hdrPlain[40 : len(hdrPlain)-4-pLen])
+		var err error
 		destHost, err = parseVLESSAddr(addrReader)
 		if err != nil {
 			return nil, nil, "", 0, 0, false
@@ -410,9 +425,15 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	default:
 		return nil, nil, "", 0, 0, false
 	}
+	if legacy {
+		token := sha256.Sum256(append(matched.CmdKey[:16:16], hdrPlain[1:33]...))
+		if s.replay.CheckAndMark(token[:]) {
+			return nil, nil, "", 0, 0, false
+		}
+	}
 	_ = conn.SetDeadline(time.Time{})
 
-	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType, cmd == 0x02)
+	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType, cmd == 0x02, legacy)
 	if err != nil {
 		return nil, nil, "", 0, 0, false
 	}
@@ -548,16 +569,17 @@ type vmessStreamConn struct {
 	readBuf        *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
 	leftover       []byte
 
-	writeMu    sync.Mutex
-	sentResp   bool
-	sentEOF    bool
-	writeAEAD  cipher.AEAD
-	writeCFB   cipher.Stream
-	writeMask  sha3.ShakeHash
-	writeCount uint16
+	writeMu      sync.Mutex
+	sentResp     bool
+	sentEOF      bool
+	writeAEAD    cipher.AEAD
+	writeCFB     cipher.Stream
+	legacyHeader bool
+	writeMask    sha3.ShakeHash
+	writeCount   uint16
 }
 
-func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV, opt, secType byte, isUDP bool) (*vmessStreamConn, error) {
+func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV, opt, secType byte, isUDP, legacyHeader bool) (*vmessStreamConn, error) {
 	rk := sha256.Sum256(reqKey[:])
 	riv := sha256.Sum256(reqIV[:])
 	if br == nil {
@@ -580,6 +602,11 @@ func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV,
 	}
 	copy(vc.respKey[:], rk[:16])
 	copy(vc.respIV[:], riv[:16])
+	vc.legacyHeader = legacyHeader
+	if legacyHeader {
+		vc.respKey = md5.Sum(reqKey[:])
+		vc.respIV = md5.Sum(reqIV[:])
+	}
 
 	if vc.optChunkMask {
 		rm := sha3.NewShake128()
@@ -671,7 +698,7 @@ func (v *vmessStreamConn) FlushResponseHeader() error {
 	defer v.writeMu.Unlock()
 	if !v.sentResp {
 		v.sentResp = true
-		if err := v.sendAEADResponseHeader(); err != nil {
+		if err := v.sendVMessResponseHeader(); err != nil {
 			return err
 		}
 	}
@@ -810,7 +837,7 @@ func (v *vmessStreamConn) writeSingleChunk(part []byte) (int, error) {
 
 	if !v.sentResp {
 		v.sentResp = true
-		if err := v.sendAEADResponseHeader(); err != nil {
+		if err := v.sendVMessResponseHeader(); err != nil {
 			return 0, err
 		}
 	}
@@ -878,7 +905,7 @@ func (v *vmessStreamConn) Write(p []byte) (int, error) {
 
 	if !v.sentResp {
 		v.sentResp = true
-		if err := v.sendAEADResponseHeader(); err != nil {
+		if err := v.sendVMessResponseHeader(); err != nil {
 			return 0, err
 		}
 	}
@@ -911,8 +938,21 @@ func (v *vmessStreamConn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (v *vmessStreamConn) sendAEADResponseHeader() error {
+func (v *vmessStreamConn) sendVMessResponseHeader() error {
 	respPlain := [4]byte{v.respV, 0x00, 0x00, 0x00}
+	if v.legacyHeader {
+		stream := v.writeCFB
+		if stream == nil {
+			block, err := aes.NewCipher(v.respKey[:])
+			if err != nil {
+				return err
+			}
+			stream = cipher.NewCFBEncrypter(block, v.respIV[:])
+		}
+		stream.XORKeyStream(respPlain[:], respPlain[:])
+		_, err := v.Conn.Write(respPlain[:])
+		return err
+	}
 	lenKey := vmessKDF1(v.respKey[:], kdfSaltRespLenK)
 	lenNonce := vmessKDF1(v.respIV[:], kdfSaltRespLenIV)
 	lenBlk, err := aes.NewCipher(lenKey[:16])

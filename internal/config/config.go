@@ -27,6 +27,9 @@ type Config struct {
 	SogaKey    string // kept for compatibility with soga.conf scripts (unused/free)
 	API        string // webapi
 
+	// VMess legacy MD5 authentication, scoped to explicitly configured user IDs.
+	VMessLegacyUsers map[int]int // user ID to maximum legacy AlterID
+
 	// WebAPI connection
 	WebAPIURL string
 	WebAPIKey string // supports both webapi_key and webapi_mukey
@@ -72,14 +75,14 @@ type Config struct {
 	UserSpeedLimit      float64 // Mbps static per-user cap (0 = follow panel speed_limit)
 	UserTCPLimit        int     // max concurrent TCP streams per user (0 = unlimited)
 	NodeSpeedLimit      float64 // Mbps total node cap (0 = unlimited)
-	CheckInterval       int      // seconds between panel config/user pulls
-	SubmitInterval      int      // seconds between traffic/alive pushes
+	CheckInterval       int     // seconds between panel config/user pulls
+	SubmitInterval      int     // seconds between traffic/alive pushes
 	ForbiddenBitTorrent bool
-	ForbiddenPorts      string   // e.g. "25,26,6881-6999" (soga forbidden_ports)
-	BanPrivateIP        bool     // block RFC1918/loopback targets when true
-	VLESS               bool     // soga `vless=true` when `server_type=v2ray`
-	VLESSFlow           string   // soga `vless_flow=` (e.g. `xtls-rprx-vision`)
-	V2rayReduceMemory   bool     // soga `v2ray_reduce_memory=true`
+	ForbiddenPorts      string // e.g. "25,26,6881-6999" (soga forbidden_ports)
+	BanPrivateIP        bool   // block RFC1918/loopback targets when true
+	VLESS               bool   // soga `vless=true` when `server_type=v2ray`
+	VLESSFlow           string // soga `vless_flow=` (e.g. `xtls-rprx-vision`)
+	V2rayReduceMemory   bool   // soga `v2ray_reduce_memory=true`
 
 	// REALITY / Hysteria2 / AnyTLS local overrides (optional when pulled from panel)
 	Reality            bool
@@ -93,13 +96,13 @@ type Config struct {
 	Hy2DownMbps        int
 	Hy2IgnoreClientBW  bool
 	AnyTLSPadding      string
-	DefaultDNS          []string
-	DNSStrategy         string // ipv4_first, ipv6_first, ipv4_only, ipv6_only
-	DNSCacheTime        int    // minutes (soga `dns_cache_time=10`)
-	DNSConfigURL        string // optional remote URL to fetch dns.yml
-	DomainSniff         bool   // rewrite target IP with sniffed SNI/Host when matching DNS/route unlock rules
-	ForceDomainSniff    bool   // always rewrite target IP with sniffed SNI/Host
-	LogLevel            string
+	DefaultDNS         []string
+	DNSStrategy        string // ipv4_first, ipv6_first, ipv4_only, ipv6_only
+	DNSCacheTime       int    // minutes (soga `dns_cache_time=10`)
+	DNSConfigURL       string // optional remote URL to fetch dns.yml
+	DomainSniff        bool   // rewrite target IP with sniffed SNI/Host when matching DNS/route unlock rules
+	ForceDomainSniff   bool   // always rewrite target IP with sniffed SNI/Host
+	LogLevel           string
 
 	// Rule file paths
 	BlockListPath string
@@ -279,6 +282,16 @@ func (c *Config) ApplyKV(key, val string) {
 		for _, part := range strings.Split(val, ",") {
 			if id, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && id > 0 {
 				c.DyLimitWhiteUserIDs[id] = struct{}{}
+			}
+		}
+	case "vmess_legacy_users":
+		c.VMessLegacyUsers = make(map[int]int)
+		for _, entry := range strings.Split(val, ",") {
+			user, count, _ := strings.Cut(strings.TrimSpace(entry), ":")
+			id, idErr := strconv.Atoi(user)
+			alterID, aidErr := strconv.Atoi(count)
+			if idErr == nil && aidErr == nil && id > 0 && alterID >= 0 && alterID <= 64 {
+				c.VMessLegacyUsers[id] = alterID
 			}
 		}
 	case "device_limit_enable", "conn_limit_enable", "ip_limit_enable":
@@ -504,7 +517,7 @@ var knownEnvKeys = []string{
 	"device_limit_enable", "conn_limit_enable", "ip_limit_enable",
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
-	"vless", "vless_flow", "v2ray_reduce_memory",
+	"vless", "vless_flow", "v2ray_reduce_memory", "vmess_legacy_users",
 	"reality", "enable_reality", "reality_dest", "dest", "reality_private_key", "private_key",
 	"reality_short_ids", "reality_short_id", "short_id", "short_ids", "reality_server_names", "server_names",
 	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps",
