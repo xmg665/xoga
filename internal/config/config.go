@@ -28,7 +28,8 @@ type Config struct {
 	API        string // webapi
 
 	// VMess legacy MD5 authentication, scoped to explicitly configured user IDs.
-	VMessLegacyUsers map[int]int // user ID to maximum legacy AlterID
+	VMessLegacyUsers          map[int]int // user ID to maximum legacy AlterID
+	ForwardExtraPortRequested bool        // legacy Soga setting surfaced at startup
 
 	// WebAPI connection
 	WebAPIURL string
@@ -288,8 +289,8 @@ func (c *Config) ApplyKV(key, val string) {
 		c.VMessLegacyUsers = make(map[int]int)
 		for _, entry := range strings.Split(val, ",") {
 			user, count, _ := strings.Cut(strings.TrimSpace(entry), ":")
-			id, idErr := strconv.Atoi(user)
-			alterID, aidErr := strconv.Atoi(count)
+			id, idErr := strconv.Atoi(strings.TrimSpace(user))
+			alterID, aidErr := strconv.Atoi(strings.TrimSpace(count))
 			if idErr == nil && aidErr == nil && id > 0 && alterID >= 0 && alterID <= 64 {
 				c.VMessLegacyUsers[id] = alterID
 			}
@@ -415,7 +416,9 @@ func (c *Config) ApplyKV(key, val string) {
 		if c.ForceProxyProtocol {
 			c.ProxyProtocol = true
 		}
-	case "forward_extra_port_enable", "dns_cache_enable", "tunnel_enable":
+	case "forward_extra_port_enable":
+		c.ForwardExtraPortRequested = parseBool(val, false)
+	case "dns_cache_enable", "tunnel_enable":
 		// Accepted for 100% compatibility with soga.conf / Docker env vars
 	}
 }
@@ -517,7 +520,7 @@ var knownEnvKeys = []string{
 	"device_limit_enable", "conn_limit_enable", "ip_limit_enable",
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
-	"vless", "vless_flow", "v2ray_reduce_memory", "vmess_legacy_users",
+	"vless", "vless_flow", "v2ray_reduce_memory", "vmess_legacy_users", "forward_extra_port_enable",
 	"reality", "enable_reality", "reality_dest", "dest", "reality_private_key", "private_key",
 	"reality_short_ids", "reality_short_id", "short_id", "short_ids", "reality_server_names", "server_names",
 	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps",

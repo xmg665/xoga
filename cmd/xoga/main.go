@@ -62,6 +62,9 @@ func runDaemon(args []string) int {
 		return 1
 	}
 	logger.SetLevel(logger.ParseLevel(cfg.LogLevel))
+	if cfg.ForwardExtraPortRequested {
+		logger.Warnf("forward_extra_port_enable is unsupported by xoga. Extra ports require an external forwarder.")
+	}
 	if cfg.PprofAddr != "" {
 		go func() {
 			logger.Infof("Starting pprof diagnostic server on %s", cfg.PprofAddr)

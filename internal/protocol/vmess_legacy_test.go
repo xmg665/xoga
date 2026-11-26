@@ -24,7 +24,7 @@ func TestLegacyVMessAuthentication(t *testing.T) {
 	echoHost, echoPort, closeEcho := startEchoTCPServer(t)
 	defer closeEcho()
 	cfg := config.Default()
-	cfg.ApplyKV("vmess_legacy_users", "55:1")
+	cfg.ApplyKV("vmess_legacy_users", "55 : 1")
 	tracker := stats.NewTracker(cfg)
 	users, _, _, _ := tracker.ReconcileUsers([]stats.SyncUserSpec{
 		{ID: 55, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"},

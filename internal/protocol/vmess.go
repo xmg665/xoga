@@ -26,6 +26,7 @@ import (
 
 	"github.com/xmg665/xoga/internal/acl"
 	"github.com/xmg665/xoga/internal/bufpool"
+	"github.com/xmg665/xoga/internal/logger"
 	"github.com/xmg665/xoga/internal/relay"
 	"github.com/xmg665/xoga/internal/stats"
 )
@@ -219,6 +220,7 @@ func fnv1a32(b []byte) uint32 {
 func (s *Server) handleVMess(conn net.Conn) {
 	vmConn, user, destHost, destPort, cmd, ok := s.handshakeVMess(conn)
 	if !ok {
+		logger.Debugf("VMess handshake rejected: node=%d peer=%s", s.cfg.NodeID, conn.RemoteAddr())
 		return
 	}
 	defer vmConn.releaseReadBuf()
