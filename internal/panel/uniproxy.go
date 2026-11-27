@@ -63,6 +63,12 @@ func (c *UniProxyClient) Name() string {
 	return "UniProxy(" + c.cfg.Type + ")"
 }
 
+func (c *UniProxyClient) ClearNodeConfigETag() {
+	c.mu.Lock()
+	c.configETag = ""
+	c.mu.Unlock()
+}
+
 func alternateUniProxyNodeType(nt string) string {
 	switch nt {
 	case "vmess":
@@ -196,7 +202,7 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 
 	var raw uniConfigResp
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("decode UniProxy config: %w", err)
+		return nil, fmt.Errorf("decode UniProxy config: %w (body: %s)", err, truncateMsg(body))
 	}
 
 	if newETag != "" {
@@ -464,7 +470,7 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 
 	var resp uniUsersResp
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode UniProxy users: %w", err)
+		return nil, fmt.Errorf("decode UniProxy users: %w (body: %s)", err, truncateMsg(body))
 	}
 
 	nowUnix = time.Now().Unix()
@@ -715,7 +721,7 @@ func parseAnyInt(v any) int {
 }
 
 func truncateMsg(b []byte) string {
-	s := strings.TrimSpace(string(b))
+	s := strings.Join(strings.Fields(string(b)), " ")
 	if len(s) > 200 {
 		return s[:200] + "..."
 	}

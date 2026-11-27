@@ -46,7 +46,7 @@ func decodeVLESSAddonFlow(raw []byte) string {
 			pos += vn
 		case 2: // length-delimited
 			l, ln := readProtoVarint(raw[pos:])
-			if ln <= 0 || int(l) < 0 || pos+ln+int(l) > len(raw) {
+			if ln <= 0 || l > uint64(len(raw)-pos-ln) {
 				return ""
 			}
 			pos += ln
@@ -153,7 +153,7 @@ func (v *visionConn) FlushResponseHeader() error {
 			out[pos] = visionCmdEnd
 			pos += 5
 		}
-		_ = writeAllConn(v.Conn, out[:pos])
+		return writeAllConn(v.Conn, out[:pos])
 	}
 	return nil
 }

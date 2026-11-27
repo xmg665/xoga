@@ -156,18 +156,24 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 
 		case anytlsCmdHeartRequest:
 			if dataLen > 0 {
-				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
+				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+					return
+				}
 			}
 			sess.enqueueCtrl(anytlsCmdHeartResponse, streamID, nil)
 
 		case anytlsCmdHeartResponse:
 			if dataLen > 0 {
-				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
+				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+					return
+				}
 			}
 
 		case anytlsCmdSYN:
 			if dataLen > 0 {
-				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
+				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+					return
+				}
 			}
 			if !sess.seenSettings.Load() {
 				sess.enqueueCtrl(anytlsCmdAlert, 0, []byte("cmdSettings required before cmdSYN"))
@@ -192,7 +198,9 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 
 		case anytlsCmdFIN:
 			if dataLen > 0 {
-				_, _ = io.CopyN(io.Discard, br, int64(dataLen))
+				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+					return
+				}
 			}
 			sess.finFromPeer(streamID)
 
@@ -311,9 +319,11 @@ func (s *anytlsSession) getStream(id uint32) *anytlsStream {
 	return st
 }
 
-func (s *anytlsSession) removeStream(id uint32) {
+func (s *anytlsSession) removeStream(st *anytlsStream) {
 	s.streamsMu.Lock()
-	delete(s.streams, id)
+	if s.streams[st.id] == st {
+		delete(s.streams, st.id)
+	}
 	s.streamsMu.Unlock()
 }
 
@@ -525,22 +535,37 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 		_ = st.SetReadDeadline(time.Now().Add(idleDur))
 		host, port := fixedHost, fixedPort
+		var l2 [2]byte
 		if !isConnect {
-			var aerr error
-			host, port, aerr = readUoTAddr(st)
-			if aerr != nil {
-				if errors.Is(aerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+			// Read the first byte (address family) separately so we only retry on timeout
+			// when 0 bytes of the frame were consumed; any mid-frame timeout breaks cleanly.
+			var af [1]byte
+			rn, rerr := st.Read(af[:])
+			if rn == 0 {
+				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
 					continue
 				}
 				break
 			}
-		}
-		var l2 [2]byte
-		if _, err := io.ReadFull(st, l2[:]); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) && isConnect && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
-				continue
+			var aerr error
+			host, port, aerr = readUoTAddrWithAF(st, af[0])
+			if aerr != nil {
+				break
 			}
-			break
+			if _, err := io.ReadFull(st, l2[:]); err != nil {
+				break
+			}
+		} else {
+			rn, rerr := st.Read(l2[:1])
+			if rn == 0 {
+				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					continue
+				}
+				break
+			}
+			if _, err := io.ReadFull(st, l2[1:]); err != nil {
+				break
+			}
 		}
 		pktLen := int(binary.BigEndian.Uint16(l2[:]))
 		if pktLen > len(inBuf) {
@@ -581,8 +606,12 @@ func readUoTAddr(r io.Reader) (string, uint16, error) {
 	if _, err := io.ReadFull(r, af[:]); err != nil {
 		return "", 0, err
 	}
+	return readUoTAddrWithAF(r, af[0])
+}
+
+func readUoTAddrWithAF(r io.Reader, af byte) (string, uint16, error) {
 	var host string
-	switch af[0] {
+	switch af {
 	case 0x00: // IPv4
 		var ip [4]byte
 		if _, err := io.ReadFull(r, ip[:]); err != nil {
@@ -639,6 +668,7 @@ type anytlsStream struct {
 	peerEOF    bool
 	localClose bool
 	readTimer  *time.Timer
+	timerGen   uint64 // generation counter to invalidate stale AfterFunc callbacks
 	timedOut   bool
 
 	finOnce sync.Once
@@ -657,8 +687,8 @@ func (s *anytlsStream) pushRx(data []byte) {
 	var overflow bool
 	s.rxMu.Lock()
 	if !s.peerEOF && !s.localClose {
-		// Cap per-stream unread buffer at 8 MiB; abort stream cleanly on overflow instead of silently corrupting middle bytes!
-		if s.rxBuf.Len()+len(data) <= 8*1024*1024 {
+		// Cap per-stream unread buffer at 256 KiB; abort stream cleanly on overflow instead of silently corrupting middle bytes!
+		if s.rxBuf.Len()+len(data) <= 256*1024 {
 			_, _ = s.rxBuf.Write(data)
 		} else {
 			s.peerEOF = true
@@ -670,7 +700,7 @@ func (s *anytlsStream) pushRx(data []byte) {
 	s.rxCond.Broadcast()
 	s.rxMu.Unlock()
 	if overflow {
-		s.sess.removeStream(s.id)
+		s.sess.removeStream(s)
 		s.sess.enqueueCtrl(anytlsCmdFIN, s.id, nil)
 	}
 }
@@ -741,7 +771,7 @@ func (s *anytlsStream) sendFINOnce() {
 
 func (s *anytlsStream) Close() error {
 	s.sendFINOnce()
-	s.sess.removeStream(s.id)
+	s.sess.removeStream(s)
 	s.rxMu.Lock()
 	s.localClose = true
 	if s.readTimer != nil {
@@ -767,6 +797,7 @@ func (s *anytlsStream) SetReadDeadline(t time.Time) error {
 		s.readTimer.Stop()
 		s.readTimer = nil
 	}
+	s.timerGen++ // invalidate any in-flight AfterFunc callback
 	s.timedOut = false
 	if t.IsZero() {
 		return nil
@@ -777,10 +808,13 @@ func (s *anytlsStream) SetReadDeadline(t time.Time) error {
 		s.rxCond.Broadcast()
 		return nil
 	}
+	gen := s.timerGen
 	s.readTimer = time.AfterFunc(dur, func() {
 		s.rxMu.Lock()
-		s.timedOut = true
-		s.rxCond.Broadcast()
+		if s.timerGen == gen { // only fire if no newer SetReadDeadline has been called
+			s.timedOut = true
+			s.rxCond.Broadcast()
+		}
 		s.rxMu.Unlock()
 	})
 	return nil

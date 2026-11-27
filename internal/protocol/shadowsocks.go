@@ -148,21 +148,23 @@ func (s *Server) handleSSClassicAEADTCP(conn net.Conn) {
 
 	// Read first encrypted payload chunk (nonce = 1)
 	bp := bufpool.Get(bufpool.LargeSize)
-	defer bufpool.Put(bp)
 	encChunk := (*bp)[:firstChunkLen+16]
 	if _, err := io.ReadFull(conn, encChunk); err != nil {
+		bufpool.Put(bp)
 		return
 	}
 	var nonce1 [12]byte
 	nonce1[0] = 1
 	firstPayload, err := decAead.Open(encChunk[:0], nonce1[:], encChunk, nil)
 	if err != nil {
+		bufpool.Put(bp)
 		return
 	}
 
 	pr := bytes.NewReader(firstPayload)
 	destHost, destPort, err := parseSOCKS5Addr(pr)
 	if err != nil {
+		bufpool.Put(bp)
 		return
 	}
 	var initialData []byte
@@ -170,6 +172,7 @@ func (s *Server) handleSSClassicAEADTCP(conn net.Conn) {
 		initialData = make([]byte, pr.Len())
 		_, _ = pr.Read(initialData)
 	}
+	bufpool.Put(bp)
 	_ = conn.SetDeadline(time.Time{})
 
 	ssConn := &ssAEADStreamConn{
@@ -179,6 +182,7 @@ func (s *Server) handleSSClassicAEADTCP(conn net.Conn) {
 		readAEAD:  decAead,
 		readNonce: [12]byte{2}, // nonce 0 used for len, nonce 1 used for payload -> next is 2
 	}
+	defer ssConn.releasePendingBuf()
 	s.connectAndRelay(ssConn, matchedUser, destHost, destPort, initialData)
 }
 
@@ -217,10 +221,6 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 		}
 		var eihPlain [16]byte
 		idBlk.Decrypt(eihPlain[:], eihEnc[:])
-		// Unmask XOR with reqSalt[:16] per SS2022 EIH specification
-		for i := 0; i < 16; i++ {
-			eihPlain[i] ^= reqSalt[i]
-		}
 		entry, ok := idx.SSEIHMap[eihPlain]
 		if !ok {
 			return
@@ -286,27 +286,30 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 	}
 
 	bp := bufpool.Get(varHdrLen + 16)
-	defer bufpool.Put(bp)
 	varEnc := (*bp)[:varHdrLen+16]
 	if _, err := io.ReadFull(conn, varEnc); err != nil {
+		bufpool.Put(bp)
 		return
 	}
 	var nonce1 [12]byte
 	nonce1[0] = 1
 	varPlain, err := decAEAD.Open(varEnc[:0], nonce1[:], varEnc, nil)
 	if err != nil {
+		bufpool.Put(bp)
 		return
 	}
 
 	pr := bytes.NewReader(varPlain)
 	destHost, destPort, err := parseSOCKS5Addr(pr)
 	if err != nil || pr.Len() < 2 {
+		bufpool.Put(bp)
 		return
 	}
 	var padLenBuf [2]byte
 	_, _ = io.ReadFull(pr, padLenBuf[:])
 	padLen := int(binary.BigEndian.Uint16(padLenBuf[:]))
 	if pr.Len() < padLen {
+		bufpool.Put(bp)
 		return
 	}
 	if padLen > 0 {
@@ -317,6 +320,7 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 		initialData = make([]byte, pr.Len())
 		_, _ = pr.Read(initialData)
 	}
+	bufpool.Put(bp)
 	_ = conn.SetDeadline(time.Time{})
 
 	reqSaltCopy := make([]byte, cs.saltSize)
@@ -331,6 +335,7 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 		readAEAD:   decAEAD,
 		readNonce:  [12]byte{2},
 	}
+	defer ssConn.releasePendingBuf()
 	s.connectAndRelay(ssConn, matchedUser, destHost, destPort, initialData)
 }
 
@@ -341,14 +346,36 @@ type ssAEADStreamConn struct {
 	is2022    bool
 	reqSalt   []byte
 
-	readMu    sync.Mutex
-	readAEAD  cipher.AEAD
-	readNonce [12]byte
-	leftover  []byte
+	readMu          sync.Mutex
+	readAEAD        cipher.AEAD
+	readNonce       [12]byte
+	leftover        []byte
+	lenHdrBuf       [18]byte // preserves partial 18-byte length header across timeouts
+	lenHdrRead      int      // bytes of lenHdrBuf already read
+	pendingBodyBuf  *[]byte  // preserves partial chunk body across short timeouts (e.g. 150ms SNI peek)
+	pendingBodySize int
+	pendingBodyRead int
 
 	writeMu    sync.Mutex
 	writeAEAD  cipher.AEAD
 	writeNonce [12]byte
+}
+
+func (c *ssAEADStreamConn) releasePendingBuf() {
+	c.readMu.Lock()
+	if c.pendingBodyBuf != nil {
+		bufpool.Put(c.pendingBodyBuf)
+		c.pendingBodyBuf = nil
+		c.pendingBodySize = 0
+		c.pendingBodyRead = 0
+	}
+	c.readMu.Unlock()
+}
+
+func (c *ssAEADStreamConn) Close() error {
+	err := c.Conn.Close()
+	c.releasePendingBuf()
+	return err
 }
 
 func (c *ssAEADStreamConn) Read(p []byte) (int, error) {
@@ -361,30 +388,59 @@ func (c *ssAEADStreamConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	var lenEnc [18]byte
-	if _, err := io.ReadFull(c.Conn, lenEnc[:]); err != nil {
-		return 0, err
-	}
-	var lenPlain [2]byte
-	if _, err := c.readAEAD.Open(lenPlain[:0], c.readNonce[:], lenEnc[:], nil); err != nil {
-		return 0, err
-	}
-	incNonce(&c.readNonce)
+	// Preserve both the 18-byte length header AND partial chunk body across short timeouts
+	// (e.g. 150ms SNI peek) without overwriting caller-set deadlines.
+	if c.pendingBodyBuf == nil {
+		for c.lenHdrRead < 18 {
+			n, err := c.Conn.Read(c.lenHdrBuf[c.lenHdrRead:18])
+			c.lenHdrRead += n
+			if err != nil {
+				return 0, err
+			}
+		}
+		c.lenHdrRead = 0 // reset for next chunk
+		var lenPlain [2]byte
+		if _, err := c.readAEAD.Open(lenPlain[:0], c.readNonce[:], c.lenHdrBuf[:], nil); err != nil {
+			return 0, err
+		}
+		incNonce(&c.readNonce)
 
-	chunkLen := int(binary.BigEndian.Uint16(lenPlain[:]))
-	if !c.is2022 {
-		chunkLen &= 0x3FFF
-	}
-	if chunkLen == 0 {
-		return 0, io.EOF
+		chunkLen := int(binary.BigEndian.Uint16(lenPlain[:]))
+		if !c.is2022 {
+			chunkLen &= 0x3FFF
+		}
+		if chunkLen == 0 {
+			return 0, io.EOF
+		}
+
+		c.pendingBodyBuf = bufpool.Get(chunkLen + 16)
+		c.pendingBodySize = chunkLen + 16
+		c.pendingBodyRead = 0
 	}
 
-	bp := bufpool.Get(chunkLen + 16)
+	enc := (*c.pendingBodyBuf)[:c.pendingBodySize]
+	for c.pendingBodyRead < c.pendingBodySize {
+		n, err := c.Conn.Read(enc[c.pendingBodyRead:c.pendingBodySize])
+		c.pendingBodyRead += n
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return 0, err
+			}
+			bufpool.Put(c.pendingBodyBuf)
+			c.pendingBodyBuf = nil
+			c.pendingBodySize = 0
+			c.pendingBodyRead = 0
+			return 0, err
+		}
+	}
+
+	bp := c.pendingBodyBuf
+	c.pendingBodyBuf = nil
+	c.pendingBodySize = 0
+	c.pendingBodyRead = 0
 	defer bufpool.Put(bp)
-	enc := (*bp)[:chunkLen+16]
-	if _, err := io.ReadFull(c.Conn, enc); err != nil {
-		return 0, err
-	}
+
 	plain, err := c.readAEAD.Open(enc[:0], c.readNonce[:], enc, nil)
 	if err != nil {
 		return 0, err
@@ -429,8 +485,6 @@ func (c *ssAEADStreamConn) Write(p []byte) (int, error) {
 			if err != nil {
 				return totalWritten, err
 			}
-			c.writeAEAD = aead
-
 			if c.is2022 {
 				// SS2022 response: ServerSalt + AEAD(Type=1 | TS(8) | ReqSalt | uint16(len(chunk))) + AEAD(chunk)
 				hdrPlain := make([]byte, 1+8+len(c.reqSalt)+2)
@@ -439,16 +493,19 @@ func (c *ssAEADStreamConn) Write(p []byte) (int, error) {
 				copy(hdrPlain[9:], c.reqSalt)
 				binary.BigEndian.PutUint16(hdrPlain[9+len(c.reqSalt):], uint16(len(chunk)))
 
+				var initNonce [12]byte
 				out := make([]byte, 0, c.cs.saltSize+len(hdrPlain)+16+len(chunk)+16)
 				out = append(out, srvSalt[:c.cs.saltSize]...)
-				out = c.writeAEAD.Seal(out, c.writeNonce[:], hdrPlain, nil)
-				incNonce(&c.writeNonce)
-				out = c.writeAEAD.Seal(out, c.writeNonce[:], chunk, nil)
-				incNonce(&c.writeNonce)
+				out = aead.Seal(out, initNonce[:], hdrPlain, nil)
+				incNonce(&initNonce)
+				out = aead.Seal(out, initNonce[:], chunk, nil)
+				incNonce(&initNonce)
 
 				if _, err := c.Conn.Write(out); err != nil {
 					return totalWritten, err
 				}
+				c.writeAEAD = aead
+				c.writeNonce = initNonce
 				totalWritten += len(chunk)
 				continue
 			}
@@ -456,6 +513,7 @@ func (c *ssAEADStreamConn) Write(p []byte) (int, error) {
 			if _, err := c.Conn.Write(srvSalt[:c.cs.saltSize]); err != nil {
 				return totalWritten, err
 			}
+			c.writeAEAD = aead
 		}
 
 		bp := bufpool.Get(2 + 16 + len(chunk) + 16)
@@ -734,7 +792,11 @@ func (s *Server) pipeSSUDPReply(
 		s.tracker.NodeLimiter.Wait(n)
 		sess.user.AddDownload(int64(n))
 
-		// Build SOCKS5Addr + payload
+		// Build SOCKS5Addr + payload (guard nil IP from unexpected raddr types)
+		if ua.IP == nil {
+			bufpool.Put(bp)
+			continue
+		}
 		ip4 := ua.IP.To4()
 		plain := make([]byte, 0, 22+n)
 		if ip4 != nil {

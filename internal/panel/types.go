@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -81,6 +82,7 @@ type Client interface {
 	PushTraffic(ctx context.Context, batch []stats.TrafficDelta) error
 	PushAlive(ctx context.Context, alive map[int][]string) error
 	PushStatus(ctx context.Context, st SystemStatus) error
+	ClearNodeConfigETag()
 }
 
 func NewClient(cfg *config.Config) (Client, error) {
@@ -128,5 +130,22 @@ func NewKeepAliveHTTPClient(maxPerHost int) *http.Client {
 	return &http.Client{
 		Transport: tr,
 		Timeout:   45 * time.Second,
+		// Only follow same-host redirects without HTTPS->HTTP downgrade (and never
+		// forward Referer) so API keys/tokens in URL query params cannot leak to
+		// third-party hosts while legitimate http->https panel redirects still work.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 || len(via) == 0 {
+				return http.ErrUseLastResponse
+			}
+			orig := via[0].URL
+			if !strings.EqualFold(req.URL.Hostname(), orig.Hostname()) {
+				return http.ErrUseLastResponse
+			}
+			if strings.EqualFold(orig.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+				return http.ErrUseLastResponse
+			}
+			req.Header.Del("Referer")
+			return nil
+		},
 	}
 }

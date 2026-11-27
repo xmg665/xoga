@@ -498,7 +498,10 @@ func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, 
 
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer func() {
+			_ = vmConn.Close()
+			close(done)
+		}()
 		bp := bufpool.Get(bufpool.MaxUDPSize)
 		buf := *bp
 		defer bufpool.Put(bp)
@@ -578,18 +581,22 @@ type vmessStreamConn struct {
 	respKey [16]byte
 	respIV  [16]byte
 
-	readMu         sync.Mutex
-	readAEAD       cipher.AEAD
-	readLegacyCFB  bool
-	readMask       sha3.ShakeHash
-	readCount      uint16
-	hasPendingMask bool
-	pendingPadLen  int
-	pendingMask    uint16
-	hdrBytes       [2]byte
-	hdrRead        int
-	readBuf        *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
-	leftover       []byte
+	readMu           sync.Mutex
+	readAEAD         cipher.AEAD
+	readLegacyCFB    bool
+	readMask         sha3.ShakeHash
+	readCount        uint16
+	hasPendingMask   bool
+	pendingPadLen    int
+	pendingMask      uint16
+	hdrBytes         [2]byte
+	hdrRead          int
+	pendingChunkBuf  *[]byte // preserves partial chunk body across short timeouts (e.g. 150ms SNI peek)
+	pendingChunkSize int
+	pendingChunkPad  int
+	pendingChunkRead int
+	readBuf          *[]byte // pooled buffer held ONLY while unread leftover bytes remain in current chunk
+	leftover         []byte
 
 	writeMu      sync.Mutex
 	sentResp     bool
@@ -607,8 +614,15 @@ func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV,
 	if br == nil {
 		br = c
 	}
+	// L6 fix: VMess Zero (0x06) uses raw stream mode for TCP, and plain unmasked
+	// 2-byte length framing for UDP (no AEAD overhead, no chunk mask), matching Xray.
+	// Reject AEAD ciphers (0x03, 0x04) without ChunkStream bit — that combination
+	// is undefined in VMess and would bypass body encryption via rawStream.
+	if (secType == 0x03 || secType == 0x04) && (opt&0x01) == 0 {
+		return nil, errors.New("VMess AEAD cipher requires ChunkStream (opt & 0x01)")
+	}
 	rawStream := !isUDP && (secType == 0x06 || (opt&0x01) == 0)
-	chunkMask := !rawStream && (opt&0x04) != 0
+	chunkMask := !rawStream && (opt&0x04) != 0 && secType != 0x06
 	wsFast, _ := c.(wsPrependWriter)
 	vc := &vmessStreamConn{
 		Conn:         c,
@@ -712,6 +726,13 @@ func (v *vmessStreamConn) releaseReadBuf() {
 		v.readBuf = nil
 		v.leftover = nil
 	}
+	if v.pendingChunkBuf != nil {
+		bufpool.Put(v.pendingChunkBuf)
+		v.pendingChunkBuf = nil
+		v.pendingChunkSize = 0
+		v.pendingChunkPad = 0
+		v.pendingChunkRead = 0
+	}
 	v.readMu.Unlock()
 }
 
@@ -747,64 +768,91 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 		return v.reader.Read(dst)
 	}
 
-	// Preserve Shake128 mask & partial 2-byte length progress across 150ms SNI peek timeouts!
-	if !v.hasPendingMask {
-		v.pendingPadLen = 0
-		if v.optGlobalPad {
-			v.pendingPadLen = int(v.nextMask(v.readMask) % 64)
-		}
-		v.pendingMask = v.nextMask(v.readMask)
-		v.hasPendingMask = true
-	}
-
-	for v.hdrRead < 2 {
-		n, err := v.reader.Read(v.hdrBytes[v.hdrRead:2])
-		v.hdrRead += n
-		if err != nil {
-			return 0, err
-		}
-	}
-	padLen := v.pendingPadLen
-	sizeMask := v.pendingMask
-	v.hdrRead = 0
-	v.hasPendingMask = false
-
-	size := int(binary.BigEndian.Uint16(v.hdrBytes[:]) ^ sizeMask)
-
 	overhead := 0
 	if v.readAEAD != nil {
 		overhead = v.readAEAD.Overhead()
 	} else if v.readLegacyCFB {
 		overhead = 4
 	}
-	if size == overhead+padLen {
-		if size > 0 {
-			var eofBuf [128]byte
-			if _, err := io.ReadFull(v.reader, eofBuf[:size]); err != nil {
+
+	// Preserve both the 2-byte length header AND partial chunk body across short timeouts
+	// (e.g. 150ms SNI peek) without ever clobbering caller-set deadlines.
+	if v.pendingChunkBuf == nil {
+		if !v.hasPendingMask {
+			v.pendingPadLen = 0
+			if v.optGlobalPad {
+				v.pendingPadLen = int(v.nextMask(v.readMask) % 64)
+			}
+			v.pendingMask = v.nextMask(v.readMask)
+			v.hasPendingMask = true
+		}
+
+		for v.hdrRead < 2 {
+			n, err := v.reader.Read(v.hdrBytes[v.hdrRead:2])
+			v.hdrRead += n
+			if err != nil {
 				return 0, err
 			}
-			if v.readAEAD != nil {
-				var nonce [12]byte
-				binary.BigEndian.PutUint16(nonce[0:2], v.readCount)
-				copy(nonce[2:12], v.reqIV[2:12])
-				v.readCount++
-				if _, err := v.readAEAD.Open(eofBuf[:0], nonce[:], eofBuf[:overhead], nil); err != nil {
-					return 0, err
-				}
+		}
+		padLen := v.pendingPadLen
+		sizeMask := v.pendingMask
+		v.hdrRead = 0
+		v.hasPendingMask = false
+
+		size := int(binary.BigEndian.Uint16(v.hdrBytes[:]) ^ sizeMask)
+		if size == 0 && overhead == 0 && padLen == 0 {
+			return 0, io.EOF
+		}
+		if size < overhead+padLen || size > 65535 {
+			return 0, errors.New("vmess: corrupted chunk size")
+		}
+		v.pendingChunkBuf = bufpool.Get(size)
+		v.pendingChunkSize = size
+		v.pendingChunkPad = padLen
+		v.pendingChunkRead = 0
+	}
+
+	chunk := (*v.pendingChunkBuf)[:v.pendingChunkSize]
+	for v.pendingChunkRead < v.pendingChunkSize {
+		n, err := v.reader.Read(chunk[v.pendingChunkRead:v.pendingChunkSize])
+		v.pendingChunkRead += n
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return 0, err
+			}
+			bufpool.Put(v.pendingChunkBuf)
+			v.pendingChunkBuf = nil
+			v.pendingChunkSize = 0
+			v.pendingChunkPad = 0
+			v.pendingChunkRead = 0
+			return 0, err
+		}
+	}
+
+	bp := v.pendingChunkBuf
+	size := v.pendingChunkSize
+	padLen := v.pendingChunkPad
+	v.pendingChunkBuf = nil
+	v.pendingChunkSize = 0
+	v.pendingChunkPad = 0
+	v.pendingChunkRead = 0
+
+	if size == overhead+padLen {
+		if v.readAEAD != nil {
+			var nonce [12]byte
+			binary.BigEndian.PutUint16(nonce[0:2], v.readCount)
+			copy(nonce[2:12], v.reqIV[2:12])
+			v.readCount++
+			if _, err := v.readAEAD.Open(chunk[:0], nonce[:], chunk[:overhead], nil); err != nil {
+				bufpool.Put(bp)
+				return 0, err
 			}
 		}
-		return 0, io.EOF
-	}
-	if size <= overhead+padLen || size > 65535 {
+		bufpool.Put(bp)
 		return 0, io.EOF
 	}
 
-	bp := bufpool.Get(size)
-	chunk := (*bp)[:size]
-	if _, err := io.ReadFull(v.reader, chunk); err != nil {
-		bufpool.Put(bp)
-		return 0, err
-	}
 	encData := chunk[:size-padLen]
 
 	plain := encData

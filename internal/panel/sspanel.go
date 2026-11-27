@@ -65,6 +65,12 @@ func (c *SSPanelClient) Name() string {
 	return "SSPanel(mod_mu)"
 }
 
+func (c *SSPanelClient) ClearNodeConfigETag() {
+	c.mu.Lock()
+	c.nodeETag = ""
+	c.mu.Unlock()
+}
+
 func (c *SSPanelClient) modURL(path string, includeNodeID bool) string {
 	q := url.Values{}
 	q.Set("key", c.cfg.WebAPIKey)
@@ -149,7 +155,7 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 
 	var resp sspanelNodeResp
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode SSPanel node info: %w", err)
+		return nil, fmt.Errorf("decode SSPanel node info: %w (body: %s)", err, truncateMsg(body))
 	}
 	if resp.Ret != 1 {
 		return nil, fmt.Errorf("SSPanel node info returned ret=%d", resp.Ret)
@@ -219,9 +225,9 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 			if s, ok := cc["sni"].(string); ok && s != "" {
 				spec.ServerName = s
 			}
-			if parseAnyInt(cc["security"]) == 2 || cc["security"] == "reality" || cc["reality"] == "1" || cc["reality"] == true {
+			if parseAnyInt(cc["security"]) == 2 || cc["security"] == "reality" || cc["reality"] == "1" || cc["reality"] == true || parseAnyInt(cc["reality"]) == 1 {
 				spec.TLSMode = 2
-			} else if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true {
+			} else if parseAnyInt(cc["security"]) > 0 || cc["security"] == "tls" || cc["tls"] == "1" || cc["tls"] == true || parseAnyInt(cc["tls"]) > 0 {
 				spec.TLSMode = 1
 			}
 			if pStr, ok := cc["protocol"].(string); ok {
@@ -233,7 +239,7 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 					spec.Protocol = np
 				}
 			}
-			if cc["enable_vless"] == "1" || cc["enable_vless"] == true || cc["vless"] == "1" || cc["vless"] == true {
+			if cc["enable_vless"] == "1" || cc["enable_vless"] == true || parseAnyInt(cc["enable_vless"]) == 1 || cc["vless"] == "1" || cc["vless"] == true || parseAnyInt(cc["vless"]) == 1 {
 				spec.Protocol = "vless"
 			}
 			if s, ok := cc["flow"].(string); ok && s != "" {
@@ -596,7 +602,7 @@ func (c *SSPanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, e
 
 	var resp sspanelUsersResp
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode SSPanel users: %w", err)
+		return nil, fmt.Errorf("decode SSPanel users: %w (body: %s)", err, truncateMsg(body))
 	}
 	if resp.Ret != 1 {
 		return nil, fmt.Errorf("SSPanel users returned ret=%d", resp.Ret)

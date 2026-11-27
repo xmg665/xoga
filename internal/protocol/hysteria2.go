@@ -59,13 +59,20 @@ func (s *Server) startHysteria2(addr string) error {
 	}
 
 	pktConn := rawUDP
-	if s.spec.Hy2Obfs == "salamander" && s.spec.Hy2ObfsPassword != "" {
+	if s.spec.Hy2Obfs == "salamander" {
+		if s.spec.Hy2ObfsPassword == "" {
+			_ = rawUDP.Close()
+			return fmt.Errorf("init hysteria2: salamander obfs requires a password")
+		}
 		obfsConn, oerr := newSalamanderPacketConn(rawUDP, []byte(s.spec.Hy2ObfsPassword))
 		if oerr != nil {
 			_ = rawUDP.Close()
 			return fmt.Errorf("init hysteria2 salamander obfs: %w", oerr)
 		}
 		pktConn = obfsConn
+	} else if s.spec.Hy2Obfs != "" {
+		_ = rawUDP.Close()
+		return fmt.Errorf("init hysteria2: unsupported obfs type %q", s.spec.Hy2Obfs)
 	}
 	s.udpConn = pktConn
 
@@ -95,6 +102,7 @@ func (s *Server) startHysteria2(addr string) error {
 	if err != nil {
 		_ = qtr.Close()
 		_ = pktConn.Close()
+		tp.Close()
 		return fmt.Errorf("listen hysteria2 quic %s: %w", addr, err)
 	}
 	s.hy2Transport = qtr
@@ -123,6 +131,7 @@ func (s *Server) acceptHysteria2Loop(qln *quic.Listener) {
 			if s.closed.Load() {
 				return
 			}
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
 		go s.handleHy2Conn(qconn)
@@ -138,6 +147,7 @@ type hy2ConnState struct {
 	user       atomic.Pointer[stats.UserEntry]
 	sessConnID uint64
 	udpOnce    sync.Once
+	closed     bool // guarded by authMu; prevents ServeHTTP from acquiring after handleHy2Conn cleanup
 }
 
 func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -145,9 +155,20 @@ func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.authMu.Lock()
 		defer h.authMu.Unlock()
 
+		if h.closed || h.qconn.Context().Err() != nil {
+			http.NotFound(w, r)
+			return
+		}
+
 		if cur := h.user.Load(); h.authed.Load() && cur != nil && !cur.IsDisabled() {
 			h.writeAuthOK(w)
 			return
+		}
+
+		// Release old mux session and counters before re-authenticating with potentially different user
+		if oldUser := h.user.Swap(nil); oldUser != nil {
+			oldUser.ReleaseMuxSession(h.sessConnID)
+			h.sessConnID = 0
 		}
 
 		cred := strings.TrimSpace(r.Header.Get("Hysteria-Auth"))
@@ -208,6 +229,7 @@ func (s *Server) handleHy2Conn(qconn *quic.Conn) {
 		s.untrackConn(srvCID)
 		_ = qconn.CloseWithError(0, "")
 		state.authMu.Lock()
+		state.closed = true
 		u := state.user.Swap(nil)
 		cid := state.sessConnID
 		state.sessConnID = 0
@@ -231,6 +253,16 @@ func (s *Server) handleHy2Conn(qconn *quic.Conn) {
 	}
 
 	ctx := qconn.Context()
+
+	// L5: Close unauthenticated connections after 30 seconds to prevent
+	// idle QUIC connections with PING keeping them alive indefinitely.
+	authTimer := time.AfterFunc(30*time.Second, func() {
+		if !state.authed.Load() {
+			_ = qconn.CloseWithError(0, "auth timeout")
+		}
+	})
+	defer authTimer.Stop()
+
 	go func() {
 		for {
 			uni, uerr := qconn.AcceptUniStream(ctx)
@@ -371,7 +403,7 @@ func (h *hy2ConnState) serveDatagrams() {
 
 	var mu sync.Mutex
 	sessions := make(map[uint32]*hy2UDPSess)
-	frags := make(map[uint32]*hy2FragAssembly)
+	frags := make(map[uint64]*hy2FragAssembly)
 	var outPktID atomic.Uint32
 
 	defer func() {
@@ -399,12 +431,13 @@ func (h *hy2ConnState) serveDatagrams() {
 		}
 
 		if fragCnt > 1 {
-			if fragID >= fragCnt || fragCnt > 32 {
+			if fragID >= fragCnt || fragCnt > 255 {
 				continue
 			}
+			fragKey := uint64(sessID)<<32 | uint64(pktID)
 			mu.Lock()
-			fa, ok := frags[sessID]
-			if !ok || fa.pktID != pktID || fa.count != fragCnt || time.Since(fa.created) > 5*time.Second {
+			fa, ok := frags[fragKey]
+			if !ok || fa.count != fragCnt || time.Since(fa.created) > 5*time.Second {
 				if !ok && len(frags) >= 128 {
 					now := time.Now()
 					for k, old := range frags {
@@ -426,7 +459,7 @@ func (h *hy2ConnState) serveDatagrams() {
 					parts:   make([][]byte, fragCnt),
 					created: time.Now(),
 				}
-				frags[sessID] = fa
+				frags[fragKey] = fa
 			}
 			if fa.parts[fragID] == nil {
 				cp := make([]byte, len(payload))
@@ -451,7 +484,7 @@ func (h *hy2ConnState) serveDatagrams() {
 			}
 			addrStr = fa.addr
 			payload = merged
-			delete(frags, sessID)
+			delete(frags, fragKey)
 			mu.Unlock()
 		}
 

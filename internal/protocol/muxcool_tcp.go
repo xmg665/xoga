@@ -32,7 +32,7 @@ type muxTCPSubSession struct {
 
 func newMuxTCPSubSession() *muxTCPSubSession {
 	return &muxTCPSubSession{
-		txCh:   make(chan []byte, 64),
+		txCh:   make(chan []byte, 128),
 		txDone: make(chan struct{}),
 	}
 }
@@ -54,11 +54,12 @@ func (m *muxTCPSubSession) enqueue(data []byte) bool {
 		m.txMu.Unlock()
 		return true
 	default:
-		// Queue full: block without holding txMu. closeClientTx waits for txSends
-		// before closing txCh, so this send can never hit a closed channel.
+		// L1 fix: wait briefly (250ms) so transient upload bursts during DialOutbound
+		// or rate-limiting succeed, without causing the old 10s head-of-line stall
+		// across sibling mux sub-streams. closeClientTx waits for txSends before closing txCh.
 		m.txSends.Add(1)
 		m.txMu.Unlock()
-		timer := time.NewTimer(10 * time.Second)
+		timer := time.NewTimer(250 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case m.txCh <- cp:

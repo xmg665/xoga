@@ -17,7 +17,7 @@ var (
 	vmessDiagCount atomic.Int32
 )
 
-const vmessDiagPerSec = 5
+const vmessDiagPerSec = 2
 
 func vmessDiagAllowed() bool {
 	now := time.Now().Unix()
@@ -42,6 +42,11 @@ func diagnoseUnmatchedVMess(idx *UserIndex, authID [16]byte) (string, int, int64
 		if crc32.ChecksumIEEE(scratch[:12]) == binary.BigEndian.Uint32(scratch[12:16]) {
 			return "aead_clock_skew", idx.VMessUsers[i].User.ID, int64(binary.BigEndian.Uint64(scratch[:8])) - now
 		}
+	}
+	// L4 fix: skip the O(N*241) HMAC-MD5 legacy scan when there are many users;
+	// AEAD is the standard authentication mode and the scan above already covers it.
+	if len(idx.VMessUsers) > 100 {
+		return "unknown_skipped_legacy", 0, 0
 	}
 	var stamp [8]byte
 	var tag [16]byte

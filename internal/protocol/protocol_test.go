@@ -238,10 +238,7 @@ func TestShadowsocks2022MultiUserEIH(t *testing.T) {
 	_, _ = rand.Read(reqSalt[:])
 
 	var userEIH [16]byte
-	blake3DeriveKey("shadowsocks 2022 identity subkey", usrKeyRaw[:], userEIH[:])
-	for i := 0; i < 16; i++ {
-		userEIH[i] ^= reqSalt[i]
-	}
+	blake3Hash("shadowsocks 2022 identity subkey", usrKeyRaw[:], userEIH[:])
 	var idMat [32]byte
 	copy(idMat[0:16], srvKeyRaw[:])
 	copy(idMat[16:32], reqSalt[:])

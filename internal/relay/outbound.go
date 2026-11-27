@@ -148,6 +148,12 @@ func dialDirectWithDNSAndRoute(
 	tryDialCandidates := func(cands []netip.Addr) (net.Conn, error) {
 		var lastDialErr error
 		limit := min(len(cands), 3)
+		perAttempt := timeout
+		if limit > 1 && timeout > 4*time.Second {
+			// Cap each attempt when multiple candidates exist so one blackholed IP
+			// doesn't exhaust the entire dial budget before trying the next candidate.
+			perAttempt = max(timeout/2, 4*time.Second)
+		}
 		for i := 0; i < limit; i++ {
 			ip := cands[i].Unmap()
 			if !route.AllowResolvedIP(ip) {
@@ -155,7 +161,7 @@ func dialDirectWithDNSAndRoute(
 				continue
 			}
 			d := net.Dialer{
-				Timeout:   timeout,
+				Timeout:   perAttempt,
 				KeepAlive: 45 * time.Second,
 			}
 			if ip.Is4() && out.ListenIPv4 != "" {
@@ -188,7 +194,11 @@ func dialDirectWithDNSAndRoute(
 		return c, nil
 	}
 	// Dual-stack graceful fallback: if ipv6_first resolved only AAAA and the host lacks IPv6 routing, fall back to A!
-	if strat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() {
+	effStrat := strat
+	if !hasStrat {
+		effStrat = resolver.DefaultStrategy()
+	}
+	if effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() {
 		if v4s, v4err := resolver.ResolveAll(dialCtx, host, dns.StrategyIPv4Only, true); v4err == nil && len(v4s) > 0 {
 			if c4, err4 := tryDialCandidates(v4s); err4 == nil {
 				return c4, nil
@@ -259,7 +269,8 @@ func dialProxyTransport(ctx context.Context, out acl.OutboundNode, resolver *dns
 	_ = rawConn.SetDeadline(time.Now().Add(timeout))
 
 	conn := rawConn
-	if out.TLS || out.Type == "trojan" || out.Type == "https" {
+	outType := strings.ToLower(out.Type)
+	if out.TLS || outType == "trojan" || outType == "https" {
 		sni := out.SNI
 		if sni == "" {
 			sni = out.Server
@@ -276,7 +287,7 @@ func dialProxyTransport(ctx context.Context, out acl.OutboundNode, resolver *dns
 		conn = tlsConn
 	}
 
-	if out.Network == "ws" {
+	if strings.ToLower(out.Network) == "ws" {
 		wsConn, err := clientWSHandshake(conn, out)
 		if err != nil {
 			_ = conn.Close()
@@ -353,6 +364,9 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 			return nil, err
 		}
 		skip = int(l[0]) + 2
+	default:
+		c.Close()
+		return nil, fmt.Errorf("socks5 connect: unsupported ATYP 0x%02x", rhead[3])
 	}
 	if skip > 0 {
 		var discard [260]byte
@@ -1064,7 +1078,19 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 			c.Close()
 			return nil, err
 		}
+		// Resolve domain BND.ADDR to IP respecting ctx so relayAddr is usable
+		domainName := string(b[:l[0]])
 		bndPort = int(binary.BigEndian.Uint16(b[l[0]:]))
+		if resolver != nil {
+			if addr, rerr := resolver.Resolve(ctx, domainName, dns.StrategyIPv4First, false); rerr == nil && addr.IsValid() {
+				bndIP = net.IP(addr.AsSlice())
+			}
+		}
+		if len(bndIP) == 0 {
+			if ips, lerr := net.DefaultResolver.LookupIPAddr(ctx, domainName); lerr == nil && len(ips) > 0 {
+				bndIP = ips[0].IP
+			}
+		}
 	default:
 		c.Close()
 		return nil, errors.New("socks5 udp unknown atyp")
@@ -1143,9 +1169,17 @@ func (s *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	raw := *bp
 	defer bufpool.Put(bp)
 	for {
-		n, _, err := s.PacketConn.ReadFrom(raw)
+		n, fromAddr, err := s.PacketConn.ReadFrom(raw)
 		if err != nil {
 			return 0, nil, err
+		}
+		// Verify packet source matches relay address to prevent UDP injection from spoofed sources
+		if s.relayAddr != nil {
+			if ua, ok := fromAddr.(*net.UDPAddr); ok {
+				if !ua.IP.Equal(s.relayAddr.IP) || ua.Port != s.relayAddr.Port {
+					continue
+				}
+			}
 		}
 		if n < 10 || raw[2] != 0x00 { // ignore fragmented or malformed SOCKS5 UDP packets
 			continue
@@ -1174,6 +1208,11 @@ func (s *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				continue
 			}
 			srcIP = net.ParseIP(string(raw[pos : pos+dlen]))
+			if srcIP == nil {
+				// Domain ATYP that doesn't parse as IP — skip packet to avoid nil IP in returned addr
+				pos += dlen
+				continue
+			}
 			pos += dlen
 		default:
 			continue

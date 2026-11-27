@@ -247,12 +247,20 @@ type wsConn struct {
 	remoteAddr net.Addr
 	closeOnce  sync.Once
 
-	readMu   sync.Mutex
-	pending  []byte
-	frameRem int64
-	maskKey  [4]byte
-	masked   bool
-	maskPos  int
+	readMu      sync.Mutex
+	pending     []byte
+	frameRem    int64
+	maskKey     [4]byte
+	masked      bool
+	maskPos     int
+	hdrBuf      [14]byte // preserves partial WS frame header across read timeouts
+	hdrRead     int
+	ctrlOp      byte // 0=none, 0x9=ping, 0xFF=discard
+	ctrlRem     int64
+	ctrlMasked  bool
+	ctrlMaskKey [4]byte
+	ctrlBuf     [125]byte
+	ctrlRead    int
 
 	writeMu sync.Mutex
 }
@@ -296,30 +304,87 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	for w.frameRem == 0 {
-		var hdr [2]byte
-		if _, err := io.ReadFull(w.br, hdr[:]); err != nil {
-			return 0, err
+		if w.ctrlOp != 0 {
+			if w.ctrlOp == 0x9 {
+				for w.ctrlRem > 0 {
+					n, err := w.br.Read(w.ctrlBuf[w.ctrlRead : w.ctrlRead+int(w.ctrlRem)])
+					w.ctrlRead += n
+					w.ctrlRem -= int64(n)
+					if err != nil {
+						return 0, err
+					}
+				}
+				pingData := w.ctrlBuf[:w.ctrlRead]
+				if w.ctrlMasked {
+					for i := range pingData {
+						pingData[i] ^= w.ctrlMaskKey[i&3]
+					}
+				}
+				w.ctrlOp = 0
+				w.ctrlRead = 0
+				_ = w.writeControlFrame(0xA, pingData)
+				continue
+			}
+			var discardBuf [256]byte
+			for w.ctrlRem > 0 {
+				want := int64(len(discardBuf))
+				if want > w.ctrlRem {
+					want = w.ctrlRem
+				}
+				n, err := w.br.Read(discardBuf[:want])
+				w.ctrlRem -= int64(n)
+				if err != nil {
+					return 0, err
+				}
+			}
+			w.ctrlOp = 0
+			continue
 		}
-		opcode := hdr[0] & 0x0F
-		masked := (hdr[1] & 0x80) != 0
-		payLen := int64(hdr[1] & 0x7F)
 
-		switch payLen {
+		// Preserve partial WS frame header bytes across short read deadlines (e.g. 150ms SNI peek)
+		// so a split header can never desynchronize the WebSocket stream.
+		for w.hdrRead < 2 {
+			n, err := w.br.Read(w.hdrBuf[w.hdrRead:2])
+			w.hdrRead += n
+			if err != nil {
+				return 0, err
+			}
+		}
+		opcode := w.hdrBuf[0] & 0x0F
+		masked := (w.hdrBuf[1] & 0x80) != 0
+		lenCode := w.hdrBuf[1] & 0x7F
+		need := 2
+		if lenCode == 126 {
+			need += 2
+		} else if lenCode == 127 {
+			need += 8
+		}
+		if masked {
+			need += 4
+		}
+		for w.hdrRead < need {
+			n, err := w.br.Read(w.hdrBuf[w.hdrRead:need])
+			w.hdrRead += n
+			if err != nil {
+				return 0, err
+			}
+		}
+		w.hdrRead = 0
+
+		pos := 2
+		var payLen int64
+		switch lenCode {
 		case 126:
-			var ext [2]byte
-			if _, err := io.ReadFull(w.br, ext[:]); err != nil {
-				return 0, err
-			}
-			payLen = int64(binary.BigEndian.Uint16(ext[:]))
+			payLen = int64(binary.BigEndian.Uint16(w.hdrBuf[pos : pos+2]))
+			pos += 2
 		case 127:
-			var ext [8]byte
-			if _, err := io.ReadFull(w.br, ext[:]); err != nil {
-				return 0, err
-			}
-			payLen = int64(binary.BigEndian.Uint64(ext[:]))
+			payLen = int64(binary.BigEndian.Uint64(w.hdrBuf[pos : pos+8]))
+			pos += 8
 			if payLen < 0 || payLen > 16*1024*1024 {
 				return 0, errors.New("websocket frame too large")
 			}
+		default:
+			payLen = int64(lenCode)
 		}
 
 		if opcode >= 0x8 && payLen > 125 {
@@ -328,9 +393,7 @@ func (w *wsConn) Read(p []byte) (int, error) {
 
 		var mkey [4]byte
 		if masked {
-			if _, err := io.ReadFull(w.br, mkey[:]); err != nil {
-				return 0, err
-			}
+			copy(mkey[:], w.hdrBuf[pos:pos+4])
 		}
 
 		switch opcode {
@@ -342,28 +405,19 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		case 0x8: // close
 			return 0, io.EOF
 		case 0x9: // ping -> reply pong
-			var pingBuf [125]byte
-			pingData := pingBuf[:payLen]
-			if _, err := io.ReadFull(w.br, pingData); err != nil {
-				return 0, err
+			if payLen == 0 {
+				_ = w.writeControlFrame(0xA, nil)
+			} else {
+				w.ctrlOp = 0x9
+				w.ctrlRem = payLen
+				w.ctrlMasked = masked
+				w.ctrlMaskKey = mkey
+				w.ctrlRead = 0
 			}
-			if masked {
-				for i := range pingData {
-					pingData[i] ^= mkey[i&3]
-				}
-			}
-			_ = w.writeControlFrame(0xA, pingData)
-		case 0xA: // pong -> discard
+		default: // pong (0xA) and unknown opcodes -> discard payload
 			if payLen > 0 {
-				if _, err := io.CopyN(io.Discard, w.br, payLen); err != nil {
-					return 0, err
-				}
-			}
-		default:
-			if payLen > 0 {
-				if _, err := io.CopyN(io.Discard, w.br, payLen); err != nil {
-					return 0, err
-				}
+				w.ctrlOp = 0xFF
+				w.ctrlRem = payLen
 			}
 		}
 	}
@@ -489,6 +543,7 @@ func (w *wsConn) writeControlFrame(opcode byte, payload []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 	_ = w.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	defer func() { _ = w.Conn.SetWriteDeadline(time.Time{}) }()
 	hdr := [2]byte{0x80 | opcode, byte(len(payload))}
 	bufs := net.Buffers{hdr[:], payload}
 	_, err := bufs.WriteTo(w.rawWriter)

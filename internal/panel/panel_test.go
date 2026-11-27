@@ -361,3 +361,50 @@ func TestSSPanelDualCredentialsAndUniProxyAliveSumFixes(t *testing.T) {
 		t.Fatalf("expected summed traffic [1500, 2300], got %+v", gotSum)
 	}
 }
+
+func TestPanelRedirectPolicyAndTruncateMsg(t *testing.T) {
+	if got := truncateMsg([]byte("<html>\r\n<head><title>405 Not Allowed</title></head>\n<body>405</body>\n</html>")); got != "<html> <head><title>405 Not Allowed</title></head> <body>405</body> </html>" {
+		t.Fatalf("truncateMsg did not collapse newlines: %q", got)
+	}
+
+	cli := NewKeepAliveHTTPClient(2)
+
+	// Same-host redirect should be followed cleanly without sending Referer
+	var sawReferer string
+	sameHostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/old" {
+			http.Redirect(w, r, "/new", http.StatusMovedPermanently)
+			return
+		}
+		sawReferer = r.Header.Get("Referer")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer sameHostSrv.Close()
+
+	resp, err := cli.Get(sameHostSrv.URL + "/old?key=secret")
+	if err != nil {
+		t.Fatalf("same-host redirect failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after same-host redirect, got %d", resp.StatusCode)
+	}
+	if sawReferer != "" {
+		t.Fatalf("expected empty Referer on redirect, got %q", sawReferer)
+	}
+
+	// Cross-host redirect must NOT be followed
+	crossSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.example.com/steal", http.StatusFound)
+	}))
+	defer crossSrv.Close()
+
+	resp2, err := cli.Get(crossSrv.URL + "/start?key=secret")
+	if err != nil {
+		t.Fatalf("cross-host redirect returned unexpected err: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 (not followed) on cross-host redirect, got %d", resp2.StatusCode)
+	}
+}

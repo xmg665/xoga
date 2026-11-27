@@ -199,7 +199,7 @@ func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, 
 				mk = deriveSSUserKey(secret, ssKeyLen)
 			}
 			var eih [16]byte
-			blake3DeriveKey("shadowsocks 2022 identity subkey", mk, eih[:])
+			blake3Hash("shadowsocks 2022 identity subkey", mk, eih[:])
 			entry := SSUserEntry{
 				User:      u,
 				MasterKey: mk,
@@ -516,8 +516,8 @@ func (s *Server) acceptLoop() {
 				return
 			}
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Temporary() {
-				time.Sleep(20 * time.Millisecond)
+			if (errors.As(err, &ne) && ne.Temporary()) || strings.Contains(err.Error(), "too many open files") {
+				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 			return
@@ -696,7 +696,11 @@ func parseSOCKS5Addr(r io.Reader) (host string, port uint16, err error) {
 	if _, err = io.ReadFull(r, atyp[:]); err != nil {
 		return "", 0, err
 	}
-	switch atyp[0] {
+	return parseSOCKS5AddrWithAtyp(r, atyp[0])
+}
+
+func parseSOCKS5AddrWithAtyp(r io.Reader, atyp byte) (host string, port uint16, err error) {
+	switch atyp {
 	case 0x01: // IPv4
 		var buf [6]byte
 		if _, err = io.ReadFull(r, buf[:]); err != nil {
@@ -723,7 +727,7 @@ func parseSOCKS5Addr(r io.Reader) (host string, port uint16, err error) {
 		host = net.IP(buf[0:16]).String()
 		port = binary.BigEndian.Uint16(buf[16:18])
 	default:
-		return "", 0, fmt.Errorf("unsupported address type 0x%02x", atyp[0])
+		return "", 0, fmt.Errorf("unsupported address type 0x%02x", atyp)
 	}
 	return host, port, nil
 }

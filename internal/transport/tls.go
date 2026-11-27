@@ -24,8 +24,9 @@ import (
 )
 
 type acmeDomainEntry struct {
-	mgr  *autocert.Manager
-	refs int
+	mgr     *autocert.Manager
+	handler http.Handler
+	refs    int
 }
 
 var (
@@ -40,12 +41,14 @@ func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 	acmeHubMu.Lock()
 	ent := acmeManagers[key]
 	if ent == nil {
+		mgr := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(key),
+			Cache:      autocert.DirCache(cacheDir),
+		}
 		ent = &acmeDomainEntry{
-			mgr: &autocert.Manager{
-				Prompt:     autocert.AcceptTOS,
-				HostPolicy: autocert.HostWhitelist(domain),
-				Cache:      autocert.DirCache(cacheDir),
-			},
+			mgr:     mgr,
+			handler: mgr.HTTPHandler(nil),
 		}
 		acmeManagers[key] = ent
 	}
@@ -64,18 +67,18 @@ func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 				}
 				host = strings.ToLower(strings.TrimSpace(host))
 				acmeHubMu.RLock()
-				var m *autocert.Manager
+				var h http.Handler
 				if e := acmeManagers[host]; e != nil {
-					m = e.mgr
+					h = e.handler
 				} else {
 					for _, cand := range acmeManagers {
-						m = cand.mgr
+						h = cand.handler
 						break
 					}
 				}
 				acmeHubMu.RUnlock()
-				if m != nil {
-					m.HTTPHandler(nil).ServeHTTP(w, r)
+				if h != nil {
+					h.ServeHTTP(w, r)
 					return
 				}
 				http.NotFound(w, r)

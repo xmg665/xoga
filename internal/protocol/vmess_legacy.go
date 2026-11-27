@@ -12,6 +12,7 @@ import (
 
 // Legacy authentication is limited to explicitly configured users. The
 // 30-second window covers legacy clients that randomize their timestamps.
+// M4 fix: cap alterID iteration count at 16 to limit CPU cost from probe traffic.
 func (s *Server) readLegacyVMessHeader(idx *UserIndex, reader io.Reader, authID [16]byte) (*VMessUserEntry, []byte) {
 	now := time.Now().Unix()
 	for i := range idx.VMessUsers {
@@ -19,6 +20,9 @@ func (s *Server) readLegacyVMessHeader(idx *UserIndex, reader io.Reader, authID 
 		count, enabled := s.cfg.VMessLegacyUsers[entry.User.ID]
 		if !enabled || entry.User.IsDisabled() {
 			continue
+		}
+		if count > 16 {
+			count = 16
 		}
 		id := entry.User.UUIDBytes
 		for n := 0; n <= count; n++ {

@@ -142,12 +142,19 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
-		host, port, err := parseSOCKS5Addr(conn)
-		if err != nil {
+		// Read the first byte (ATYP) separately: only retry on timeout when 0 bytes
+		// were consumed so partial reads can never desynchronize the stream.
+		var atyp [1]byte
+		rn, err := conn.Read(atyp[:])
+		if rn == 0 {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
 				continue
 			}
+			break
+		}
+		host, port, err := parseSOCKS5AddrWithAtyp(conn, atyp[0])
+		if err != nil {
 			break
 		}
 		var lenCRLF [4]byte
@@ -189,7 +196,14 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 }
 
 func encodeTrojanUDPPacket(ua *net.UDPAddr, data []byte) []byte {
+	if ua == nil || ua.IP == nil {
+		return nil
+	}
 	ip4 := ua.IP.To4()
+	ip16 := ua.IP.To16()
+	if ip4 == nil && ip16 == nil {
+		return nil
+	}
 	addrLen := 1 + 16 + 2
 	if ip4 != nil {
 		addrLen = 1 + 4 + 2
@@ -200,7 +214,7 @@ func encodeTrojanUDPPacket(ua *net.UDPAddr, data []byte) []byte {
 		out = append(out, ip4...)
 	} else {
 		out = append(out, 0x04)
-		out = append(out, ua.IP.To16()...)
+		out = append(out, ip16...)
 	}
 	var p2 [2]byte
 	binary.BigEndian.PutUint16(p2[:], uint16(ua.Port))

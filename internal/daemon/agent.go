@@ -215,6 +215,12 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 		if !errors.Is(err, panel.ErrNotModified) {
 			return err
 		}
+		// On first sync, ErrNotModified means the ETag was latched but w.curSpec is nil.
+		// Clear the ETag so the next attempt re-fetches.
+		if first && w.curSpec == nil {
+			w.client.ClearNodeConfigETag()
+			return fmt.Errorf("empty node config (ETag cleared for retry)")
+		}
 	} else if newSpec != nil {
 		if w.curSpec == nil || listenerNeedsRestart(w.curSpec, newSpec) {
 			configChanged = true
@@ -257,6 +263,8 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 		srv, err := protocol.NewServer(w.cfg, effectiveSpec, w.tracker, idx, aclEng, w.dnsRes)
 		if err != nil {
 			// Keep old w.curServer & w.curSpec untouched if constructing new server failed!
+			// Clear ETags so next poll re-fetches config instead of getting 304.
+			w.client.ClearNodeConfigETag()
 			return err
 		}
 		w.curSpec = effectiveSpec

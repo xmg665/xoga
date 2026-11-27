@@ -318,11 +318,17 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		var lb [2]byte
-		if _, err := io.ReadFull(reader, lb[:]); err != nil {
+		// Read the first byte separately: if 0 bytes were read before timeout while
+		// downlink is still active, we can safely retry without desyncing framing.
+		rn, err := reader.Read(lb[:1])
+		if rn == 0 {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
 				continue
 			}
+			break
+		}
+		if _, err := io.ReadFull(reader, lb[1:]); err != nil {
 			break
 		}
 		pktLen := int(binary.BigEndian.Uint16(lb[:]))
@@ -619,7 +625,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 					user.AddDownload(int64(rn))
 
 					frame := encodeXUDPReplyFrame(subID, ua, rbuf[:rn])
-					if writeXUDP(frame) != nil {
+					if frame == nil || writeXUDP(frame) != nil {
 						return
 					}
 				}
@@ -642,6 +648,9 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 }
 
 func encodeXUDPReplyFrame(sid uint16, ua *net.UDPAddr, data []byte) []byte {
+	if ua == nil || ua.IP == nil {
+		return nil
+	}
 	ip4 := ua.IP.To4()
 	metaLen := 4 + 1 + 2 + 1 + 16
 	if ip4 != nil {

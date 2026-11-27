@@ -235,6 +235,14 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 	return r
 }
 
+// DefaultStrategy returns the resolver's configured default IPv4/IPv6 preference.
+func (r *Resolver) DefaultStrategy() Strategy {
+	if r == nil {
+		return StrategyIPv4First
+	}
+	return r.defaultStrategy
+}
+
 // SetCacheMinutes configures the maximum DNS cache TTL in minutes (`dns_cache_time` in soga.conf).
 func (r *Resolver) SetCacheMinutes(minutes int) {
 	if r != nil && minutes > 0 {
@@ -585,7 +593,7 @@ func exchangeTCP(ctx context.Context, addr string, wire []byte) ([]byte, error) 
 		return nil, err
 	}
 	respLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-	if respLen <= 12 || respLen > 16384 {
+	if respLen < 12 || respLen > 16384 {
 		return nil, errors.New("invalid TCP DNS response length")
 	}
 	resp := make([]byte, respLen)
@@ -634,7 +642,7 @@ func exchangeDoT(ctx context.Context, rawHost string, wire []byte) ([]byte, erro
 		return nil, err
 	}
 	respLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-	if respLen <= 12 || respLen > 16384 {
+	if respLen < 12 || respLen > 16384 {
 		return nil, errors.New("invalid DoT DNS response length")
 	}
 	resp := make([]byte, respLen)
@@ -697,11 +705,21 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID b
 	qdCount := int(binary.BigEndian.Uint16(msg[4:6]))
 	anCount := int(binary.BigEndian.Uint16(msg[6:8]))
 
+	// Validate QDCOUNT == 1 to prevent cache poisoning via crafted multi-question responses
+	if qdCount != 1 {
+		return nil, 0, fmt.Errorf("DNS QDCOUNT=%d (expected 1)", qdCount)
+	}
+
 	pos := 12
 	for i := 0; i < qdCount; i++ {
 		next, err := skipDNSName(msg, pos)
 		if err != nil || next+4 > len(msg) {
 			return nil, 0, errors.New("malformed DNS question")
+		}
+		// Validate QCLASS == IN (1) to reject non-Internet class responses
+		qclass := binary.BigEndian.Uint16(msg[next+2 : next+4])
+		if qclass != 1 {
+			return nil, 0, fmt.Errorf("DNS QCLASS=%d (expected IN=1)", qclass)
 		}
 		pos = next + 4
 	}
@@ -715,6 +733,7 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID b
 		}
 		pos = next
 		rrType := binary.BigEndian.Uint16(msg[pos : pos+2])
+		rrClass := binary.BigEndian.Uint16(msg[pos+2 : pos+4])
 		ttl := binary.BigEndian.Uint32(msg[pos+4 : pos+8])
 		rdLen := int(binary.BigEndian.Uint16(msg[pos+8 : pos+10]))
 		pos += 10
@@ -723,6 +742,11 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID b
 		}
 		rdata := msg[pos : pos+rdLen]
 		pos += rdLen
+
+		// Skip non-IN class RRs (prevents cache poisoning via injected CHAOS/etc class records)
+		if rrClass != 1 {
+			continue
+		}
 
 		if rrType == qtype {
 			if qtype == qTypeA && rdLen == 4 {
@@ -830,14 +854,18 @@ func (r *Resolver) reloadNow(initial bool) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.remoteURL, nil)
 		if err == nil {
 			if resp, derr := r.dohClient.Do(req); derr == nil {
-				raw, _ = io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					raw, _ = io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+				}
 				_ = resp.Body.Close()
 			}
 		}
 		cancel()
 	}
 
-	if len(raw) == 0 && r.configPath != "" {
+	// When a remote URL is configured, skip local file hot-reload to prevent
+	// overwriting remote config with stale local dns.yml on file mtime changes.
+	if len(raw) == 0 && r.configPath != "" && (r.remoteURL == "" || initial) {
 		st, err := os.Stat(r.configPath)
 		if err != nil {
 			if initial {
@@ -1033,6 +1061,8 @@ func ensurePort53(addr string) string {
 	if _, _, err := net.SplitHostPort(addr); err == nil {
 		return addr
 	}
+	// Strip outer brackets from bare IPv6 addresses like "[::1]" before JoinHostPort
+	addr = strings.TrimPrefix(strings.TrimSuffix(addr, "]"), "[")
 	return net.JoinHostPort(addr, "53")
 }
 

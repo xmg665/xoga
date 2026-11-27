@@ -10,7 +10,7 @@ import (
 const (
 	replayWords      = 16384             // 16384 * 64 = 1,048,576 bits (128 KiB per generation, <0.02% FP at 500 conn/s)
 	replayBitMask    = replayWords*64 - 1
-	replayWindowSecs = 65
+	replayWindowSecs = 240
 )
 
 // replayFilter implements a lock-free dual-generation rotating atomic Bloom filter (modeled after
@@ -20,7 +20,7 @@ type replayFilter struct {
 	gens     [2][replayWords]atomic.Uint64
 	active   atomic.Uint32
 	rotateAt atomic.Int64
-	rotMu    sync.Mutex
+	rotMu    sync.RWMutex
 }
 
 // CheckAndMark records a >=16-byte handshake token (AuthID or stream salt) and returns true
@@ -48,6 +48,8 @@ func (f *replayFilter) CheckAndMark(token []byte) bool {
 		h2 = 0x9e3779b97f4a7c15
 	}
 
+	// RLock prevents concurrent rotation from clearing the prev gen while we probe.
+	f.rotMu.RLock()
 	curIdx := f.active.Load() & 1
 	prevIdx := curIdx ^ 1
 	curGen := &f.gens[curIdx]
@@ -69,13 +71,12 @@ func (f *replayFilter) CheckAndMark(token []byte) bool {
 			allInPrev = false
 		}
 	}
+	f.rotMu.RUnlock()
 	return allInCur || allInPrev
 }
 
 func (f *replayFilter) maybeRotate(now int64) {
-	if !f.rotMu.TryLock() {
-		return
-	}
+	f.rotMu.Lock()
 	defer f.rotMu.Unlock()
 	if now < f.rotateAt.Load() {
 		return

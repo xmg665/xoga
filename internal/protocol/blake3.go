@@ -21,6 +21,18 @@ const (
 	b3DeriveKeyMaterial = 1 << 6
 )
 
+// blake3Hash computes a plain BLAKE3 hash of data and writes the first len(out) bytes.
+// Used for SS-2022 EIH identity hashing per SIP022: `BLAKE3::hash(uPSK)[0..16]`.
+func blake3Hash(_ string, data []byte, out []byte) {
+	var rootWords [16]uint32
+	blake3SingleChunkRootOutput(blake3IV, data, 0, &rootWords)
+	var raw [64]byte
+	for i := 0; i < 16; i++ {
+		binary.LittleEndian.PutUint32(raw[i*4:], rootWords[i])
+	}
+	copy(out, raw[:len(out)])
+}
+
 // blake3DeriveKey derives outLen (up to 64) bytes using BLAKE3 derive_key(context, keyMaterial).
 // Both context and keyMaterial for SS-2022 are <= 64 bytes (single chunk), handled cleanly for up to 1024 bytes.
 func blake3DeriveKey(context string, keyMaterial []byte, out []byte) {

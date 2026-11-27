@@ -96,17 +96,22 @@ func (c *legacyAuthCache) lookup(authID [16]byte) (*VMessUserEntry, [8]byte, boo
 
 // start launches the once-per-second ring refresher.
 func (c *legacyAuthCache) start(current func() *UserIndex) {
-	if !c.started.CompareAndSwap(false, true) {
+	c.mu.Lock()
+	if c.started.Load() {
+		c.mu.Unlock()
 		return
 	}
-	c.stop = make(chan struct{})
+	stop := make(chan struct{})
+	c.stop = stop
+	c.started.Store(true)
+	c.mu.Unlock()
 	c.refresh(current(), time.Now().Unix())
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-c.stop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				c.refresh(current(), time.Now().Unix())
@@ -116,11 +121,14 @@ func (c *legacyAuthCache) start(current func() *UserIndex) {
 }
 
 func (c *legacyAuthCache) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.started.Load() && c.stop != nil {
 		select {
 		case <-c.stop:
 		default:
 			close(c.stop)
 		}
+		c.started.Store(false)
 	}
 }
