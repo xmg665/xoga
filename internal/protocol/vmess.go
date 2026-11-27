@@ -731,9 +731,12 @@ func (v *vmessStreamConn) FlushResponseHeader() error {
 	return nil
 }
 
+// Close closes the socket first so a reader blocked in readSingleChunk (holding
+// readMu) is woken, then releases the read buffer.
 func (v *vmessStreamConn) Close() error {
+	err := v.Conn.Close()
 	v.releaseReadBuf()
-	return v.Conn.Close()
+	return err
 }
 
 func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {

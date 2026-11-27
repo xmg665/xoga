@@ -21,6 +21,9 @@ type muxTCPSubSession struct {
 	txCh     chan []byte
 	txMu     sync.Mutex
 	txClosed bool
+	txDone   chan struct{}  // closed when tx is shut down; wakes blocked senders
+	txSends  sync.WaitGroup // senders blocked outside txMu on a full txCh
+	txOnce   sync.Once
 	aborted  atomic.Bool
 
 	connMu sync.Mutex
@@ -29,7 +32,8 @@ type muxTCPSubSession struct {
 
 func newMuxTCPSubSession() *muxTCPSubSession {
 	return &muxTCPSubSession{
-		txCh: make(chan []byte, 64),
+		txCh:   make(chan []byte, 64),
+		txDone: make(chan struct{}),
 	}
 }
 
@@ -50,16 +54,21 @@ func (m *muxTCPSubSession) enqueue(data []byte) bool {
 		m.txMu.Unlock()
 		return true
 	default:
-		// Sub-stream upload queue full -> block briefly under no mutex? Never hold txMu while blocking;
-		// instead close sub-session cleanly only if peer stops draining completely.
-		ch := m.txCh
+		// Queue full: block without holding txMu. closeClientTx waits for txSends
+		// before closing txCh, so this send can never hit a closed channel.
+		m.txSends.Add(1)
 		m.txMu.Unlock()
 		timer := time.NewTimer(10 * time.Second)
 		defer timer.Stop()
 		select {
-		case ch <- cp:
+		case m.txCh <- cp:
+			m.txSends.Done()
 			return true
+		case <-m.txDone:
+			m.txSends.Done()
+			return false
 		case <-timer.C:
+			m.txSends.Done()
 			m.abort()
 			return false
 		}
@@ -70,9 +79,11 @@ func (m *muxTCPSubSession) closeClientTx() {
 	m.txMu.Lock()
 	if !m.txClosed {
 		m.txClosed = true
-		close(m.txCh)
+		close(m.txDone)
 	}
 	m.txMu.Unlock()
+	m.txSends.Wait()
+	m.txOnce.Do(func() { close(m.txCh) })
 }
 
 func (m *muxTCPSubSession) abort() {
