@@ -16,6 +16,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -218,9 +219,9 @@ func fnv1a32(b []byte) uint32 {
 // handleVMess isolates the stack-heavy AEAD KDF handshake into a `//go:noinline` helper so
 // Go's stack shrinker reclaims the ~2.5 KiB handshake stack frame as soon as streaming begins.
 func (s *Server) handleVMess(conn net.Conn) {
-	vmConn, user, destHost, destPort, cmd, ok := s.handshakeVMess(conn)
-	if !ok {
-		logger.Debugf("VMess handshake rejected: node=%d peer=%s", s.cfg.NodeID, conn.RemoteAddr())
+	vmConn, user, destHost, destPort, cmd, reason := s.handshakeVMess(conn)
+	if reason != "" {
+		logger.Debugf("VMess handshake rejected: node=%d peer=%s stage=%s", s.cfg.NodeID, conn.RemoteAddr(), reason)
 		return
 	}
 	defer vmConn.releaseReadBuf()
@@ -236,7 +237,7 @@ func (s *Server) handleVMess(conn net.Conn) {
 }
 
 //go:noinline
-func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, bool) {
+func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, string) {
 	var br io.Reader = conn
 	if _, alreadyBuf := conn.(interface{ IsBufferedStream() bool }); !alreadyBuf {
 		br = bufio.NewReaderSize(conn, 2048)
@@ -244,12 +245,12 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 
 	var authID [16]byte
 	if _, err := io.ReadFull(br, authID[:]); err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "read_authid"
 	}
 
 	idx := s.userIdx.Load()
 	if idx == nil || len(idx.VMessUsers) == 0 {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "no_users"
 	}
 
 	minTS := uint64(time.Now().Unix() - 120)
@@ -316,26 +317,45 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 			}
 		}
 	}
+	if matched == nil && s.cfg.VMessAuthMode == "auto" {
+		if entry, stamp, ok := s.legacy.lookup(authID); ok {
+			if entry.User.IsDisabled() {
+				return nil, nil, "", 0, 0, "user_disabled"
+			}
+			hdr, err := decodeLegacyVMessHeader(br, entry.CmdKey, stamp)
+			if err != nil {
+				return nil, nil, "", 0, 0, "legacy_header"
+			}
+			return s.finishVMessHandshake(conn, br, entry, hdr, true)
+		}
+	}
 	if matched == nil && len(s.cfg.VMessLegacyUsers) != 0 {
 		user, hdr := s.readLegacyVMessHeader(idx, br, authID)
 		if user == nil {
-			return nil, nil, "", 0, 0, false
+			return nil, nil, "", 0, 0, "legacy_auth_failed"
 		}
 		return s.finishVMessHandshake(conn, br, user, hdr, true)
 	}
-	if matched == nil || matched.User.IsDisabled() {
-		return nil, nil, "", 0, 0, false
+	if matched == nil {
+		kind, uid, skew := diagnoseUnmatchedVMess(idx, authID)
+		if uid != 0 {
+			return nil, nil, "", 0, 0, "auth_no_user_match diag=" + kind + " user=" + strconv.Itoa(uid) + " skew=" + strconv.FormatInt(skew, 10)
+		}
+		return nil, nil, "", 0, 0, "auth_no_user_match diag=" + kind
+	}
+	if matched.User.IsDisabled() {
+		return nil, nil, "", 0, 0, "user_disabled"
 	}
 
 	// Reject replayed AuthIDs after authentication succeeds (prevents GFW active replay probing)
 	if s.replay.CheckAndMark(authID[:]) {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "auth_replay"
 	}
 
 	// Read 18-byte encrypted header length + 8-byte connection nonce
 	var encLenAndNonce [26]byte
 	if _, err := io.ReadFull(br, encLenAndNonce[:]); err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "read_header_len"
 	}
 	encHdrLen := encLenAndNonce[:18]
 	connNonce := encLenAndNonce[18:26]
@@ -344,19 +364,19 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	lenNonce := vmessKDF3(matched.CmdKey[:], kdfSaltHdrLenIV, authID[:], connNonce)
 	lenBlk, err := aes.NewCipher(lenKey[:16])
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_len_cipher"
 	}
 	lenGCM, err := cipher.NewGCM(lenBlk)
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_len_cipher"
 	}
 	var hdrLenBytes [2]byte
 	if _, err := lenGCM.Open(hdrLenBytes[:0], lenNonce[:12], encHdrLen, authID[:]); err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_len_decrypt"
 	}
 	hdrLen := int(binary.BigEndian.Uint16(hdrLenBytes[:])) + 16
 	if hdrLen <= 16 || hdrLen > 2048 {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_len_invalid"
 	}
 
 	var stackHdr [512]byte
@@ -367,34 +387,34 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		encHdr = make([]byte, hdrLen)
 	}
 	if _, err := io.ReadFull(br, encHdr); err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "read_header"
 	}
 
 	payKey := vmessKDF3(matched.CmdKey[:], kdfSaltHdrKey, authID[:], connNonce)
 	payNonce := vmessKDF3(matched.CmdKey[:], kdfSaltHdrIV, authID[:], connNonce)
 	payBlk, err := aes.NewCipher(payKey[:16])
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_cipher"
 	}
 	payGCM, err := cipher.NewGCM(payBlk)
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_cipher"
 	}
 	hdrPlain, err := payGCM.Open(encHdr[:0], payNonce[:12], encHdr, authID[:])
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_decrypt"
 	}
 	return s.finishVMessHandshake(conn, br, matched, hdrPlain, false)
 }
 
-func (s *Server) finishVMessHandshake(conn net.Conn, br io.Reader, matched *VMessUserEntry, hdrPlain []byte, legacy bool) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, bool) {
+func (s *Server) finishVMessHandshake(conn net.Conn, br io.Reader, matched *VMessUserEntry, hdrPlain []byte, legacy bool) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, string) {
 	if len(hdrPlain) < 42 {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_too_short"
 	}
 
 	// Verify FNV1a32 checksum at end of VMess command header
 	if fnv1a32(hdrPlain[:len(hdrPlain)-4]) != binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:]) || hdrPlain[0] != 0x01 {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "header_checksum"
 	}
 
 	var reqBodyIV, reqBodyKey [16]byte
@@ -411,35 +431,35 @@ func (s *Server) finishVMessHandshake(conn net.Conn, br io.Reader, matched *VMes
 	switch cmd {
 	case 0x01, 0x02:
 		if len(hdrPlain)-4-pLen <= 40 {
-			return nil, nil, "", 0, 0, false
+			return nil, nil, "", 0, 0, "addr_too_short"
 		}
 		destPort = binary.BigEndian.Uint16(hdrPlain[38:40])
 		addrReader := bytes.NewReader(hdrPlain[40 : len(hdrPlain)-4-pLen])
 		var err error
 		destHost, err = parseVLESSAddr(addrReader)
 		if err != nil {
-			return nil, nil, "", 0, 0, false
+			return nil, nil, "", 0, 0, "addr_parse"
 		}
 	case 0x03: // RequestCommandMux (Mux.Cool without target address in VMess header)
 		if len(hdrPlain)-4-pLen < 38 {
-			return nil, nil, "", 0, 0, false
+			return nil, nil, "", 0, 0, "mux_header_short"
 		}
 	default:
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "unknown_cmd"
 	}
 	if legacy {
 		token := sha256.Sum256(append(matched.CmdKey[:16:16], hdrPlain[1:33]...))
 		if s.replay.CheckAndMark(token[:]) {
-			return nil, nil, "", 0, 0, false
+			return nil, nil, "", 0, 0, "legacy_replay"
 		}
 	}
 	_ = conn.SetDeadline(time.Time{})
 
 	vmConn, err := newVMessStreamConn(conn, br, reqBodyKey, reqBodyIV, respV, opt, secType, cmd == 0x02, legacy)
 	if err != nil {
-		return nil, nil, "", 0, 0, false
+		return nil, nil, "", 0, 0, "stream_init"
 	}
-	return vmConn, matched.User, destHost, destPort, cmd, true
+	return vmConn, matched.User, destHost, destPort, cmd, ""
 }
 
 func (s *Server) handleVMessUDP(vmConn *vmessStreamConn, user *stats.UserEntry, destHost string, destPort uint16) {

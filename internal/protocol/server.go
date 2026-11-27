@@ -284,6 +284,7 @@ type Server struct {
 	ipHints ipHintCache
 	hotRing hotUserRing
 	replay  replayFilter
+	legacy  legacyAuthCache
 
 	userIdx atomic.Pointer[UserIndex]
 	aclEng  atomic.Pointer[acl.Engine]
@@ -449,6 +450,11 @@ func (s *Server) Start() error {
 	}
 	s.tcpLn = ln
 
+	if s.spec.Protocol == "vmess" && s.cfg.VMessAuthMode == "auto" {
+		s.legacy.start(s.userIdx.Load)
+		logger.Infof("[node %d] VMess auth mode: auto (AEAD + legacy MD5)", s.cfg.NodeID)
+	}
+
 	s.wg.Add(1)
 	go s.acceptLoop()
 
@@ -473,6 +479,7 @@ func (s *Server) Close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
+	s.legacy.close()
 	if s.hy2Listener != nil {
 		_ = s.hy2Listener.Close()
 	}

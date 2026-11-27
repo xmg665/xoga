@@ -29,6 +29,7 @@ type Config struct {
 
 	// VMess legacy MD5 authentication, scoped to explicitly configured user IDs.
 	VMessLegacyUsers          map[int]int // user ID to maximum legacy AlterID
+	VMessAuthMode             string      // "aead" (default) or "auto" (AEAD + legacy MD5 for all users, like Soga)
 	ForwardExtraPortRequested bool        // legacy Soga setting surfaced at startup
 
 	// WebAPI connection
@@ -285,6 +286,13 @@ func (c *Config) ApplyKV(key, val string) {
 				c.DyLimitWhiteUserIDs[id] = struct{}{}
 			}
 		}
+	case "vmess_auth_mode":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "auto":
+			c.VMessAuthMode = "auto"
+		default:
+			c.VMessAuthMode = "aead"
+		}
 	case "vmess_legacy_users":
 		c.VMessLegacyUsers = make(map[int]int)
 		for _, entry := range strings.Split(val, ",") {
@@ -520,7 +528,7 @@ var knownEnvKeys = []string{
 	"device_limit_enable", "conn_limit_enable", "ip_limit_enable",
 	"user_conn_limit", "user_speed_limit", "user_tcp_limit", "node_speed_limit",
 	"check_interval", "submit_interval", "forbidden_bit_torrent", "forbidden_ports", "ban_private_ip",
-	"vless", "vless_flow", "v2ray_reduce_memory", "vmess_legacy_users", "forward_extra_port_enable",
+	"vless", "vless_flow", "v2ray_reduce_memory", "vmess_legacy_users", "vmess_auth_mode", "forward_extra_port_enable",
 	"reality", "enable_reality", "reality_dest", "dest", "reality_private_key", "private_key",
 	"reality_short_ids", "reality_short_id", "short_id", "short_ids", "reality_server_names", "server_names",
 	"hy2_obfs", "obfs", "hy2_obfs_password", "obfs_password", "hy2_up_mbps", "up_mbps", "hy2_down_mbps", "down_mbps",
