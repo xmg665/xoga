@@ -639,7 +639,7 @@ func (c *UniProxyClient) doGet(ctx context.Context, fullURL, ifNoneMatch string)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, redactErr(err)
 	}
 	defer resp.Body.Close()
 
@@ -671,7 +671,7 @@ func (c *UniProxyClient) doPostJSON(ctx context.Context, fullURL string, v any, 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

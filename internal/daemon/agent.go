@@ -321,14 +321,19 @@ func (w *nodeWorker) shutdown() {
 		w.curServer.Close()
 		w.curServer = nil
 	}
-	flushCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
+	// systemd stops us after 30 s; give a slow panel up to 20 s. A single attempt
+	// avoids double counting if the panel applied a request whose reply was lost.
 	batch := w.tracker.HarvestTraffic(0)
-	if len(batch) > 0 {
-		if err := w.client.PushTraffic(flushCtx, batch); err != nil {
-			logger.Warnf("[node %d] Final traffic flush failed: %v", w.nodeID, err)
-		}
+	if len(batch) == 0 {
+		return
 	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := w.client.PushTraffic(flushCtx, batch); err != nil {
+		logger.Warnf("[node %d] Final traffic flush failed, %d users' traffic lost: %v", w.nodeID, len(batch), err)
+		return
+	}
+	logger.Infof("[node %d] Final traffic flush pushed %d users", w.nodeID, len(batch))
 }
 
 func listenerNeedsRestart(oldSpec, newSpec *panel.NodeSpec) bool {

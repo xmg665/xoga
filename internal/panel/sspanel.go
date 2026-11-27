@@ -739,7 +739,7 @@ func (c *SSPanelClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, redactErr(err)
 	}
 	defer resp.Body.Close()
 
@@ -802,7 +802,7 @@ func (c *SSPanelClient) doPost(ctx context.Context, fullURL string, v any) error
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
