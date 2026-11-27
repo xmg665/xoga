@@ -29,7 +29,7 @@ type Config struct {
 
 	// VMess legacy MD5 authentication, scoped to explicitly configured user IDs.
 	VMessLegacyUsers          map[int]int // user ID to maximum legacy AlterID
-	VMessAuthMode             string      // "aead" (default) or "auto" (AEAD + legacy MD5 for all users, like Soga)
+	VMessAuthMode             string      // "auto" (default: AEAD + legacy MD5 for all users, like Soga) or "aead" (AEAD only)
 	ForwardExtraPortRequested bool        // legacy Soga setting surfaced at startup
 
 	// WebAPI connection
@@ -287,11 +287,10 @@ func (c *Config) ApplyKV(key, val string) {
 			}
 		}
 	case "vmess_auth_mode":
-		switch strings.ToLower(strings.TrimSpace(val)) {
-		case "auto":
-			c.VMessAuthMode = "auto"
-		default:
+		if strings.EqualFold(strings.TrimSpace(val), "aead") {
 			c.VMessAuthMode = "aead"
+		} else {
+			c.VMessAuthMode = "auto"
 		}
 	case "vmess_legacy_users":
 		c.VMessLegacyUsers = make(map[int]int)

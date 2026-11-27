@@ -450,7 +450,7 @@ func (s *Server) Start() error {
 	}
 	s.tcpLn = ln
 
-	if s.spec.Protocol == "vmess" && s.cfg.VMessAuthMode == "auto" {
+	if s.spec.Protocol == "vmess" && s.cfg.VMessAuthMode != "aead" {
 		s.legacy.start(s.userIdx.Load)
 		logger.Infof("[node %d] VMess auth mode: auto (AEAD + legacy MD5)", s.cfg.NodeID)
 	}

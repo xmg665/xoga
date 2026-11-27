@@ -317,7 +317,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 			}
 		}
 	}
-	if matched == nil && s.cfg.VMessAuthMode == "auto" {
+	if matched == nil && s.cfg.VMessAuthMode != "aead" {
 		if entry, stamp, ok := s.legacy.lookup(authID); ok {
 			if entry.User.IsDisabled() {
 				return nil, nil, "", 0, 0, "user_disabled"
