@@ -351,16 +351,16 @@ func selectXFFClientIP(xffTokens []string, peerIP netip.Addr, trustedCIDRs []net
 //     only that configured header without falling back to client-spoofable headers.
 //   - Default "auto" mode:
 //     1. Immediate Cloudflare CDN edge peer: CF-Connecting-IP > X-Forwarded-For (right-to-left)
-//        > X-Real-IP (only when XFF is absent). If CF-Connecting-IP itself points to a trusted
-//        upstream proxy (e.g. Transit HAProxy -> Cloudflare -> xoga), unwind X-Forwarded-For
-//        right-to-left past trusted proxies so clients do not collapse onto the transit relay IP.
+//     > X-Real-IP (only when XFF is absent). If CF-Connecting-IP itself points to a trusted
+//     upstream proxy (e.g. Transit HAProxy -> Cloudflare -> xoga), unwind X-Forwarded-For
+//     right-to-left past trusted proxies so clients do not collapse onto the transit relay IP.
 //     2. Non-Cloudflare trusted proxies (HAProxy, Nginx, Caddy, etc.): right-to-left
-//        X-Forwarded-For unwinding first (falling back to CF-Connecting-IP only if the
-//        trusted XFF chain genuinely traversed a trusted Cloudflare hop with no untrusted
-//        client hop in XFF).
+//     X-Forwarded-For unwinding first (falling back to CF-Connecting-IP only if the
+//     trusted XFF chain genuinely traversed a trusted Cloudflare hop with no untrusted
+//     client hop in XFF).
 //     3. When X-Forwarded-For is absent on a non-Cloudflare peer: X-Real-IP (preserving
-//        Nginx X-Real-IP-only setups), and CF-Connecting-IP only for local/private peers
-//        (e.g. local cloudflared) or explicit trust_forwarded_ip=true.
+//     Nginx X-Real-IP-only setups), and CF-Connecting-IP only for local/private peers
+//     (e.g. local cloudflared) or explicit trust_forwarded_ip=true.
 func selectForwardedClientIP(cfIP, xRealIP string, xffTokens []string, peerAddr net.Addr, trustedCIDRs []netip.Prefix, trustAllForwarded bool, mode ForwardedIPHeaderMode) net.IP {
 	peerIP := extractPeerNetIP(peerAddr)
 	switch mode {
