@@ -400,7 +400,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 		}
 		return
 	}
-	_, hostIsIP := netip.ParseAddr(destHost)
+	_, hostIsIP := netip.ParseAddr(strings.Trim(destHost, "[]"))
 	if hostIsIP != nil || !(s.srv.cfg.DomainSniff || s.srv.cfg.ForceDomainSniff) {
 		preRoute := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, "", "")
 		if preRoute.Action == acl.ActionBlock {
@@ -424,7 +424,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 		return
 	}
 	sn := sniff.Inspect(peeked)
-	effectiveHost := s.srv.resolveEffectiveHost(destHost, sn.Domain)
+	effectiveHost := s.srv.resolveEffectiveHost(aclEng, destHost, sn.Domain)
 	route := aclEng.DecideForNode(s.srv.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		return

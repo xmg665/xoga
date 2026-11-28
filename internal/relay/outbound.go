@@ -71,9 +71,40 @@ func DialOutbound(
 		return dialDirectWithDNSAndRoute(ctx, targetHost, targetPort, acl.OutboundNode{Type: "direct"}, route, resolver, timeout)
 	}
 
+	if len(route.Outbounds) == 1 {
+		return dialSingleOutbound(ctx, targetHost, targetPort, route.Outbounds[0], route, resolver, timeout)
+	}
+
+	overallDeadline := time.Now().Add(timeout)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(overallDeadline) {
+		overallDeadline = ctxDL
+	}
 	var lastErr error
-	for _, out := range route.Outbounds {
-		c, err := dialSingleOutbound(ctx, targetHost, targetPort, out, route, resolver, timeout)
+	n := len(route.Outbounds)
+	for i, out := range route.Outbounds {
+		if ctx.Err() != nil {
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			break
+		}
+		rem := time.Until(overallDeadline)
+		if rem <= 0 {
+			if lastErr == nil {
+				lastErr = context.DeadlineExceeded
+			}
+			break
+		}
+		perOut := rem / time.Duration(n-i)
+		if perOut < 200*time.Millisecond && rem >= 200*time.Millisecond {
+			perOut = 200 * time.Millisecond
+		}
+		if perOut <= 0 {
+			perOut = rem
+		}
+		outCtx, outCancel := context.WithTimeout(ctx, perOut)
+		c, err := dialSingleOutbound(outCtx, targetHost, targetPort, out, route, resolver, perOut)
+		outCancel()
 		if err == nil {
 			return c, nil
 		}
@@ -134,6 +165,119 @@ func dialDirectWithDNSAndRoute(
 	resolver *dns.Resolver,
 	timeout time.Duration,
 ) (net.Conn, error) {
+	return dialDirectWithDNSAndRouteDialer(ctx, host, port, out, route, resolver, timeout, nil)
+}
+
+func dialCandidateAddrs(
+	attemptCtx context.Context,
+	cands []netip.Addr,
+	port uint16,
+	out acl.OutboundNode,
+	route acl.OutboundTarget,
+	budget time.Duration,
+	dialFn func(ctx context.Context, d *net.Dialer, network, addr string) (net.Conn, error),
+) (net.Conn, error) {
+	var lastDialErr error
+	var lastV4Err error
+	limit := min(len(cands), 3)
+	for i := 0; i < limit; i++ {
+		if attemptCtx.Err() != nil {
+			break
+		}
+		ip := cands[i].Unmap()
+		if !route.AllowResolvedIP(ip) {
+			lastDialErr = errors.New("resolved IP blocked by ACL/private-IP policy")
+			continue
+		}
+		rem := budget
+		if dl, ok := attemptCtx.Deadline(); ok {
+			if until := time.Until(dl); until < rem {
+				rem = until
+			}
+		}
+		if rem <= 0 {
+			break
+		}
+		perAttempt := rem / time.Duration(limit-i)
+		if perAttempt < 200*time.Millisecond && rem >= 200*time.Millisecond {
+			perAttempt = 200 * time.Millisecond
+		}
+		if perAttempt <= 0 {
+			perAttempt = rem
+		}
+		d := net.Dialer{
+			Timeout:   perAttempt,
+			KeepAlive: 45 * time.Second,
+		}
+		if ip.Is4() {
+			if out.ListenIPv4 != "" {
+				lip := net.ParseIP(strings.Trim(out.ListenIPv4, "[]"))
+				if lip == nil || lip.To4() == nil {
+					lastDialErr = fmt.Errorf("invalid outbound listen_ipv4 %q", out.ListenIPv4)
+					continue
+				}
+				d.LocalAddr = &net.TCPAddr{IP: lip}
+			} else if out.ListenIPv6 != "" {
+				// IPv6-only bound route must never leak host default IPv4.
+				lastDialErr = errors.New("outbound route is bound to IPv6 only; refusing unbound IPv4 dial")
+				continue
+			}
+		} else if ip.Is6() {
+			if out.ListenIPv6 != "" {
+				lip := net.ParseIP(strings.Trim(out.ListenIPv6, "[]"))
+				if lip == nil || lip.To4() != nil {
+					lastDialErr = fmt.Errorf("invalid outbound listen_ipv6 %q", out.ListenIPv6)
+					continue
+				}
+				d.LocalAddr = &net.TCPAddr{IP: lip}
+			} else if out.ListenIPv4 != "" {
+				// IPv4-only bound route must never leak host default IPv6.
+				lastDialErr = errors.New("outbound route is bound to IPv4 only; refusing unbound IPv6 dial")
+				continue
+			}
+		}
+		network := "tcp4"
+		if ip.Is6() {
+			network = "tcp6"
+		}
+		targetAddr := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+		var c net.Conn
+		var derr error
+		if dialFn != nil {
+			c, derr = dialFn(attemptCtx, &d, network, targetAddr)
+		} else {
+			c, derr = d.DialContext(attemptCtx, network, targetAddr)
+		}
+		if derr == nil {
+			return c, nil
+		}
+		if ip.Is4() {
+			lastV4Err = derr
+			lastDialErr = derr
+		} else if lastV4Err == nil || (!isNoRouteOrUnreachable(derr) && !isNetTimeout(derr) && !errors.Is(derr, context.DeadlineExceeded) && !errors.Is(derr, context.Canceled)) {
+			lastDialErr = derr
+		}
+	}
+	if lastDialErr == nil {
+		if attemptCtx.Err() != nil {
+			lastDialErr = attemptCtx.Err()
+		} else {
+			lastDialErr = errors.New("no dialable IP candidate")
+		}
+	}
+	return nil, lastDialErr
+}
+
+func dialDirectWithDNSAndRouteDialer(
+	ctx context.Context,
+	host string,
+	port uint16,
+	out acl.OutboundNode,
+	route acl.OutboundTarget,
+	resolver *dns.Resolver,
+	timeout time.Duration,
+	dialFn func(ctx context.Context, d *net.Dialer, network, addr string) (net.Conn, error),
+) (net.Conn, error) {
 	hasStrat := out.ListenStrategy != ""
 	strat := dns.ParseStrategy(out.ListenStrategy)
 	if !hasStrat {
@@ -155,88 +299,7 @@ func dialDirectWithDNSAndRoute(
 	}
 
 	tryDialCandidates := func(attemptCtx context.Context, cands []netip.Addr, budget time.Duration) (net.Conn, error) {
-		var lastDialErr error
-		var lastV4Err error
-		limit := min(len(cands), 3)
-		for i := 0; i < limit; i++ {
-			if attemptCtx.Err() != nil {
-				break
-			}
-			ip := cands[i].Unmap()
-			if !route.AllowResolvedIP(ip) {
-				lastDialErr = errors.New("resolved IP blocked by ACL/private-IP policy")
-				continue
-			}
-			rem := budget
-			if dl, ok := attemptCtx.Deadline(); ok {
-				if until := time.Until(dl); until < rem {
-					rem = until
-				}
-			}
-			if rem <= 0 {
-				break
-			}
-			perAttempt := rem / time.Duration(limit-i)
-			if perAttempt < 200*time.Millisecond && rem >= 200*time.Millisecond {
-				perAttempt = 200 * time.Millisecond
-			}
-			if perAttempt <= 0 {
-				perAttempt = rem
-			}
-			d := net.Dialer{
-				Timeout:   perAttempt,
-				KeepAlive: 45 * time.Second,
-			}
-			if ip.Is4() {
-				if out.ListenIPv4 != "" {
-					lip := net.ParseIP(strings.Trim(out.ListenIPv4, "[]"))
-					if lip == nil || lip.To4() == nil {
-						lastDialErr = fmt.Errorf("invalid outbound listen_ipv4 %q", out.ListenIPv4)
-						continue
-					}
-					d.LocalAddr = &net.TCPAddr{IP: lip}
-				} else if out.ListenIPv6 != "" {
-					// IPv6-only bound route must never leak host default IPv4.
-					lastDialErr = errors.New("outbound route is bound to IPv6 only; refusing unbound IPv4 dial")
-					continue
-				}
-			} else if ip.Is6() {
-				if out.ListenIPv6 != "" {
-					lip := net.ParseIP(strings.Trim(out.ListenIPv6, "[]"))
-					if lip == nil || lip.To4() != nil {
-						lastDialErr = fmt.Errorf("invalid outbound listen_ipv6 %q", out.ListenIPv6)
-						continue
-					}
-					d.LocalAddr = &net.TCPAddr{IP: lip}
-				} else if out.ListenIPv4 != "" {
-					// IPv4-only bound route must never leak host default IPv6.
-					lastDialErr = errors.New("outbound route is bound to IPv4 only; refusing unbound IPv6 dial")
-					continue
-				}
-			}
-			network := "tcp4"
-			if ip.Is6() {
-				network = "tcp6"
-			}
-			c, derr := d.DialContext(attemptCtx, network, net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
-			if derr == nil {
-				return c, nil
-			}
-			if ip.Is4() {
-				lastV4Err = derr
-				lastDialErr = derr
-			} else if lastV4Err == nil || (!isNoRouteOrUnreachable(derr) && !errors.Is(derr, context.DeadlineExceeded) && !errors.Is(derr, context.Canceled)) {
-				lastDialErr = derr
-			}
-		}
-		if lastDialErr == nil {
-			if attemptCtx.Err() != nil {
-				lastDialErr = attemptCtx.Err()
-			} else {
-				lastDialErr = errors.New("no dialable IP candidate")
-			}
-		}
-		return nil, lastDialErr
+		return dialCandidateAddrs(attemptCtx, cands, port, out, route, budget, dialFn)
 	}
 
 	effStrat := strat
@@ -244,7 +307,14 @@ func dialDirectWithDNSAndRoute(
 		effStrat = resolver.DefaultStrategy()
 	}
 	_, isLiteralIP := netip.ParseAddr(host)
-	willFallbackV4 := isLiteralIP != nil && effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() && !(out.ListenIPv6 != "" && out.ListenIPv4 == "")
+	hasV4Candidate := false
+	for _, cand := range ips[:min(len(ips), 3)] {
+		if cand.Unmap().Is4() {
+			hasV4Candidate = true
+			break
+		}
+	}
+	willFallbackV4 := isLiteralIP != nil && effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() && !hasV4Candidate && !(out.ListenIPv6 != "" && out.ListenIPv4 == "")
 
 	primaryCtx := dialCtx
 	primaryBudget := timeout
@@ -382,7 +452,11 @@ func dialProxyTransport(ctx context.Context, out acl.OutboundNode, resolver *dns
 	if err != nil {
 		return nil, err
 	}
-	_ = rawConn.SetDeadline(time.Now().Add(timeout))
+	dl := time.Now().Add(timeout)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
+		dl = ctxDL
+	}
+	_ = rawConn.SetDeadline(dl)
 
 	conn := rawConn
 	outType := strings.ToLower(out.Type)
@@ -514,7 +588,7 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 		var l [1]byte
 		if _, err := io.ReadFull(c, l[:]); err != nil {
 			c.Close()
-			return nil, err
+			return nil, fmt.Errorf("socks5 connect addr len read: %w", err)
 		}
 		skip = int(l[0]) + 2
 	default:
@@ -525,7 +599,7 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 		var discard [260]byte
 		if _, err := io.ReadFull(c, discard[:skip]); err != nil {
 			c.Close()
-			return nil, err
+			return nil, fmt.Errorf("socks5 connect addr read: %w", err)
 		}
 	}
 	_ = c.SetDeadline(time.Time{})
@@ -1476,13 +1550,41 @@ func DialUDPForRoute(ctx context.Context, route acl.OutboundTarget, preferIPv6 b
 		return net.ListenPacket("udp", "")
 	}
 
+	overallDeadline := time.Now().Add(5 * time.Second)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(overallDeadline) {
+		overallDeadline = ctxDL
+	}
+
 	var lastErr error
-	for _, out := range route.Outbounds {
+	n := len(route.Outbounds)
+	for i, out := range route.Outbounds {
 		switch strings.ToLower(out.Type) {
 		case "block":
 			return nil, errors.New("UDP blocked by route outbound")
 		case "socks5", "socks":
-			pc, err := dialSOCKS5UDPAssociate(ctx, out, resolver, 5*time.Second)
+			if ctx.Err() != nil {
+				if lastErr == nil {
+					lastErr = ctx.Err()
+				}
+				return nil, lastErr
+			}
+			rem := time.Until(overallDeadline)
+			if rem <= 0 {
+				if lastErr == nil {
+					lastErr = context.DeadlineExceeded
+				}
+				return nil, lastErr
+			}
+			perOut := rem
+			if n > 1 {
+				perOut = rem / time.Duration(n-i)
+				if perOut < 200*time.Millisecond && rem >= 200*time.Millisecond {
+					perOut = 200 * time.Millisecond
+				}
+			}
+			outCtx, outCancel := context.WithTimeout(ctx, perOut)
+			pc, err := dialSOCKS5UDPAssociate(outCtx, out, resolver, perOut)
+			outCancel()
 			if err == nil {
 				return pc, nil
 			}

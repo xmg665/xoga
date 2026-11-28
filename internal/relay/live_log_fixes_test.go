@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -134,6 +135,62 @@ func TestNEW2ProxyProtoNoDeadlineExtensionOrRedundantSyscallOnError(t *testing.T
 		n2, err2 := pp.Read(buf[:])
 		if n2 != 0 || !errors.Is(err2, io.EOF) {
 			t.Fatalf("expected EOF after draining leftover, got n=%d err=%v", n2, err2)
+		}
+	})
+
+	// 5. Partial PROXY v1 Slowloris timeout with requireHdr=false: fails at parseTimeout without +12s extension!
+	t.Run("PartialV1SlowlorisTimeout", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		go func() {
+			_, _ = c2.Write([]byte("PROXY TCP4 "))
+		}()
+		spy := &spyDeadlineConn{Conn: c1}
+		pp := &proxyProtoConn{Conn: spy, requireHdr: false, parseTimeout: 60 * time.Millisecond}
+
+		start := time.Now()
+		var buf [16]byte
+		_, err := pp.Read(buf[:])
+		if !isNetTimeout(err) {
+			t.Fatalf("expected timeout on partial v1 slowloris, got %v", err)
+		}
+		if time.Since(start) > 500*time.Millisecond {
+			t.Fatalf("partial v1 slowloris extended deadline: %v", time.Since(start))
+		}
+		spy.mu.Lock()
+		dlCount := len(spy.readDLs)
+		spy.mu.Unlock()
+		if dlCount != 1 {
+			t.Fatalf("partial v1 slowloris reset deadline after timeout (%d SetReadDeadline calls)", dlCount)
+		}
+	})
+
+	// 6. Partial PROXY v2 Slowloris timeout with requireHdr=false: fails at parseTimeout without +12s extension!
+	t.Run("PartialV2SlowlorisTimeout", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		go func() {
+			_, _ = c2.Write(proxyV2Sig[:6])
+		}()
+		spy := &spyDeadlineConn{Conn: c1}
+		pp := &proxyProtoConn{Conn: spy, requireHdr: false, parseTimeout: 60 * time.Millisecond}
+
+		start := time.Now()
+		var buf [16]byte
+		_, err := pp.Read(buf[:])
+		if !isNetTimeout(err) {
+			t.Fatalf("expected timeout on partial v2 slowloris, got %v", err)
+		}
+		if time.Since(start) > 500*time.Millisecond {
+			t.Fatalf("partial v2 slowloris extended deadline: %v", time.Since(start))
+		}
+		spy.mu.Lock()
+		dlCount := len(spy.readDLs)
+		spy.mu.Unlock()
+		if dlCount != 1 {
+			t.Fatalf("partial v2 slowloris reset deadline after timeout (%d SetReadDeadline calls)", dlCount)
 		}
 	})
 }
@@ -376,5 +433,146 @@ func TestBUG6SOCKS5AndHTTPConnectPreserveUnderlyingErrorsAndReplyCodes(t *testin
 		if err == nil || !isNetTimeout(err) || !strings.Contains(err.Error(), "http connect proxy read") {
 			t.Fatalf("expected wrapped timeout on http connect read, got %v", err)
 		}
+	})
+}
+
+func TestMultiOutboundFailoverWhenPrimaryHangs(t *testing.T) {
+	// 1. TCP failover: primary SOCKS5 proxy accepts TCP and hangs forever; backup direct outbound
+	//    must still succeed within a shared parent context deadline!
+	t.Run("TCPFailoverFromHangingSOCKS5ToDirect", func(t *testing.T) {
+		hangLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer hangLn.Close()
+		hangDone := make(chan struct{})
+		defer close(hangDone)
+		go func() {
+			for {
+				c, aerr := hangLn.Accept()
+				if aerr != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					<-hangDone
+				}(c)
+			}
+		}()
+
+		targetLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer targetLn.Close()
+		go func() {
+			for {
+				c, aerr := targetLn.Accept()
+				if aerr != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					_, _ = conn.Write([]byte("backup-ok"))
+				}(c)
+			}
+		}()
+
+		route := acl.OutboundTarget{
+			Action: acl.ActionProxy,
+			Outbounds: []acl.OutboundNode{
+				{Type: "socks5", Server: "127.0.0.1", Port: hangLn.Addr().(*net.TCPAddr).Port},
+				{Type: "direct"},
+			},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+		defer cancel()
+		c, err := DialOutbound(ctx, "127.0.0.1", uint16(targetLn.Addr().(*net.TCPAddr).Port), route, nil, 900*time.Millisecond)
+		if err != nil {
+			t.Fatalf("expected DialOutbound to fail over from hanging primary to backup direct, got %v", err)
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		buf := make([]byte, 16)
+		n, rerr := c.Read(buf)
+		if rerr != nil || string(buf[:n]) != "backup-ok" {
+			t.Fatalf("unexpected backup response: %q err=%v", buf[:n], rerr)
+		}
+	})
+
+	// 2. UDP failover: primary SOCKS5 UDP proxy hangs on greeting; backup SOCKS5 UDP proxy succeeds!
+	t.Run("UDPFailoverFromHangingSOCKS5ToHealthySOCKS5", func(t *testing.T) {
+		hangLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer hangLn.Close()
+		hangDone := make(chan struct{})
+		defer close(hangDone)
+		go func() {
+			for {
+				c, aerr := hangLn.Accept()
+				if aerr != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					<-hangDone
+				}(c)
+			}
+		}()
+
+		relayPC, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer relayPC.Close()
+		relayPort := relayPC.LocalAddr().(*net.UDPAddr).Port
+
+		goodLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer goodLn.Close()
+		go func() {
+			for {
+				c, aerr := goodLn.Accept()
+				if aerr != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf := make([]byte, 64)
+					if _, rerr := conn.Read(buf); rerr != nil {
+						return
+					}
+					_, _ = conn.Write([]byte{0x05, 0x00})
+					if _, rerr := conn.Read(buf); rerr != nil {
+						return
+					}
+					var reply [10]byte
+					reply[0], reply[1], reply[2], reply[3] = 0x05, 0x00, 0x00, 0x01
+					copy(reply[4:8], []byte{127, 0, 0, 1})
+					binary.BigEndian.PutUint16(reply[8:10], uint16(relayPort))
+					_, _ = conn.Write(reply[:])
+					<-hangDone
+				}(c)
+			}
+		}()
+
+		route := acl.OutboundTarget{
+			Action: acl.ActionProxy,
+			Outbounds: []acl.OutboundNode{
+				{Type: "socks5", Server: "127.0.0.1", Port: hangLn.Addr().(*net.TCPAddr).Port},
+				{Type: "socks5", Server: "127.0.0.1", Port: goodLn.Addr().(*net.TCPAddr).Port},
+			},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+		defer cancel()
+		pc, err := DialUDPForRoute(ctx, route, false, nil)
+		if err != nil {
+			t.Fatalf("expected DialUDPForRoute to fail over from hanging primary SOCKS5 to healthy backup, got %v", err)
+		}
+		_ = pc.Close()
 	})
 }

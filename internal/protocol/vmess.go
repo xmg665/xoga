@@ -331,7 +331,10 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		}
 	}
 	if matched == nil && len(s.cfg.VMessLegacyUsers) != 0 {
-		if user, hdr := s.readLegacyVMessHeader(idx, br, authID); user != nil {
+		if user, hdr, err := s.readLegacyVMessHeader(idx, br, authID); user != nil {
+			if err != nil {
+				return nil, nil, "", 0, 0, fmt.Sprintf("legacy_header user=%d err=%v", user.User.ID, err)
+			}
 			return s.finishVMessHandshake(conn, br, user, hdr, true)
 		}
 	}

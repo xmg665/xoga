@@ -168,7 +168,7 @@ func (s *Server) runMuxTCPSubSession(
 	}
 
 	sn := sniff.Inspect(firstChunk)
-	effectiveHost := s.resolveEffectiveHost(destHost, sn.Domain)
+	effectiveHost := s.resolveEffectiveHost(aclEng, destHost, sn.Domain)
 	route := aclEng.DecideForNode(s.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		_ = writeFrame(encodeMuxTCPEndFrame(sid, true))

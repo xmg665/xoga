@@ -766,12 +766,16 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 
 // resolveEffectiveHost applies Soga/Xray-compatible domain_sniff (`destOverride: ["http","tls"]`,
 // `routeOnly=false`): whenever domain_sniff (or force_domain_sniff) is enabled, destHost is a
-// literal IP, and a valid non-IP SNI/HTTP Host was sniffed, override effectiveHost with
-// sniffDomain BEFORE ACL and literal ban_private_ip checks so Clash Fake-IPs (198.18.0.0/15),
-// GFW-poisoned IPs (127.0.0.1 / 0.0.0.1), and unreachable IPv6 literals resolve via DNS.
-func (s *Server) resolveEffectiveHost(destHost, sniffDomain string) string {
+// literal IP not explicitly whitelisted in `whiteList`, and a valid non-IP SNI/HTTP Host was
+// sniffed, override effectiveHost with sniffDomain BEFORE ACL and literal ban_private_ip checks
+// so Clash Fake-IPs (198.18.0.0/15), GFW-poisoned IPs (127.0.0.1 / 0.0.0.1), and unreachable
+// IPv6 literals resolve via DNS while explicitly whitelisted backend IPs remain directly reachable.
+func (s *Server) resolveEffectiveHost(aclEng *acl.Engine, destHost, sniffDomain string) string {
 	if sniffDomain != "" && (s.cfg.DomainSniff || s.cfg.ForceDomainSniff) {
-		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
+		if ip, err := netip.ParseAddr(strings.Trim(destHost, "[]")); err == nil {
+			if aclEng != nil && aclEng.IsIPWhitelisted(ip) {
+				return destHost
+			}
 			return sniffDomain
 		}
 	}
@@ -818,7 +822,7 @@ func (s *Server) connectStreamNoAcquire(
 	}
 
 	sn := sniff.Inspect(peeked)
-	effectiveHost := s.resolveEffectiveHost(destHost, sn.Domain)
+	effectiveHost := s.resolveEffectiveHost(aclEng, destHost, sn.Domain)
 	route := aclEng.DecideForNode(s.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		logger.Debugf("blocked user=%d dest=%s:%d effective=%s sni=%s proto=%s rule=%s", user.ID, destHost, destPort, effectiveHost, sn.Domain, sn.Protocol, route.RuleName)

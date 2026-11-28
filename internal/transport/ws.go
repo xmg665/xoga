@@ -105,27 +105,11 @@ func ParseTrustedProxyCIDRs(entries []string) ([]netip.Prefix, []string) {
 	return prefixes, invalid
 }
 
-// isTrustedProxyPeer reports whether the immediate TCP peer is loopback, private/link-local
-// (e.g. local Nginx/HAProxy/Caddy/cloudflared), or inside one of trustedCIDRs (e.g. public
-// L7 HTTP relays / Cloudflare CDN ranges), preventing untrusted public clients from spoofing
-// X-Forwarded-For / CF-Connecting-IP / X-Real-IP headers.
-func isTrustedProxyPeer(addr net.Addr, trustedCIDRs []netip.Prefix) bool {
-	if addr == nil {
-		return false
-	}
-	var ip netip.Addr
-	if ta, ok := addr.(*net.TCPAddr); ok {
-		if parsed, ok2 := netip.AddrFromSlice(ta.IP); ok2 {
-			ip = parsed.Unmap()
-		}
-	} else if host, _, err := net.SplitHostPort(addr.String()); err == nil {
-		if parsed, perr := netip.ParseAddr(host); perr == nil {
-			ip = parsed.Unmap()
-		}
-	}
+func isTrustedProxyAddr(ip netip.Addr, trustedCIDRs []netip.Prefix) bool {
 	if !ip.IsValid() {
 		return false
 	}
+	ip = ip.Unmap()
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return true
 	}
@@ -137,20 +121,87 @@ func isTrustedProxyPeer(addr net.Addr, trustedCIDRs []netip.Prefix) bool {
 	return false
 }
 
-func parseForwardedClientIP(raw string) net.IP {
+func extractPeerNetIP(addr net.Addr) netip.Addr {
+	if addr == nil {
+		return netip.Addr{}
+	}
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		if parsed, ok2 := netip.AddrFromSlice(ta.IP); ok2 {
+			return parsed.Unmap()
+		}
+		return netip.Addr{}
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		if parsed, perr := netip.ParseAddr(strings.Trim(host, "[]")); perr == nil {
+			return parsed.Unmap()
+		}
+	}
+	return netip.Addr{}
+}
+
+// isTrustedProxyPeer reports whether the immediate TCP peer is loopback, private/link-local
+// (e.g. local Nginx/HAProxy/Caddy/cloudflared), or inside one of trustedCIDRs (e.g. public
+// L7 HTTP relays / Cloudflare CDN ranges), preventing untrusted public clients from spoofing
+// X-Forwarded-For / CF-Connecting-IP / X-Real-IP headers.
+func isTrustedProxyPeer(addr net.Addr, trustedCIDRs []netip.Prefix) bool {
+	return isTrustedProxyAddr(extractPeerNetIP(addr), trustedCIDRs)
+}
+
+func parseForwardedClientAddr(raw string) (netip.Addr, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return nil
+		return netip.Addr{}, false
 	}
 	if addr, err := netip.ParseAddr(strings.Trim(s, "[]")); err == nil {
-		u := addr.Unmap()
-		return net.IP(u.AsSlice())
+		return addr.Unmap(), true
 	}
 	if host, _, err := net.SplitHostPort(s); err == nil {
 		if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
-			u := addr.Unmap()
-			return net.IP(u.AsSlice())
+			return addr.Unmap(), true
 		}
+	}
+	return netip.Addr{}, false
+}
+
+func parseForwardedClientIP(raw string) net.IP {
+	if addr, ok := parseForwardedClientAddr(raw); ok {
+		return net.IP(addr.AsSlice())
+	}
+	return nil
+}
+
+// selectForwardedClientIP extracts the real client IP with strict header priority
+// (CF-Connecting-IP > X-Real-IP > X-Forwarded-For), falling through if a higher-priority
+// header is malformed. For X-Forwarded-For, tokens across all XFF headers are walked
+// right-to-left skipping trusted proxy hops (loopback/private/link-local, trustedCIDRs,
+// and the immediate peer IP) so client-injected leading XFF values cannot spoof the IP.
+func selectForwardedClientIP(cfIP, xRealIP string, xffTokens []string, peerAddr net.Addr, trustedCIDRs []netip.Prefix) net.IP {
+	if ip := parseForwardedClientIP(cfIP); ip != nil {
+		return ip
+	}
+	if ip := parseForwardedClientIP(xRealIP); ip != nil {
+		return ip
+	}
+	if len(xffTokens) == 0 {
+		return nil
+	}
+	peerIP := extractPeerNetIP(peerAddr)
+	var leftmostTrusted netip.Addr
+	for i := len(xffTokens) - 1; i >= 0; i-- {
+		addr, ok := parseForwardedClientAddr(xffTokens[i])
+		if !ok {
+			// Stop walking past a malformed/untrusted hop so leading spoofed tokens
+			// cannot be trusted behind garbage injected by an untrusted client.
+			break
+		}
+		if (peerIP.IsValid() && addr == peerIP) || isTrustedProxyAddr(addr, trustedCIDRs) {
+			leftmostTrusted = addr
+			continue
+		}
+		return net.IP(addr.AsSlice())
+	}
+	if leftmostTrusted.IsValid() {
+		return net.IP(leftmostTrusted.AsSlice())
 	}
 	return nil
 }
@@ -200,7 +251,8 @@ func AcceptWebSocketWithTrustedProxies(c net.Conn, expectedPath string, trustAll
 		}
 	}
 
-	var wsKey, wsProto, cfIP, xRealIP, xffIP string
+	var wsKey, wsProto, cfIP, xRealIP string
+	var xffTokens []string
 	headerBytes := 0
 	for lineCount := 0; ; lineCount++ {
 		if lineCount >= 64 {
@@ -238,18 +290,12 @@ func AcceptWebSocketWithTrustedProxies(c net.Conn, expectedPath string, trustAll
 		case "x-real-ip":
 			xRealIP = v
 		case "x-forwarded-for":
-			if xffIP == "" {
-				first, _, _ := strings.Cut(v, ",")
-				xffIP = strings.TrimSpace(first)
+			for _, part := range strings.Split(v, ",") {
+				if tok := strings.TrimSpace(part); tok != "" {
+					xffTokens = append(xffTokens, tok)
+				}
 			}
 		}
-	}
-	realIPStr := cfIP
-	if realIPStr == "" {
-		realIPStr = xRealIP
-	}
-	if realIPStr == "" {
-		realIPStr = xffIP
 	}
 
 	if wsKey == "" {
@@ -303,8 +349,8 @@ func AcceptWebSocketWithTrustedProxies(c net.Conn, expectedPath string, trustAll
 
 	remoteAddr := c.RemoteAddr()
 	trustHeaders := trustAllForwarded || isTrustedProxyPeer(remoteAddr, trustedCIDRs)
-	if trustHeaders && realIPStr != "" {
-		if ip := parseForwardedClientIP(realIPStr); ip != nil {
+	if trustHeaders {
+		if ip := selectForwardedClientIP(cfIP, xRealIP, xffTokens, remoteAddr, trustedCIDRs); ip != nil {
 			port := 0
 			if ta, ok := remoteAddr.(*net.TCPAddr); ok {
 				port = ta.Port

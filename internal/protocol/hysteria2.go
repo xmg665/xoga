@@ -346,7 +346,7 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 		_ = writeHy2TCPResponse(sc, false, "blocked by policy")
 		return
 	}
-	_, hostIsIP := netip.ParseAddr(host)
+	_, hostIsIP := netip.ParseAddr(strings.Trim(host, "[]"))
 	if hostIsIP != nil || !(h.srv.cfg.DomainSniff || h.srv.cfg.ForceDomainSniff) {
 		preRoute := aclEng.DecideForNode(h.srv.cfg.NodeID, host, destPort, "", "")
 		if preRoute.Action == acl.ActionBlock {
@@ -363,7 +363,7 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	}
 
 	sn := sniff.Inspect(peeked)
-	effectiveHost := h.srv.resolveEffectiveHost(host, sn.Domain)
+	effectiveHost := h.srv.resolveEffectiveHost(aclEng, host, sn.Domain)
 	route := aclEng.DecideForNode(h.srv.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		_ = writeHy2TCPResponse(sc, false, "blocked by policy")

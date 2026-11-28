@@ -145,10 +145,15 @@ func (p *proxyProtoConn) parseHeader() (retErr error) {
 	if bytes.HasPrefix(hdr[:n], []byte("PROXY ")) {
 		var buf [128]byte
 		total := copy(buf[:], hdr[:n])
+		var readErr error
 		for !bytes.Contains(buf[:total], []byte("\r\n")) && total < 108 {
 			rn, rerr := p.Conn.Read(buf[total:108])
 			total += rn
-			if rerr != nil || rn == 0 {
+			if rerr != nil {
+				readErr = rerr
+				break
+			}
+			if rn == 0 {
 				break
 			}
 		}
@@ -168,7 +173,13 @@ func (p *proxyProtoConn) parseHeader() (retErr error) {
 			return nil
 		}
 		if p.requireHdr {
+			if readErr != nil {
+				return fmt.Errorf("malformed PROXY protocol v1 header: %w", readErr)
+			}
 			return errors.New("malformed PROXY protocol v1 header")
+		}
+		if readErr != nil && isNetTimeout(readErr) {
+			return readErr
 		}
 		p.leftover = append(p.leftover, buf[:total]...)
 		return nil
@@ -188,7 +199,10 @@ func (p *proxyProtoConn) parseHeader() (retErr error) {
 		n += m
 		if rerr != nil {
 			if p.requireHdr {
-				return errors.New("incomplete PROXY protocol v2 header")
+				return fmt.Errorf("incomplete PROXY protocol v2 header: %w", rerr)
+			}
+			if isNetTimeout(rerr) {
+				return rerr
 			}
 			p.leftover = append(p.leftover, hdr[:n]...)
 			return nil

@@ -424,6 +424,19 @@ func (e *Engine) IsPortForbidden(port uint16) bool {
 	return (e.forbiddenPorts[port>>6] & (1 << uint(port&63))) != 0
 }
 
+// IsIPWhitelisted reports whether ip explicitly matches `/etc/xoga/whiteList` IP/CIDR rules.
+func (e *Engine) IsIPWhitelisted(ip netip.Addr) bool {
+	if e == nil || !ip.IsValid() {
+		return false
+	}
+	e.maybeHotReload()
+	sn := e.snap.Load()
+	if sn == nil {
+		return false
+	}
+	return sn.whitelist.matchesIP(ip.Unmap())
+}
+
 // HasRouteForDomain reports whether any non-direct proxy route in `routes.toml` or panel routes matches domain.
 func (e *Engine) HasRouteForDomain(domain string) bool {
 	if e == nil || domain == "" {
@@ -744,6 +757,7 @@ func readRuleLines(path string) ([]string, error) {
 	defer f.Close()
 	var out []string
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
@@ -925,7 +939,7 @@ func parseRoutesTOMLFile(path string) ([]compiledRule, bool, error) {
 
 		eq := strings.IndexByte(l, '=')
 		if eq <= 0 {
-			continue
+			return nil, false, errors.New("malformed or truncated TOML key-value line")
 		}
 		k := strings.TrimSpace(l[:eq])
 		v := stripTOMLComment(strings.TrimSpace(l[eq+1:]))
@@ -981,8 +995,13 @@ func parseRoutesTOMLFile(path string) ([]compiledRule, bool, error) {
 	}
 
 	var compiled []compiledRule
+	hasEnabledDraft := false
 	for i, d := range drafts {
-		if !d.enable || len(d.matches) == 0 {
+		if !d.enable {
+			continue
+		}
+		hasEnabledDraft = true
+		if len(d.matches) == 0 {
 			continue
 		}
 		name := d.name
@@ -1025,6 +1044,9 @@ func parseRoutesTOMLFile(path string) ([]compiledRule, bool, error) {
 			cr.addPattern(m)
 		}
 		compiled = append(compiled, cr)
+	}
+	if len(drafts) > 0 && !hasEnabledDraft {
+		return nil, true, nil
 	}
 	return compiled, false, nil
 }
@@ -1099,10 +1121,14 @@ func coalesceMultilineArraysChecked(raw string) ([]string, bool) {
 	bracketDepth := 0
 
 	sc := bufio.NewScanner(strings.NewReader(raw))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(stripTOMLComment(sc.Text()))
 		if line == "" {
 			continue
+		}
+		if hasUnclosedQuote(line) {
+			return nil, true
 		}
 		if bracketDepth > 0 {
 			buf.WriteByte(' ')
@@ -1136,13 +1162,48 @@ func coalesceMultilineArraysChecked(raw string) ([]string, bool) {
 	return out, false
 }
 
+func hasUnclosedQuote(s string) bool {
+	inQ := byte(0)
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQ != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if inQ == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == inQ {
+				inQ = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inQ = c
+		}
+	}
+	return inQ != 0
+}
+
 func countBrackets(s string) int {
 	inQ := byte(0)
+	escaped := false
 	d := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if inQ != 0 {
-			if c == inQ && (i == 0 || s[i-1] != '\\') {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if inQ == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == inQ {
 				inQ = 0
 			}
 			continue
@@ -1161,10 +1222,19 @@ func countBrackets(s string) int {
 
 func stripTOMLComment(s string) string {
 	inQ := byte(0)
+	escaped := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if inQ != 0 {
-			if c == inQ && (i == 0 || s[i-1] != '\\') {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if inQ == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == inQ {
 				inQ = 0
 			}
 			continue

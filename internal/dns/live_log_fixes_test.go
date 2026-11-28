@@ -4,6 +4,9 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -190,4 +193,157 @@ func TestBUG1SystemDNSCacheSingleflightServeStaleNegativeCacheAndIPv4First(t *te
 			t.Fatalf("negative cache insert evicted positive entries: kept %d/%d", posCount, maxCacheEntries)
 		}
 	})
+}
+
+func TestNegativeCacheNotStarvedByFullPositiveCacheAndRecovery(t *testing.T) {
+	dnsFile := filepath.Join(t.TempDir(), "dns.yml")
+	if err := os.WriteFile(dnsFile, []byte("# empty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res := NewResolver(dnsFile, "", nil, "ipv4_only")
+
+	var lookupCalls atomic.Int32
+	var recoverHost atomic.Bool
+	res.systemLookup = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		lookupCalls.Add(1)
+		if host == "recover.example.test" && recoverHost.Load() {
+			return []netip.Addr{netip.MustParseAddr("203.0.113.42")}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+
+	// 1. Fill positive cache completely with maxCacheEntries entries (half fresh, half expired within 30m serve-stale window).
+	now := time.Now().Unix()
+	res.cacheMu.Lock()
+	for i := 0; i < maxCacheEntries; i++ {
+		exp := now + 600
+		if i%2 == 0 {
+			exp = now - 60 // expired 1m ago (kept for serve-stale)
+		}
+		res.cache[cacheKey{
+			domain:   "pos-" + strconv.Itoa(i) + ".example.test",
+			server:   systemDNSServer,
+			strategy: StrategyIPv4Only,
+		}] = cacheEntry{
+			addrs:   []netip.Addr{netip.MustParseAddr("198.51.100.1")},
+			expires: exp,
+		}
+	}
+	res.cacheMu.Unlock()
+
+	// 2. Repeated NXDOMAIN lookups MUST still be negative-cached (1 upstream call, NOT 20)
+	//    and MUST NOT evict any positive entries!
+	for i := 0; i < 20; i++ {
+		if _, err := res.ResolveAll(context.Background(), "storm.missing.test", 0, false); err == nil {
+			t.Fatal("expected NXDOMAIN error")
+		}
+	}
+	if got := lookupCalls.Load(); got != 1 {
+		t.Fatalf("full positive cache starved negative cache: expected 1 upstream lookup, got %d", got)
+	}
+	res.cacheMu.RLock()
+	posCount := len(res.cache)
+	negCount := len(res.negCache)
+	res.cacheMu.RUnlock()
+	if posCount != maxCacheEntries {
+		t.Fatalf("expected all %d positive entries preserved, got %d", maxCacheEntries, posCount)
+	}
+	if negCount != 1 {
+		t.Fatalf("expected 1 negative cache entry, got %d", negCount)
+	}
+
+	// 3. Flooding negative cache beyond maxNegCacheEntries stays bounded and never evicts positive entries.
+	for i := 0; i < maxNegCacheEntries+500; i++ {
+		res.putNegativeCache(cacheKey{
+			domain:   "nx-" + strconv.Itoa(i) + ".missing.test",
+			server:   systemDNSServer,
+			strategy: StrategyIPv4Only,
+		}, errDNSNXDomain, 15)
+	}
+	res.cacheMu.RLock()
+	posAfterFlood := len(res.cache)
+	negAfterFlood := len(res.negCache)
+	res.cacheMu.RUnlock()
+	if posAfterFlood != maxCacheEntries {
+		t.Fatalf("negative flood evicted positive entries: kept %d/%d", posAfterFlood, maxCacheEntries)
+	}
+	if negAfterFlood > maxNegCacheEntries {
+		t.Fatalf("negative cache exceeded bound: %d > %d", negAfterFlood, maxNegCacheEntries)
+	}
+
+	// 4. Positive cache insert when full evicts expired stale entries before fresh TTL-valid ones.
+	res.putCache(cacheKey{domain: "fresh-new.example.test", server: systemDNSServer, strategy: StrategyIPv4Only}, []netip.Addr{netip.MustParseAddr("198.51.100.9")}, 300)
+	res.cacheMu.RLock()
+	freshKept := 0
+	for k, v := range res.cache {
+		if k.domain != "fresh-new.example.test" && v.expires > now {
+			freshKept++
+		}
+	}
+	res.cacheMu.RUnlock()
+	if freshKept != maxCacheEntries/2 {
+		t.Fatalf("putCache evicted fresh entries instead of expired serve-stale entries: kept %d/%d fresh", freshKept, maxCacheEntries/2)
+	}
+
+	// 5. Recovery: putCache deletes any stale negCache entry for the same key.
+	ckRec := cacheKey{domain: "recover.example.test", server: systemDNSServer, strategy: StrategyIPv4Only}
+	res.putNegativeCache(ckRec, errDNSNXDomain, 60)
+	recoverHost.Store(true)
+	res.putCache(ckRec, []netip.Addr{netip.MustParseAddr("203.0.113.42")}, 120)
+	addrs, err := res.ResolveAll(context.Background(), "recover.example.test", 0, false)
+	if err != nil || len(addrs) != 1 || addrs[0].String() != "203.0.113.42" {
+		t.Fatalf("recovered domain should resolve from positive cache, got addrs=%v err=%v", addrs, err)
+	}
+
+	// 6. Hot-reload of dns.yml clears BOTH positive and negative caches.
+	future := time.Now().Add(10 * time.Second)
+	if err := os.WriteFile(dnsFile, []byte("# updated\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(dnsFile, future, future)
+	res.reloadNow(false)
+	res.cacheMu.RLock()
+	posAfterReload := len(res.cache)
+	negAfterReload := len(res.negCache)
+	res.cacheMu.RUnlock()
+	if posAfterReload != 0 || negAfterReload != 0 {
+		t.Fatalf("reloadNow must clear both caches, got pos=%d neg=%d", posAfterReload, negAfterReload)
+	}
+
+	// 7. Negative cache TTL expiry -> next ResolveAll retries upstream and recovers cleanly!
+	var retryCount atomic.Int32
+	var allowResolve atomic.Bool
+	resExp := NewResolver("", "", nil, "ipv4_only")
+	resExp.systemLookup = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		retryCount.Add(1)
+		if allowResolve.Load() {
+			return []netip.Addr{netip.MustParseAddr("198.51.100.88")}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	if _, err := resExp.ResolveAll(context.Background(), "ttl-recover.example.test", 0, false); err == nil {
+		t.Fatal("expected initial NXDOMAIN")
+	}
+	// Backdate negCache expiry so TTL has elapsed
+	resExp.cacheMu.Lock()
+	for k, v := range resExp.negCache {
+		v.expires = time.Now().Unix() - 1
+		resExp.negCache[k] = v
+	}
+	resExp.cacheMu.Unlock()
+	allowResolve.Store(true)
+	addrsExp, err := resExp.ResolveAll(context.Background(), "ttl-recover.example.test", 0, false)
+	if err != nil || len(addrsExp) != 1 || addrsExp[0].String() != "198.51.100.88" {
+		t.Fatalf("expected recovery after negative cache expiry, got %v err=%v", addrsExp, err)
+	}
+	if retryCount.Load() != 2 {
+		t.Fatalf("expected exactly 2 system lookups (initial fail + post-expiry recovery), got %d", retryCount.Load())
+	}
+
+	// 8. Real net.DefaultResolver.LookupNetIP path (systemLookup == nil) resolves localhost under ipv4_first!
+	realRes := NewResolver("", "", nil, "ipv4_first")
+	localAddrs, err := realRes.ResolveAll(context.Background(), "localhost", 0, false)
+	if err != nil || len(localAddrs) == 0 || !localAddrs[0].Is4() || !localAddrs[0].IsLoopback() {
+		t.Fatalf("real system resolver ipv4_first localhost lookup failed: addrs=%v err=%v", localAddrs, err)
+	}
 }

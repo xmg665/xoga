@@ -116,7 +116,41 @@ rules = [
 		t.Fatalf("half-written malformed routes.toml wiped previous valid routes: %+v", r)
 	}
 
-	// 3. Complete writing valid updated TOML (even at SAME mtime as future2!) -> must reload cleanly!
+	// 2b. Simulate mid-quote truncation (e.g. `outbound = "socks5://127.0.0.1:40` missing closing quote)
+	midQuote := `
+[[routes]]
+name = "ai-warp-v2"
+rules = ["domain:claude.ai"]
+outbound = "socks5://127.0.0.1:40
+`
+	if err := os.WriteFile(rtPath, []byte(midQuote), 0644); err != nil {
+		t.Fatal(err)
+	}
+	future2b := time.Now().Add(12 * time.Second)
+	_ = os.Chtimes(rtPath, future2b, future2b)
+	eng.reloadNow(false)
+	if r := eng.DecideWithPort("chatgpt.com", 443, "", "tls"); r.Action != ActionProxy || r.RuleName != "ai-warp" {
+		t.Fatalf("mid-quote truncated routes.toml wiped previous valid routes: %+v", r)
+	}
+
+	// 2c. Simulate bare truncated key line without `=`
+	bareKey := `
+[[routes]]
+name = "ai-warp-v2"
+rules = ["domain:claude.ai"]
+outb
+`
+	if err := os.WriteFile(rtPath, []byte(bareKey), 0644); err != nil {
+		t.Fatal(err)
+	}
+	future2c := time.Now().Add(15 * time.Second)
+	_ = os.Chtimes(rtPath, future2c, future2c)
+	eng.reloadNow(false)
+	if r := eng.DecideWithPort("chatgpt.com", 443, "", "tls"); r.Action != ActionProxy || r.RuleName != "ai-warp" {
+		t.Fatalf("bare-key truncated routes.toml wiped previous valid routes: %+v", r)
+	}
+
+	// 3. Complete writing valid updated TOML (even at SAME mtime as future2c!) -> must reload cleanly!
 	validTOML2 := `
 [[routes]]
 name = "ai-warp-v2"
@@ -131,14 +165,45 @@ port = 40001
 	if err := os.WriteFile(rtPath, []byte(validTOML2), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Chtimes(rtPath, future2, future2) // identical mtime to the rejected write, proving routeStat wasn't latched!
+	_ = os.Chtimes(rtPath, future2c, future2c) // identical mtime to the rejected write, proving routeStat wasn't latched!
 	eng.reloadNow(false)
 
 	if r := eng.DecideWithPort("claude.ai", 443, "", "tls"); r.Action != ActionProxy || r.RuleName != "ai-warp-v2" || r.Outbounds[0].Port != 40001 {
 		t.Fatalf("routes.toml failed to recover after valid write at same mtime: %+v", r)
 	}
 
-	// 4. Explicit `enable = false` intentionally disables file routes cleanly.
+	// 4. Per-route `enable = false` on all [[routes]] blocks intentionally disables file routes cleanly.
+	perRouteDisabled := `
+[[routes]]
+enable = false
+name = "ai-warp-v2"
+rules = ["domain:claude.ai"]
+[[routes.outs]]
+type = "socks5"
+server = "127.0.0.1"
+port = 40001
+`
+	if err := os.WriteFile(rtPath, []byte(perRouteDisabled), 0644); err != nil {
+		t.Fatal(err)
+	}
+	future3a := time.Now().Add(18 * time.Second)
+	_ = os.Chtimes(rtPath, future3a, future3a)
+	eng.reloadNow(false)
+	if r := eng.DecideWithPort("claude.ai", 443, "", "tls"); r.Action != ActionDirect {
+		t.Fatalf("per-route enable=false did not disable file routes: %+v", r)
+	}
+
+	// Re-enable validTOML2 then verify top-level `enable = false` disables cleanly too.
+	if err := os.WriteFile(rtPath, []byte(validTOML2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	future3b := time.Now().Add(19 * time.Second)
+	_ = os.Chtimes(rtPath, future3b, future3b)
+	eng.reloadNow(false)
+	if r := eng.DecideWithPort("claude.ai", 443, "", "tls"); r.Action != ActionProxy {
+		t.Fatalf("failed to re-enable routes.toml: %+v", r)
+	}
+
 	if err := os.WriteFile(rtPath, []byte("enable = false\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -148,5 +213,23 @@ port = 40001
 
 	if r := eng.DecideWithPort("claude.ai", 443, "", "tls"); r.Action != ActionDirect {
 		t.Fatalf("explicit enable=false did not disable file routes: %+v", r)
+	}
+}
+
+func TestIsIPWhitelisted(t *testing.T) {
+	tmp := t.TempDir()
+	whitePath := filepath.Join(tmp, "whiteList")
+	if err := os.WriteFile(whitePath, []byte("10.1.2.3\n192.168.50.0/24\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	eng := NewEngine(true, whitePath, "", "", nil)
+	if !eng.IsIPWhitelisted(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected 10.1.2.3 to be whitelisted")
+	}
+	if !eng.IsIPWhitelisted(netip.MustParseAddr("::ffff:192.168.50.42")) {
+		t.Fatal("expected IPv4-mapped 192.168.50.42 to be whitelisted")
+	}
+	if eng.IsIPWhitelisted(netip.MustParseAddr("198.18.0.5")) {
+		t.Fatal("expected 198.18.0.5 NOT to be whitelisted")
 	}
 }

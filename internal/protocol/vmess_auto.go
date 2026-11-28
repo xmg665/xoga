@@ -563,10 +563,30 @@ func (r *legacyRing) lookup(idx *UserIndex, authID [16]byte) (*VMessUserEntry, [
 	return nil, stamp, false
 }
 
+func (r *legacyRing) windowBounds() (int64, int64, bool) {
+	r.mu.RLock()
+	ok := r.hasWindow
+	ws, we := r.winStart, r.winEnd
+	r.mu.RUnlock()
+	return ws, we, ok
+}
+
+func (r *legacyRing) windowBoundsForUUID(uuid [16]byte) (int64, int64, bool) {
+	r.mu.RLock()
+	ok := r.hasWindow
+	if ok {
+		_, ok = r.uuidToIdx[uuid]
+	}
+	ws, we := r.winStart, r.winEnd
+	r.mu.RUnlock()
+	return ws, we, ok
+}
+
 type sharedLegacyNode struct {
-	current func() *UserIndex
-	lastIdx *UserIndex
-	uuids   map[[16]byte]struct{}
+	current   func() *UserIndex
+	lastIdx   *UserIndex
+	syncedIdx *atomic.Pointer[UserIndex]
+	uuids     map[[16]byte]struct{}
 }
 
 // sharedLegacyManager maintains a single process-wide pointer-free legacyAuthRing
@@ -629,6 +649,10 @@ func diffIndexUUIDs(oldSet map[[16]byte]struct{}, idx *UserIndex) (added, remove
 }
 
 func (m *sharedLegacyManager) register(current func() *UserIndex) uint64 {
+	return m.registerWithSync(current, nil)
+}
+
+func (m *sharedLegacyManager) registerWithSync(current func() *UserIndex, syncedIdx *atomic.Pointer[UserIndex]) uint64 {
 	m.mu.Lock()
 	if m.nodes == nil {
 		m.nodes = make(map[uint64]*sharedLegacyNode)
@@ -636,8 +660,9 @@ func (m *sharedLegacyManager) register(current func() *UserIndex) uint64 {
 	m.nextID++
 	id := m.nextID
 	node := &sharedLegacyNode{
-		current: current,
-		uuids:   make(map[[16]byte]struct{}),
+		current:   current,
+		syncedIdx: syncedIdx,
+		uuids:     make(map[[16]byte]struct{}),
 	}
 	m.nodes[id] = node
 
@@ -648,6 +673,9 @@ func (m *sharedLegacyManager) register(current func() *UserIndex) uint64 {
 	added, removed := diffIndexUUIDs(node.uuids, idx)
 	node.lastIdx = idx
 	m.ring.applyUUIDDiff(added, removed)
+	if node.syncedIdx != nil {
+		node.syncedIdx.Store(idx)
+	}
 
 	var startTickerCh chan struct{}
 	if !m.running {
@@ -677,6 +705,9 @@ func (m *sharedLegacyManager) syncNode(id uint64, idx *UserIndex) {
 	added, removed := diffIndexUUIDs(node.uuids, idx)
 	node.lastIdx = idx
 	m.ring.applyUUIDDiff(added, removed)
+	if node.syncedIdx != nil {
+		node.syncedIdx.Store(idx)
+	}
 	m.mu.Unlock()
 }
 
@@ -729,6 +760,9 @@ func (m *sharedLegacyManager) runTicker(stopCh chan struct{}) {
 				added, removed := diffIndexUUIDs(node.uuids, idx)
 				node.lastIdx = idx
 				m.ring.applyUUIDDiff(added, removed)
+				if node.syncedIdx != nil {
+					node.syncedIdx.Store(idx)
+				}
 			}
 			m.mu.Unlock()
 			m.ring.advanceIfOpen(time.Now().Unix(), stopCh)
@@ -741,10 +775,11 @@ func (m *sharedLegacyManager) runTicker(stopCh chan struct{}) {
 // When started via start(), all Server instances share a single process-wide
 // pointer-free ring while verifying per-node membership in O(1) against UserIndex.
 type legacyAuthCache struct {
-	mu      sync.Mutex
-	started atomic.Bool
-	nodeID  uint64
-	current func() *UserIndex
+	mu        sync.Mutex
+	started   atomic.Bool
+	syncedIdx atomic.Pointer[UserIndex]
+	nodeID    uint64
+	current   func() *UserIndex
 
 	// Standalone local ring used only when refresh() is invoked directly without start() (e.g. unit tests).
 	local        *legacyRing
@@ -813,6 +848,40 @@ func (c *legacyAuthCache) lookup(authID [16]byte) (*VMessUserEntry, [8]byte, boo
 	return c.lookupIn(c.localLastIdx.Load(), authID)
 }
 
+// syncedWindowBounds reports the currently indexed [winStart, winEnd] range when this cache
+// is already synchronized with idx, allowing readLegacyVMessHeader to skip redundant n=0 scans.
+func (c *legacyAuthCache) syncedWindowBounds(idx *UserIndex) (int64, int64, bool) {
+	if c.started.Load() {
+		if c.syncedIdx.Load() != idx {
+			return 0, 0, false
+		}
+		return globalLegacyAuth.ring.windowBounds()
+	}
+	c.mu.Lock()
+	local := c.local
+	lastIdx := c.localLastIdx.Load()
+	c.mu.Unlock()
+	if local == nil || lastIdx != idx {
+		return 0, 0, false
+	}
+	return local.windowBounds()
+}
+
+// windowBoundsForUUID reports the indexed [winStart, winEnd] range if uuid is present in the active ring.
+func (c *legacyAuthCache) windowBoundsForUUID(idx *UserIndex, uuid [16]byte) (int64, int64, bool) {
+	if c.started.Load() {
+		return globalLegacyAuth.ring.windowBoundsForUUID(uuid)
+	}
+	c.mu.Lock()
+	local := c.local
+	lastIdx := c.localLastIdx.Load()
+	c.mu.Unlock()
+	if local == nil || lastIdx != idx {
+		return 0, 0, false
+	}
+	return local.windowBoundsForUUID(uuid)
+}
+
 // start attaches this server to the process-wide shared legacy auth ring.
 func (c *legacyAuthCache) start(current func() *UserIndex) {
 	c.mu.Lock()
@@ -821,7 +890,7 @@ func (c *legacyAuthCache) start(current func() *UserIndex) {
 		return
 	}
 	c.current = current
-	c.nodeID = globalLegacyAuth.register(current)
+	c.nodeID = globalLegacyAuth.registerWithSync(current, &c.syncedIdx)
 	c.started.Store(true)
 	c.mu.Unlock()
 }
@@ -832,6 +901,7 @@ func (c *legacyAuthCache) close() {
 	wasStarted := c.started.Swap(false)
 	c.nodeID = 0
 	c.current = nil
+	c.syncedIdx.Store(nil)
 	c.mu.Unlock()
 	if wasStarted && id != 0 {
 		globalLegacyAuth.unregister(id)

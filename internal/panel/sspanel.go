@@ -142,6 +142,8 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	etag := c.nodeETag
 	c.mu.Unlock()
 
+	var prefetchedRules []string
+	var hasPrefetchedRules bool
 	u := c.modURL(fmt.Sprintf("/mod_mu/nodes/%d/info", c.cfg.NodeID), false)
 	body, newETag, status, err := c.doGet(ctx, u, etag)
 	if errors.Is(err, ErrNotModified) {
@@ -156,7 +158,8 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 		if len(body) == 0 {
 			return nil, ErrNotModified
 		}
-		_ = rules
+		prefetchedRules = rules
+		hasPrefetchedRules = true
 	} else if err != nil {
 		return nil, fmt.Errorf("fetch SSPanel node info (HTTP %d): %w", status, err)
 	}
@@ -329,7 +332,10 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	}
 
 	// Optionally pull SSPanel-UIM dynamic audit rules (`/mod_mu/func/detect_rules`)
-	rules := c.fetchDetectRules(ctx)
+	rules := prefetchedRules
+	if !hasPrefetchedRules {
+		rules = c.fetchDetectRules(ctx)
+	}
 	if len(rules) > 0 {
 		spec.Routes = append(spec.Routes, acl.DynamicRoute{
 			Matches: rules,
@@ -451,10 +457,10 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 				}
 			}
 
-			close(call.done)
 			detectInflightMu.Lock()
 			delete(detectInflight, cacheKey)
 			detectInflightMu.Unlock()
+			close(call.done)
 		}()
 	}
 	detectInflightMu.Unlock()
@@ -872,6 +878,17 @@ func (c *SSPanelClient) doPost(ctx context.Context, fullURL string, v any) error
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("POST %d: %s", resp.StatusCode, truncateMsg(body))
+	}
+	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 {
+		var ack struct {
+			Ret *int `json:"ret"`
+		}
+		if err := json.Unmarshal(trimmed, &ack); err != nil {
+			return fmt.Errorf("POST %d invalid JSON response: %w (body: %s)", resp.StatusCode, err, truncateMsg(body))
+		}
+		if ack.Ret != nil && *ack.Ret != 1 {
+			return fmt.Errorf("POST %d panel ret=%d: %s", resp.StatusCode, *ack.Ret, truncateMsg(body))
+		}
 	}
 	return nil
 }

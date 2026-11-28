@@ -685,7 +685,10 @@ func (c *UniProxyClient) FetchAliveList(ctx context.Context) (*AliveList, error)
 	var wrapper struct {
 		Alive json.RawMessage `json:"alive"`
 	}
-	if err := json.Unmarshal(body, &wrapper); err != nil || len(wrapper.Alive) == 0 {
+	if err := json.Unmarshal(body, &wrapper); err != nil {
+		return nil, fmt.Errorf("decode UniProxy alivelist: %w (body: %s)", err, truncateMsg(body))
+	}
+	if len(wrapper.Alive) == 0 {
 		return &AliveList{}, nil
 	}
 	// Note: PHP panels serialize empty associative arrays as `[]`; return non-nil empty AliveList so stale remoteIPs clear!
@@ -828,6 +831,20 @@ func (c *UniProxyClient) doPostJSON(ctx context.Context, fullURL string, v any, 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("POST %d: %s", resp.StatusCode, truncateMsg(body))
 	}
+	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 {
+		if !json.Valid(trimmed) {
+			return fmt.Errorf("POST %d invalid JSON response: %s", resp.StatusCode, truncateMsg(body))
+		}
+		if bytes.Equal(trimmed, []byte("false")) {
+			return fmt.Errorf("POST %d panel rejected request: false", resp.StatusCode)
+		}
+		var obj struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(trimmed, &obj) == nil && bytes.Equal(bytes.TrimSpace(obj.Data), []byte("false")) {
+			return fmt.Errorf("POST %d panel rejected request: %s", resp.StatusCode, truncateMsg(body))
+		}
+	}
 	return nil
 }
 
@@ -861,7 +878,7 @@ func parseAnyInt(v any) int {
 }
 
 func truncateMsg(b []byte) string {
-	s := strings.Join(strings.Fields(string(b)), " ")
+	s := redactQuerySecrets(strings.Join(strings.Fields(string(b)), " "))
 	if len(s) > 200 {
 		return s[:200] + "..."
 	}

@@ -64,6 +64,7 @@ const (
 	qTypeA              uint16 = 1
 	qTypeAAAA           uint16 = 28
 	maxCacheEntries            = 4096
+	maxNegCacheEntries         = 4096
 	systemDNSServer            = "__system__"
 	defaultSystemDNSTTL uint32 = 60
 	negTTLNotFound      int64  = 15
@@ -181,8 +182,13 @@ type cacheKey struct {
 type cacheEntry struct {
 	addrs      []netip.Addr
 	expires    int64 // Unix seconds for positive entry
-	negErr     error // non-nil when negative-cached
-	negExpires int64 // Unix seconds for negative cache entry
+	negErr     error // non-nil when serve-stale backoff is active on a positive entry
+	negExpires int64 // Unix seconds for serve-stale retry backoff
+}
+
+type negCacheEntry struct {
+	err     error
+	expires int64 // Unix seconds
 }
 
 type inflightCall struct {
@@ -208,8 +214,9 @@ type Resolver struct {
 	lastMtime time.Time
 	lastCheck atomic.Int64
 
-	cacheMu sync.RWMutex
-	cache   map[cacheKey]cacheEntry
+	cacheMu  sync.RWMutex
+	cache    map[cacheKey]cacheEntry
+	negCache map[cacheKey]negCacheEntry
 
 	inflightMu sync.Mutex
 	inflight   map[cacheKey]*inflightCall
@@ -225,6 +232,7 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 		defaultServers:  normalizeServerList(defaultServers),
 		defaultStrategy: ParseStrategy(defaultStrategy),
 		cache:           make(map[cacheKey]cacheEntry, 256),
+		negCache:        make(map[cacheKey]negCacheEntry, 128),
 		inflight:        make(map[cacheKey]*inflightCall, 32),
 		dohClient: &http.Client{
 			// Do NOT set a hard Client.Timeout here because reloadNow(true) uses an 8s
@@ -360,24 +368,24 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 
 	var staleAddrs []netip.Addr
 	r.cacheMu.RLock()
-	if ce, ok := r.cache[ck]; ok {
-		if len(ce.addrs) > 0 {
-			if ce.expires > now {
-				addrs := ce.addrs
+	if ce, ok := r.cache[ck]; ok && len(ce.addrs) > 0 {
+		if ce.expires > now {
+			addrs := ce.addrs
+			r.cacheMu.RUnlock()
+			return addrs, nil
+		}
+		// Keep recently expired IPs (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
+		if now-ce.expires <= 1800 {
+			staleAddrs = ce.addrs
+			if ce.negExpires > now {
 				r.cacheMu.RUnlock()
-				return addrs, nil
-			}
-			// Keep recently expired IPs (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
-			if now-ce.expires <= 1800 {
-				staleAddrs = ce.addrs
-				if ce.negExpires > now {
-					r.cacheMu.RUnlock()
-					return staleAddrs, nil
-				}
+				return staleAddrs, nil
 			}
 		}
-		if len(staleAddrs) == 0 && ce.negErr != nil && ce.negExpires > now {
-			negErr := ce.negErr
+	}
+	if len(staleAddrs) == 0 {
+		if ne, ok := r.negCache[ck]; ok && ne.err != nil && ne.expires > now {
+			negErr := ne.err
 			r.cacheMu.RUnlock()
 			return nil, negErr
 		}
@@ -389,6 +397,36 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 	r.inflightMu.Lock()
 	call, dup := r.inflight[ck]
 	if !dup {
+		// Double-check positive/negative caches under inflightMu so a caller arriving right after
+		// a sibling inflight finished never kicks off a redundant duplicate upstream query.
+		now2 := time.Now().Unix()
+		r.cacheMu.RLock()
+		if ce, ok := r.cache[ck]; ok && len(ce.addrs) > 0 {
+			if ce.expires > now2 {
+				addrs := ce.addrs
+				r.cacheMu.RUnlock()
+				r.inflightMu.Unlock()
+				return addrs, nil
+			}
+			if now2-ce.expires <= 1800 {
+				staleAddrs = ce.addrs
+				if ce.negExpires > now2 {
+					r.cacheMu.RUnlock()
+					r.inflightMu.Unlock()
+					return staleAddrs, nil
+				}
+			}
+		}
+		if len(staleAddrs) == 0 {
+			if ne, ok := r.negCache[ck]; ok && ne.err != nil && ne.expires > now2 {
+				negErr := ne.err
+				r.cacheMu.RUnlock()
+				r.inflightMu.Unlock()
+				return nil, negErr
+			}
+		}
+		r.cacheMu.RUnlock()
+
 		call = &inflightCall{done: make(chan struct{})}
 		r.inflight[ck] = call
 		go func(srvs []string) {
@@ -439,11 +477,11 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 			call.addrs = addrs
 			call.ttl = ttl
 			call.err = lastErr
-			close(call.done)
 
 			r.inflightMu.Lock()
 			delete(r.inflight, ck)
 			r.inflightMu.Unlock()
+			close(call.done)
 		}(servers)
 	}
 	r.inflightMu.Unlock()
@@ -499,16 +537,17 @@ func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
 
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
+	delete(r.negCache, ck)
 	if len(r.cache) >= maxCacheEntries {
 		for k, v := range r.cache {
-			if (len(v.addrs) == 0 && v.negExpires <= now) || (len(v.addrs) > 0 && now-v.expires > 1800) {
+			if len(v.addrs) == 0 || now-v.expires > 1800 {
 				delete(r.cache, k)
 			}
 		}
 		if len(r.cache) >= maxCacheEntries {
-			// Prefer evicting negative-only entries before touching positive entries.
+			// Prefer evicting expired serve-stale entries before touching fresh TTL-valid answers.
 			for k, v := range r.cache {
-				if len(v.addrs) == 0 {
+				if v.expires <= now {
 					delete(r.cache, k)
 				}
 			}
@@ -544,30 +583,29 @@ func (r *Resolver) putNegativeCache(ck cacheKey, negErr error, ttlSec int64) {
 		r.cache[ck] = cur
 		return
 	}
-	if len(r.cache) >= maxCacheEntries {
-		for k, v := range r.cache {
-			if (len(v.addrs) == 0 && v.negExpires <= now) || (len(v.addrs) > 0 && now-v.expires > 1800) {
-				delete(r.cache, k)
+	if r.negCache == nil {
+		r.negCache = make(map[cacheKey]negCacheEntry, 128)
+	}
+	if len(r.negCache) >= maxNegCacheEntries {
+		for k, v := range r.negCache {
+			if v.expires <= now {
+				delete(r.negCache, k)
 			}
 		}
-		if len(r.cache) >= maxCacheEntries {
-			// Evict a handful of existing negative-only entries; never evict positive entries for a negative entry.
+		if len(r.negCache) >= maxNegCacheEntries {
+			// Evict ~25% negative entries so negative storms stay bounded O(1) amortized
+			// and never starve negative caching or evict positive entries.
 			evicted := 0
-			for k, v := range r.cache {
-				if len(v.addrs) == 0 {
-					delete(r.cache, k)
-					evicted++
-					if evicted >= 64 {
-						break
-					}
+			for k := range r.negCache {
+				delete(r.negCache, k)
+				evicted++
+				if evicted >= maxNegCacheEntries/4 {
+					break
 				}
 			}
 		}
-		if len(r.cache) >= maxCacheEntries {
-			return
-		}
 	}
-	r.cache[ck] = cacheEntry{negErr: negErr, negExpires: negExp}
+	r.negCache[ck] = negCacheEntry{err: negErr, expires: negExp}
 }
 
 func (r *Resolver) querySystemWithStrategy(ctx context.Context, domain string, strat Strategy) ([]netip.Addr, uint32, error) {
@@ -1199,6 +1237,7 @@ func (r *Resolver) reloadNow(initial bool) {
 	// Clear cached answers on reload so newly edited DNS unlock IPs apply immediately
 	r.cacheMu.Lock()
 	clear(r.cache)
+	clear(r.negCache)
 	r.cacheMu.Unlock()
 
 	if !initial && len(rules) > 0 {

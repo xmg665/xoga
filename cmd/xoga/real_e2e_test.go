@@ -41,22 +41,36 @@ import (
 
 func freePort(t *testing.T, netw string) int {
 	t.Helper()
-	if netw == "udp" {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+	return freeUniquePorts(t, netw, 1)[0]
+}
+
+func freeUniquePorts(t *testing.T, netw string, count int) []int {
+	t.Helper()
+	ports := make([]int, 0, count)
+	closers := make([]io.Closer, 0, count)
+	defer func() {
+		for _, c := range closers {
+			_ = c.Close()
 		}
-		p := pc.LocalAddr().(*net.UDPAddr).Port
-		_ = pc.Close()
-		return p
+	}()
+	for len(ports) < count {
+		if netw == "udp" {
+			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			closers = append(closers, pc)
+			ports = append(ports, pc.LocalAddr().(*net.UDPAddr).Port)
+		} else {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			closers = append(closers, ln)
+			ports = append(ports, ln.Addr().(*net.TCPAddr).Port)
+		}
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return p
+	return ports
 }
 
 func readProcVmRSSKiB(pid int) (int64, error) {
@@ -821,10 +835,9 @@ func TestRealMachineLiveLogBugFixesE2E(t *testing.T) {
 	}()
 	dnsAddr := dnsPC.LocalAddr().String()
 
-	// 3. Allocate ports for 3 SSPanel nodes: 781 (VLESS+WS), 782 (VMess+WS), 783 (Trojan+TCP)
-	port781 := freePort(t, "tcp")
-	port782 := freePort(t, "tcp")
-	port783 := freePort(t, "tcp")
+	// 3. Allocate unique local ports for 3 SSPanel nodes: 781 (VLESS+WS), 782 (VMess+WS), 783 (Trojan+TCP)
+	ports := freeUniquePorts(t, "tcp", 3)
+	port781, port782, port783 := ports[0], ports[1], ports[2]
 
 	u1Str, u1Bytes := deterministicUUID(101)
 	const trojanPass = "e2e-trojan-live-pass"
@@ -878,6 +891,7 @@ type = "direct"
 	confText := fmt.Sprintf(`type=sspanel-uim
 server_type=auto
 node_id=781,782,783
+listen_ip=127.0.0.1
 webapi_url=%s
 webapi_key=e2e-sspanel-key
 force_close_ssl=true
@@ -1068,6 +1082,15 @@ log_level=info
 		if r3, err := sendVLESS(c3, "spoofed-xff"); err == nil && bytes.Contains(r3, []byte("spoofed-xff")) {
 			t.Fatalf("NEW-1 security regression: untrusted public IP spoofed X-Forwarded-For to share active slot!")
 		}
+
+		// Conn 4 from trusted public relay 203.175.12.253 where an attacker prepended spoofed 198.51.100.77
+		// ahead of the real appended client IP 198.51.100.88 -> right-to-left unwinding sees 198.51.100.88
+		// and MUST reject it under device_limit=1 instead of trusting the spoofed leftmost token!
+		c4 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21004 8080\r\n", "X-Forwarded-For: 198.51.100.77, 198.51.100.88\r\n")
+		defer c4.Close()
+		if r4, err := sendVLESS(c4, "spoofed-leading-xff"); err == nil && bytes.Contains(r4, []byte("spoofed-leading-xff")) {
+			t.Fatalf("NEW-1 security regression: client-spoofed leftmost X-Forwarded-For bypassed device_limit behind trusted relay!")
+		}
 	})
 
 	// BUG-5: Legacy MD5 VMess client with +81s clock skew succeeds end-to-end!
@@ -1196,6 +1219,21 @@ log_level=info
 		_ = cGFW.Close()
 		if dnsHits.Load() < 2 {
 			t.Fatalf("expected mock DNS to resolve overridden direct domains, got %d hits", dnsHits.Load())
+		}
+
+		// Explicitly whitelisted literal IP 127.0.0.1 with HTTP Host MUST dial 127.0.0.1 directly
+		// WITHOUT overriding to Host or triggering DNS lookup!
+		dnsBefore := dnsHits.Load()
+		httpWhite := []byte("GET /white HTTP/1.1\r\nHost: internal-only.corp.local\r\n\r\n")
+		cWhite := dialTrojan([]byte{127, 0, 0, 1}, echoPort, httpWhite)
+		gotW := make([]byte, len(httpWhite))
+		if _, err := io.ReadFull(cWhite, gotW); err != nil || !bytes.Equal(gotW, httpWhite) {
+			_ = cWhite.Close()
+			t.Fatalf("whitelisted 127.0.0.1 with HTTP Host failed: got=%q err=%v", gotW, err)
+		}
+		_ = cWhite.Close()
+		if dnsHits.Load() != dnsBefore {
+			t.Fatalf("whitelisted literal IP triggered DNS rewrite (%d -> %d)", dnsBefore, dnsHits.Load())
 		}
 
 		// Unresolved metadata 169.254.169.254, 0.0.0.1, 198.18.0.5, 240.0.0.1 MUST be blocked!

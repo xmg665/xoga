@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
@@ -25,7 +26,9 @@ import (
 
 const (
 	defaultPushTrafficTimeout   = 12 * time.Second
-	defaultShutdownFlushTimeout = 12 * time.Second
+	defaultShutdownFlushTimeout = 20 * time.Second
+	defaultShutdownBudget       = 24 * time.Second
+	minShutdownFlushTimeout     = 4 * time.Second
 	defaultStartRetryInterval   = 5 * time.Second
 )
 
@@ -136,11 +139,13 @@ type nodeWorker struct {
 	curServer     *protocol.Server
 	pendingServer *protocol.Server
 	curUsers      []*stats.UserEntry
+	shutdownAt    atomic.Int64 // UnixNano recorded when ctx cancels, bounding total shutdown < 30s
 
 	// Optional overrides for fast deterministic unit tests (0 = production defaults).
 	pushTrafficTimeout   time.Duration
 	shutdownFlushTimeout time.Duration
 	startRetryInterval   time.Duration
+	pullIntervalOverride time.Duration
 }
 
 func (w *nodeWorker) trafficTimeout() time.Duration {
@@ -154,7 +159,17 @@ func (w *nodeWorker) flushTimeout() time.Duration {
 	if w.shutdownFlushTimeout > 0 {
 		return w.shutdownFlushTimeout
 	}
-	return defaultShutdownFlushTimeout
+	timeout := defaultShutdownFlushTimeout
+	if ts := w.shutdownAt.Load(); ts > 0 {
+		remaining := defaultShutdownBudget - time.Since(time.Unix(0, ts))
+		if remaining < minShutdownFlushTimeout {
+			remaining = minShutdownFlushTimeout
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return timeout
 }
 
 func (w *nodeWorker) retryInterval() time.Duration {
@@ -272,6 +287,11 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (w *nodeWorker) runLoop(ctx context.Context, bootstrapSem chan struct{}) {
+	stopCancelTrack := context.AfterFunc(ctx, func() {
+		w.shutdownAt.CompareAndSwap(0, time.Now().UnixNano())
+	})
+	defer stopCancelTrack()
+
 	retryDur := w.retryInterval()
 	panelRefreshEvery := max(w.cfg.CheckInterval/5, 12)
 	localStartRetries := 0
@@ -326,7 +346,11 @@ func (w *nodeWorker) runLoop(ctx context.Context, bootstrapSem chan struct{}) {
 		pushSec = w.curSpec.PushInterval
 	}
 
-	pullTicker := time.NewTicker(time.Duration(pullSec) * time.Second)
+	pullDur := time.Duration(pullSec) * time.Second
+	if w.pullIntervalOverride > 0 {
+		pullDur = w.pullIntervalOverride
+	}
+	pullTicker := time.NewTicker(pullDur)
 	pushTicker := time.NewTicker(time.Duration(pushSec) * time.Second)
 	var dyCh <-chan time.Time
 	var dyTicker *time.Ticker
@@ -334,8 +358,37 @@ func (w *nodeWorker) runLoop(ctx context.Context, bootstrapSem chan struct{}) {
 		dyTicker = time.NewTicker(time.Second)
 		dyCh = dyTicker.C
 	}
+	var retryTimer *time.Timer
+	var retryCh <-chan time.Time
+	armRetry := func() {
+		if retryTimer == nil {
+			retryTimer = time.NewTimer(retryDur)
+			retryCh = retryTimer.C
+			return
+		}
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryTimer.Reset(retryDur)
+		retryCh = retryTimer.C
+	}
+	stopRetry := func() {
+		if retryTimer != nil {
+			if !retryTimer.Stop() {
+				select {
+				case <-retryTimer.C:
+				default:
+				}
+			}
+			retryCh = nil
+		}
+	}
 
 	defer func() {
+		stopRetry()
 		pullTicker.Stop()
 		pushTicker.Stop()
 		if dyTicker != nil {
@@ -353,9 +406,31 @@ func (w *nodeWorker) runLoop(ctx context.Context, bootstrapSem chan struct{}) {
 			return
 		case <-dyCh:
 			w.tracker.TickDynamicSpeedLimit()
+		case <-retryCh:
+			retryCh = nil
+			if w.pendingServer != nil && w.curServer == nil {
+				if err := w.pendingServer.Start(); err == nil {
+					w.curServer = w.pendingServer
+					w.pendingServer = nil
+					logger.Infof("[node %d] Loaded %d active users (goroutines=%d)", w.nodeID, len(w.curUsers), runtime.NumGoroutine())
+				} else {
+					logger.Errorf("[node %d] Inbound start failed (retrying in %s): %v", w.nodeID, retryDur, err)
+					armRetry()
+				}
+			}
 		case <-pullTicker.C:
 			if err := w.syncFromPanel(ctx, false); err != nil {
-				logger.Warnf("[node %d] Panel pull failed: %v", w.nodeID, err)
+				var startErr *serverStartError
+				if errors.As(err, &startErr) {
+					logger.Errorf("[node %d] Inbound start failed (retrying in %s): %v", w.nodeID, retryDur, startErr.err)
+				} else {
+					logger.Warnf("[node %d] Panel pull failed: %v", w.nodeID, err)
+				}
+			}
+			if w.pendingServer != nil && w.curServer == nil {
+				armRetry()
+			} else {
+				stopRetry()
 			}
 		case <-pushTicker.C:
 			w.pushToPanel(ctx)
@@ -422,6 +497,24 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 		}
 	}
 
+	if w.curServer == nil && w.pendingServer != nil && !configChanged {
+		if aclOnlyChanged {
+			w.curSpec = effectiveSpec
+			w.pendingServer.UpdateACL(w.buildACL(effectiveSpec.Routes))
+		}
+		if usersModified {
+			idx := protocol.BuildUserIndexForCipher(w.curSpec.Protocol, w.curSpec.Cipher, w.curUsers)
+			w.pendingServer.UpdateUsers(idx)
+		}
+		if err := w.pendingServer.Start(); err != nil {
+			return &serverStartError{err: err}
+		}
+		w.curServer = w.pendingServer
+		w.pendingServer = nil
+		logger.Infof("[node %d] Loaded %d active users (goroutines=%d)", w.nodeID, len(w.curUsers), runtime.NumGoroutine())
+		return nil
+	}
+
 	if configChanged || w.curServer == nil {
 		idx := protocol.BuildUserIndexForCipher(effectiveSpec.Protocol, effectiveSpec.Cipher, w.curUsers)
 		aclEng := w.buildACL(effectiveSpec.Routes)
@@ -433,6 +526,10 @@ func (w *nodeWorker) syncFromPanel(ctx context.Context, first bool) error {
 			return err
 		}
 		w.curSpec = effectiveSpec
+		if w.pendingServer != nil {
+			w.pendingServer.Close()
+			w.pendingServer = nil
+		}
 		if w.curServer != nil {
 			logger.Infof("[node %d] Listener config changed; restarting inbound gracefully...", w.nodeID)
 			w.curServer.Close()
@@ -515,13 +612,17 @@ func (w *nodeWorker) pushToPanel(ctx context.Context) {
 }
 
 func (w *nodeWorker) shutdown() {
-	w.pendingServer = nil
+	if w.pendingServer != nil {
+		w.pendingServer.Close()
+		w.pendingServer = nil
+	}
 	if w.curServer != nil {
 		w.curServer.Close()
 		w.curServer = nil
 	}
-	// systemd stops us after 30s; cap final flush to 12s (paired with 12s detached periodic
-	// PushTraffic so worst-case total shutdown stays well under 30s). A single attempt avoids
+	// systemd stops us after 30s; allow up to 20s for final flush on a normal shutdown,
+	// adaptively trimmed by remaining time inside the 24s total shutdown budget if an in-flight
+	// periodic PushTraffic already consumed part of the stop window. A single attempt avoids
 	// double counting if the panel applied a request whose reply was lost.
 	batch := w.tracker.HarvestTraffic(0)
 	if len(batch) == 0 {

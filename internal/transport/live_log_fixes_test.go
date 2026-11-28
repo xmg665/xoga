@@ -93,4 +93,32 @@ func TestNEW1TrustedProxyCIDRsWebSocketForwardedIP(t *testing.T) {
 	if got := runWS("127.0.0.1", "X-Real-IP: 198.51.100.55\r\n", false); got != "198.51.100.55" {
 		t.Fatalf("loopback peer ignored forwarded IP: got %s want 198.51.100.55", got)
 	}
+
+	// 8. Client-spoofed leading XFF behind trusted public relay that appends real client IP:
+	//    right-to-left unwinding MUST return 198.51.100.42 (real client), NOT 8.8.8.8 (spoofed)!
+	if got := runWS("203.175.12.253", "X-Forwarded-For: 8.8.8.8, 198.51.100.42\r\n", false); got != "198.51.100.42" {
+		t.Fatalf("spoofed leading XFF bypassed right-to-left extraction: got %s want 198.51.100.42", got)
+	}
+
+	// 9. Multi-header XFF smuggling (client sends first XFF header, trusted relay appends second):
+	//    right-to-left across all headers MUST extract 198.51.100.43!
+	multiXFF := "X-Forwarded-For: 8.8.8.8\r\nX-Forwarded-For: 198.51.100.43, 172.64.15.9\r\n"
+	if got := runWS("203.175.12.253", multiXFF, false); got != "198.51.100.43" {
+		t.Fatalf("multi-header XFF with trusted CDN hop failed: got %s want 198.51.100.43", got)
+	}
+
+	// 10. Garbage prefix in XFF followed by real client IP appended by trusted relay:
+	if got := runWS("203.175.12.253", "X-Forwarded-For: garbage, 198.51.100.44\r\n", false); got != "198.51.100.44" {
+		t.Fatalf("garbage-prefixed XFF failed: got %s want 198.51.100.44", got)
+	}
+
+	// 11. Malformed CF-Connecting-IP falls through cleanly to valid X-Real-IP instead of collapsing to relay IP:
+	if got := runWS("172.64.15.9", "CF-Connecting-IP: not-an-ip\r\nX-Real-IP: 198.51.100.45\r\n", false); got != "198.51.100.45" {
+		t.Fatalf("malformed CF-Connecting-IP did not fall back to X-Real-IP: got %s want 198.51.100.45", got)
+	}
+
+	// 12. All-private XFF chain behind loopback proxy falls back to leftmost valid private client IP:
+	if got := runWS("127.0.0.1", "X-Forwarded-For: 10.0.0.50, 127.0.0.1\r\n", false); got != "10.0.0.50" {
+		t.Fatalf("all-private XFF fallback failed: got %s want 10.0.0.50", got)
+	}
 }

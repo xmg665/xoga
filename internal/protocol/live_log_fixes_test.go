@@ -552,3 +552,111 @@ func crc32IEEE(b []byte) uint32 {
 	}
 	return ^crc
 }
+
+func TestLegacyVMessAutoSkipAndExplicitHeaderError(t *testing.T) {
+	echoHost, echoPort, closeEcho := startEchoTCPServer(t)
+	defer closeEcho()
+
+	// 1. Explicit vmess_legacy_users in aead mode: matched user with truncated header MUST report
+	//    `legacy_header user=<id>` (NOT fall through to `auth_no_user_match`)!
+	t.Run("ExplicitLegacyHeaderErrorSurfaced", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.ApplyKV("vmess_auth_mode", "aead")
+		cfg.ApplyKV("vmess_legacy_users", "42:1")
+		tr := stats.NewTracker(cfg)
+		users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{
+			{ID: 42, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"},
+		})
+		idx := BuildUserIndexForProtocol("vmess", users, 0)
+		srv, err := NewServer(cfg, &panel.NodeSpec{Protocol: "vmess", ListenIP: "127.0.0.1", ServerPort: 0, Network: "tcp"}, tr, idx, acl.NewEngine(false, "", "", "", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Use alterID #1 so we also exercise alterID path
+		altUUID := nextVMessAlterID(users[0].UUIDBytes)
+		var stamp [8]byte
+		binary.BigEndian.PutUint64(stamp[:], uint64(time.Now().Unix()))
+		auth := hmacMD5Stamp(altUUID, stamp)
+
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		go func() {
+			_, _ = c2.Write(auth[:])
+			_ = c2.Close()
+		}()
+		_, _, _, _, _, reason := srv.handshakeVMess(c1)
+		if !strings.Contains(reason, "legacy_header") || !strings.Contains(reason, "user=42") || !strings.Contains(reason, "EOF") {
+			t.Fatalf("expected legacy_header error for matched vmess_legacy_users entry, got %q", reason)
+		}
+	})
+
+	// 2. Auto mode + vmess_legacy_users with alterID=1: primary UUID (n=0) succeeds via O(1) ring,
+	//    alterID (n=1) STILL succeeds via readLegacyVMessHeader even though n=0 is skipped,
+	//    and unmatched probes when alterID=0 short-circuit without redundant n=0 HMAC scans!
+	t.Run("AutoModeSkipsRedundantPrimaryScanWhilePreservingAlterID", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.ApplyKV("vmess_auth_mode", "auto")
+		cfg.ApplyKV("vmess_legacy_users", "501:0,502:1")
+		tr := stats.NewTracker(cfg)
+		users, _, _, _ := tr.ReconcileUsers([]stats.SyncUserSpec{
+			{ID: 501, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"},
+			{ID: 502, UUIDOrPass: "75eae340-a037-4cc2-b64c-ae5dc26cc897"},
+		})
+		idx := BuildUserIndexForProtocol("vmess", users, 0)
+		port := freeTCPPort(t)
+		srv, err := NewServer(cfg, &panel.NodeSpec{Protocol: "vmess", ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp"}, tr, idx, acl.NewEngine(false, "", "", "", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		// Send alterID #1 request for user 502
+		altID := nextVMessAlterID(users[1].UUIDBytes)
+		var stamp [8]byte
+		binary.BigEndian.PutUint64(stamp[:], uint64(time.Now().Unix()))
+		auth := hmacMD5Stamp(altID, stamp)
+		key := md5.Sum(append(users[1].UUIDBytes[:], []byte("c48619fe-8f02-49e0-b9e9-edf763e17e21")...))
+		iv := md5.Sum(bytes.Repeat(stamp[:], 4))
+		block, _ := aes.NewCipher(key[:])
+
+		header := make([]byte, 42)
+		header[0] = 1
+		_, _ = rand.Read(header[1:33])
+		header[33] = 7
+		header[35], header[37], header[40], header[41] = 5, 1, 2, byte(len(echoHost))
+		binary.BigEndian.PutUint16(header[38:40], echoPort)
+		header = append(header, echoHost...)
+		sum := fnv.New32a()
+		sum.Write(header)
+		header = sum.Sum(header)
+		reqKey, reqIV := [16]byte(header[17:33]), [16]byte(header[1:17])
+		respKey := md5.Sum(reqKey[:])
+		respIV := md5.Sum(reqIV[:])
+		cipher.NewCFBEncrypter(block, iv[:]).XORKeyStream(header, header)
+
+		payload := []byte("alterid-ok")
+		req := append(append(auth[:], header...), payload...)
+		c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write(req); err != nil {
+			t.Fatal(err)
+		}
+		resp := make([]byte, 4+len(payload))
+		if _, err := io.ReadFull(c, resp); err != nil {
+			t.Fatalf("alterID=1 legacy handshake under auto mode failed: %v", err)
+		}
+		rblk, _ := aes.NewCipher(respKey[:])
+		cipher.NewCFBDecrypter(rblk, respIV[:]).XORKeyStream(resp[:4], resp[:4])
+		if resp[0] != 7 || string(resp[4:]) != "alterid-ok" {
+			t.Fatalf("unexpected alterID=1 response: v=%d payload=%q", resp[0], resp[4:])
+		}
+	})
+}

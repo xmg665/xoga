@@ -37,7 +37,10 @@ func (f *fakePanelClient) ClearNodeConfigETag() {}
 
 func (f *fakePanelClient) FetchNodeConfig(ctx context.Context) (*panel.NodeSpec, error) {
 	f.fetchConfigCalls.Add(1)
-	return f.spec, nil
+	f.mu.Lock()
+	sp := f.spec
+	f.mu.Unlock()
+	return sp, nil
 }
 
 func (f *fakePanelClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, error) {
@@ -303,5 +306,145 @@ func TestBUG11StartupBindRetryDoesNotRepollPanelEveryRetry(t *testing.T) {
 	}
 	if got := cli.fetchUsersCalls.Load(); got != 1 {
 		t.Fatalf("expected 1 total FetchUsers call across bind recovery, got %d", got)
+	}
+}
+
+func TestRuntimeConfigChangeBindFailureRetriesPendingServerFast(t *testing.T) {
+	// Allocate two distinct ports: portA for initial bind, portB occupied during runtime switch.
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portA := lnA.Addr().(*net.TCPAddr).Port
+	_ = lnA.Close()
+
+	blockerB, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portB := blockerB.Addr().(*net.TCPAddr).Port
+
+	cfg := config.Default()
+	cfg.NodeID = 782
+	cfg.ForceCloseSSL = true
+	cfg.CheckInterval = 120
+	cfg.SubmitInterval = 120
+
+	cli := &fakePanelClient{
+		spec: &panel.NodeSpec{
+			Protocol:       "vless",
+			ListenIP:       "127.0.0.1",
+			ServerPort:     portA,
+			Network:        "tcp",
+			ConfigChecksum: "v1",
+		},
+		users: []stats.SyncUserSpec{{ID: 1, UUIDOrPass: "b831381d-6324-4d53-ad4f-8cda48b30811"}},
+	}
+
+	w := &nodeWorker{
+		nodeID:               782,
+		cfg:                  cfg,
+		client:               cli,
+		tracker:              stats.NewTracker(cfg),
+		dnsRes:               dns.NewResolver("", "", nil, "ipv4_only"),
+		baseACL:              acl.NewEngine(false, "", "", "", nil),
+		aclPool:              newSharedACLPool(),
+		startRetryInterval:   35 * time.Millisecond,
+		pullIntervalOverride: 450 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sem := make(chan struct{}, 2)
+
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		w.runLoop(ctx, sem)
+	}()
+
+	// Wait for portA to start accepting connections.
+	addrA := (&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: portA}).String()
+	readyA := false
+	for dl := time.Now().Add(2 * time.Second); time.Now().Before(dl); {
+		if c, derr := net.DialTimeout("tcp", addrA, 80*time.Millisecond); derr == nil {
+			_ = c.Close()
+			readyA = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !readyA {
+		_ = blockerB.Close()
+		cancel()
+		<-loopDone
+		t.Fatal("initial listener on portA never became ready")
+	}
+
+	// Switch panel spec to occupied portB -> runtime pull closes portA and fails to bind portB!
+	cli.mu.Lock()
+	cli.spec = &panel.NodeSpec{
+		Protocol:       "vless",
+		ListenIP:       "127.0.0.1",
+		ServerPort:     portB,
+		Network:        "tcp",
+		ConfigChecksum: "v2",
+	}
+	cli.mu.Unlock()
+
+	// Wait until runtime pull has attempted portB (portA is closed and fetchConfigCalls >= 2).
+	for dl := time.Now().Add(2 * time.Second); time.Now().Before(dl); {
+		if cli.fetchConfigCalls.Load() >= 2 {
+			if c, derr := net.DialTimeout("tcp", addrA, 40*time.Millisecond); derr != nil {
+				break
+			} else {
+				_ = c.Close()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Now release portB and verify steady-state retryTimer binds portB quickly WITHOUT waiting for next pullTicker!
+	pullsBeforeRelease := cli.fetchConfigCalls.Load()
+	_ = blockerB.Close()
+	addrB := blockerB.Addr().String()
+	boundB := false
+	for dl := time.Now().Add(350 * time.Millisecond); time.Now().Before(dl); {
+		if c, derr := net.DialTimeout("tcp", addrB, 80*time.Millisecond); derr == nil {
+			_ = c.Close()
+			boundB = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pullsAfterBind := cli.fetchConfigCalls.Load()
+	cancel()
+	<-loopDone
+	if !boundB {
+		t.Fatal("steady-state pendingServer retry failed to bind portB quickly via retryTimer")
+	}
+	if pullsAfterBind != pullsBeforeRelease {
+		t.Fatalf("expected steady-state retryTimer to recover without re-polling panel: before=%d after=%d", pullsBeforeRelease, pullsAfterBind)
+	}
+}
+
+func TestAdaptiveShutdownFlushBudget(t *testing.T) {
+	w := &nodeWorker{}
+	// 1. Fresh shutdown (no elapsed push time) -> full 20s budget.
+	if got := w.flushTimeout(); got != defaultShutdownFlushTimeout {
+		t.Fatalf("expected %v default flush timeout, got %v", defaultShutdownFlushTimeout, got)
+	}
+
+	// 2. Shutdown after 12s consumed by in-flight periodic push -> trimmed to ~12s (< 30s total).
+	w.shutdownAt.Store(time.Now().Add(-12 * time.Second).UnixNano())
+	gotMid := w.flushTimeout()
+	if gotMid > 12500*time.Millisecond || gotMid < 11*time.Second {
+		t.Fatalf("expected ~12s remaining flush budget after 12s push, got %v", gotMid)
+	}
+
+	// 3. Shutdown after >=22s elapsed -> floored at minShutdownFlushTimeout (4s).
+	w.shutdownAt.Store(time.Now().Add(-23 * time.Second).UnixNano())
+	if gotMin := w.flushTimeout(); gotMin != minShutdownFlushTimeout {
+		t.Fatalf("expected floor %v when budget exhausted, got %v", minShutdownFlushTimeout, gotMin)
 	}
 }

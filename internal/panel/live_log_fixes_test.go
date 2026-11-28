@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xmg665/xoga/internal/config"
+	"github.com/xmg665/xoga/internal/stats"
 )
 
 func TestNEW3SSPanelDetectRulesSharedKeySingleflightAndChangePropagation(t *testing.T) {
@@ -121,4 +122,137 @@ func TestNEW3SSPanelDetectRulesSharedKeySingleflightAndChangePropagation(t *test
 	if got := detectHits.Load(); got != 2 {
 		t.Fatalf("expected 2 total detect_rules HTTP GETs after settling, got %d", got)
 	}
+}
+
+func TestPanelPostValidatesBodyPreventsSilentTrafficLossAndRedactsSecrets(t *testing.T) {
+	batch := []stats.TrafficDelta{{UserID: 101, Upload: 2048, Download: 4096}}
+
+	t.Run("SSPanelPostRejectsRet0AndHTML200", func(t *testing.T) {
+		var mode atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			switch mode.Load() {
+			case 0:
+				_, _ = w.Write([]byte(`{"ret":0,"data":"invalid key"}`))
+			case 1:
+				_, _ = w.Write([]byte(`<html><body>502 Maintenance https://panel.test/mod_mu/users/traffic?key=TOPSECRETKEY99&node_id=851</body></html>`))
+			case 2:
+				_, _ = w.Write([]byte(`Connection refused`))
+			case 3:
+				_, _ = w.Write([]byte(`{"ret":1,"data":"ok"}`))
+			case 4:
+				// empty 200 body (compatible with minimal mocks)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := config.Default()
+		cfg.Type = "sspanel"
+		cfg.NodeID = 851
+		cfg.WebAPIURL = srv.URL
+		cfg.WebAPIKey = "TOPSECRETKEY99"
+		cli := NewSSPanelClient(cfg, srv.Client())
+
+		// ret=0 on HTTP 200 -> MUST fail so daemon rolls back traffic!
+		mode.Store(0)
+		if err := cli.PushTraffic(context.Background(), batch); err == nil || !strings.Contains(err.Error(), "ret=0") {
+			t.Fatalf("expected ret=0 error on HTTP 200, got %v", err)
+		}
+
+		// HTML maintenance page on HTTP 200 -> MUST fail AND redact echoed secret key!
+		mode.Store(1)
+		err := cli.PushTraffic(context.Background(), batch)
+		if err == nil {
+			t.Fatal("expected error on HTTP 200 HTML response")
+		}
+		if strings.Contains(err.Error(), "TOPSECRETKEY99") {
+			t.Fatalf("secret WebAPI key leaked in error snippet: %v", err)
+		}
+		if !strings.Contains(err.Error(), "key=***") {
+			t.Fatalf("expected redacted key=*** in error snippet, got %v", err)
+		}
+
+		// Plain non-JSON error text on HTTP 200 -> MUST fail!
+		mode.Store(2)
+		if err := cli.PushTraffic(context.Background(), batch); err == nil {
+			t.Fatal("expected error on HTTP 200 non-JSON body")
+		}
+
+		// Standard SSPanel ret=1 -> MUST succeed!
+		mode.Store(3)
+		if err := cli.PushTraffic(context.Background(), batch); err != nil {
+			t.Fatalf("expected ret=1 to succeed, got %v", err)
+		}
+
+		// Empty 200 body -> MUST succeed!
+		mode.Store(4)
+		if err := cli.PushTraffic(context.Background(), batch); err != nil {
+			t.Fatalf("expected empty 200 body to succeed, got %v", err)
+		}
+	})
+
+	t.Run("UniProxyPostAndAliveListRejectHTML200AndFalse", func(t *testing.T) {
+		var mode atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			if strings.HasSuffix(r.URL.Path, "/alivelist") {
+				switch mode.Load() {
+				case 0:
+					_, _ = w.Write([]byte(`<html><title>CF Challenge</title></html>`))
+				case 1:
+					_, _ = w.Write([]byte(`{"alive":[]}`))
+				}
+				return
+			}
+			switch mode.Load() {
+			case 0:
+				_, _ = w.Write([]byte(`<html><body>WAF block /api?token=UNIPROXYSECRET&node_id=1</body></html>`))
+			case 1:
+				_, _ = w.Write([]byte(`{"data":false,"message":"denied"}`))
+			case 2:
+				_, _ = w.Write([]byte(`false`))
+			case 3:
+				_, _ = w.Write([]byte(`{"data":true}`))
+			}
+		}))
+		defer srv.Close()
+
+		cfg := config.Default()
+		cfg.Type = "xboard"
+		cfg.ServerType = "vless"
+		cfg.NodeID = 1
+		cfg.WebAPIURL = srv.URL
+		cfg.WebAPIKey = "UNIPROXYSECRET"
+		cli := NewUniProxyClient(cfg, srv.Client())
+
+		mode.Store(0)
+		err := cli.PushTraffic(context.Background(), batch)
+		if err == nil {
+			t.Fatal("expected error on UniProxy HTTP 200 HTML response")
+		}
+		if strings.Contains(err.Error(), "UNIPROXYSECRET") {
+			t.Fatalf("secret UniProxy token leaked in error snippet: %v", err)
+		}
+		if _, aerr := cli.FetchAliveList(context.Background()); aerr == nil {
+			t.Fatal("expected FetchAliveList to return error on HTTP 200 HTML instead of empty AliveList")
+		}
+
+		mode.Store(1)
+		if err := cli.PushTraffic(context.Background(), batch); err == nil {
+			t.Fatal("expected error on UniProxy {\"data\":false}")
+		}
+		if al, aerr := cli.FetchAliveList(context.Background()); aerr != nil || al == nil {
+			t.Fatalf("expected valid empty {\"alive\":[]} to return non-nil empty AliveList, got al=%v err=%v", al, aerr)
+		}
+
+		mode.Store(2)
+		if err := cli.PushTraffic(context.Background(), batch); err == nil {
+			t.Fatal("expected error on UniProxy bare false")
+		}
+
+		mode.Store(3)
+		if err := cli.PushTraffic(context.Background(), batch); err != nil {
+			t.Fatalf("expected UniProxy {\"data\":true} to succeed, got %v", err)
+		}
+	})
 }
