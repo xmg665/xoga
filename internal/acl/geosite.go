@@ -119,8 +119,5 @@ func ExpandGeosite(pattern string) ([]string, bool) {
 	if list, ok := BuiltinGeosite[tag]; ok {
 		return list, true
 	}
-	if tag != "" && !strings.Contains(tag, "-") {
-		return []string{"keyword:" + tag}, true
-	}
 	return nil, false
 }

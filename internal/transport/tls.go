@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -90,11 +91,17 @@ func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 	acmeHubMu.Unlock()
 
 	if needStart && srv != nil {
-		go func() {
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		go func(s *http.Server) {
+			if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Warnf("ACME HTTP-01 challenge listener (:80) stopped: %v", err)
+				// Clear global acmeServer pointer so future registrations can retry binding :80.
+				acmeHubMu.Lock()
+				if acmeServer == s {
+					acmeServer = nil
+				}
+				acmeHubMu.Unlock()
 			}
-		}()
+		}(srv)
 	}
 	return mgr
 }
@@ -145,6 +152,9 @@ func BuildTLSConfigWithALPN(cfg *config.Config, serverName string, nextProtos []
 	}
 
 	// 1. Manual certificate files with hot mtime reload
+	if (cfg.CertFile != "") != (cfg.KeyFile != "") {
+		return nil, errors.New("partial manual TLS configuration: both cert_file and key_file must be set")
+	}
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		reloader, err := newCertReloader(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
@@ -279,7 +289,11 @@ func generateSelfSignedCert(commonName string) (tls.Certificate, error) {
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{commonName},
+	}
+	if ip := net.ParseIP(strings.Trim(commonName, "[]")); ip != nil {
+		tmpl.IPAddresses = []net.IP{ip}
+	} else if commonName != "" {
+		tmpl.DNSNames = []string{commonName}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {

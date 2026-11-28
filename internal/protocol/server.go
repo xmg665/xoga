@@ -40,7 +40,7 @@ import (
 type SSUserEntry struct {
 	User      *stats.UserEntry
 	MasterKey []byte   // derived via EVP_BytesToKey (AEAD) or base64/BLAKE3 (SS2022)
-	EIHHash   [16]byte // BLAKE3("shadowsocks 2022 identity subkey", userKey)[:16] for SS2022 EIH
+	EIHHash   [16]byte // BLAKE3::hash(userKey)[:16] for SS2022 EIH (SIP022)
 }
 
 // VMessUserEntry precomputes VMess cmdKey (`MD5(UUID + magic)`) and AuthID AES-128 block cipher
@@ -64,7 +64,8 @@ type UserIndex struct {
 	ssExactMode bool
 	ssCipher    string
 	VMessUsers  []VMessUserEntry
-	VMessBlocks []cipher.Block // compact 16B/user parallel slice for L1/L2 cache-friendly AuthID scan
+	VMessBlocks []cipher.Block   // compact 16B/user parallel slice for L1/L2 cache-friendly AuthID scan
+	VMessByUUID map[[16]byte]int // pointer-free O(1) UUID -> VMessUsers slice index for per-node legacy membership check
 }
 
 func (idx *UserIndex) LookupPassword(cred string) *stats.UserEntry {
@@ -141,13 +142,21 @@ func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, 
 	if needVMess {
 		idx.VMessUsers = make([]VMessUserEntry, 0, len(users))
 		idx.VMessBlocks = make([]cipher.Block, 0, len(users))
+		idx.VMessByUUID = make(map[[16]byte]int, len(users))
 	}
 
+	seenID := make(map[int]struct{}, len(users))
 	for _, u := range users {
-		if u.IsDisabled() {
+		if u == nil || u.IsDisabled() {
 			continue
 		}
-		if needTrojan {
+		if u.ID > 0 {
+			if _, dup := seenID[u.ID]; dup {
+				continue
+			}
+			seenID[u.ID] = struct{}{}
+		}
+		if needTrojan && (u.UUID != "" || u.Passwd != "") {
 			idx.ByTrojan[u.TrojanHash] = u
 			if u.UUID != "" && u.UUID != u.Passwd {
 				var altTrojan [56]byte
@@ -161,7 +170,9 @@ func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, 
 			}
 		}
 		if needAnyTLS {
-			idx.BySHA256[u.SHA256UUID] = u
+			if u.UUID != "" {
+				idx.BySHA256[u.SHA256UUID] = u
+			}
 			if u.Passwd != "" && u.Passwd != u.UUID {
 				idx.BySHA256[u.SHA256Passwd] = u
 			}
@@ -179,6 +190,7 @@ func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, 
 				idx.ByUUID[u.UUIDBytes] = u
 			}
 			if needVMess && u.VMessAuthReady && u.VMessAuthBlock != nil {
+				idx.VMessByUUID[u.UUIDBytes] = len(idx.VMessUsers)
 				idx.VMessUsers = append(idx.VMessUsers, VMessUserEntry{
 					User:      u,
 					CmdKey:    u.VMessCmdKey,
@@ -191,6 +203,9 @@ func buildUserIndexInternal(proto, cipherName string, users []*stats.UserEntry, 
 			secret := u.Passwd
 			if secret == "" {
 				secret = u.UUID
+			}
+			if secret == "" {
+				continue
 			}
 			var mk []byte
 			if exactSS {
@@ -383,6 +398,7 @@ func (s *Server) SSKeySize() int {
 func (s *Server) UpdateUsers(idx *UserIndex) {
 	s.userIdx.Store(idx)
 	s.hotRing.Reset()
+	s.legacy.sync(idx)
 }
 
 func (s *Server) UpdateACL(eng *acl.Engine) {
@@ -539,7 +555,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
 
 	if s.spec.Network == "ws" {
-		wsConn, err := transport.AcceptWebSocket(conn, s.spec.WSPath, s.cfg.ProxyProtocol)
+		// Never conflate L4 ProxyProtocol with L7 HTTP forwarded headers: L4 relays pass
+		// real client IP via PROXY header and do not strip client-spoofed CF-Connecting-IP/XFF.
+		wsConn, err := transport.AcceptWebSocket(conn, s.spec.WSPath, s.cfg.TrustForwardedIP)
 		if err != nil {
 			logger.Debugf("ws upgrade failed from %s: %v", conn.RemoteAddr(), err)
 			return
@@ -561,14 +579,18 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-// peekInitialPayload reads up to 2 KiB of initial client payload within 150ms (reassembling fragmented
-// TLS ClientHello records when split across 2 TCP segments) and IMMEDIATELY returns the pooled buffer
-// so idle streams never pin 2 KiB slabs in `bufpool`!
+// peekInitialPayload reads up to 8 KiB of initial client payload within 150ms (reassembling
+// fragmented post-quantum TLS ClientHello records such as X25519MLKEM768) and IMMEDIATELY
+// returns the pooled buffer so idle streams never pin slabs in `bufpool`!
 func (s *Server) peekInitialPayload(clientConn net.Conn) ([]byte, error) {
-	bp := bufpool.Get(bufpool.SmallSize)
+	return s.peekInitialPayloadWithTimeout(clientConn, 150*time.Millisecond)
+}
+
+func (s *Server) peekInitialPayloadWithTimeout(clientConn net.Conn, wait time.Duration) ([]byte, error) {
+	bp := bufpool.Get(8192)
 	defer bufpool.Put(bp)
 
-	deadline := time.Now().Add(150 * time.Millisecond)
+	deadline := time.Now().Add(wait)
 	_ = clientConn.SetReadDeadline(deadline)
 	defer func() { _ = clientConn.SetReadDeadline(time.Time{}) }()
 
@@ -585,8 +607,8 @@ func (s *Server) peekInitialPayload(clientConn net.Conn) ([]byte, error) {
 		return nil, nil
 	}
 
-	// Reassemble fragmented TLS ClientHello (e.g. Xray/sing-box 5-byte TLS record fragment) within same 150ms budget
-	for attempt := 0; attempt < 2 && n < len(buf); attempt++ {
+	// Reassemble fragmented / post-quantum TLS ClientHello records within same wait budget
+	for attempt := 0; attempt < 8 && n < len(buf); attempt++ {
 		needMore := false
 		if n < 5 && buf[0] == 0x16 {
 			needMore = true
@@ -609,6 +631,80 @@ func (s *Server) peekInitialPayload(clientConn net.Conn) ([]byte, error) {
 	out := make([]byte, n)
 	copy(out, buf[:n])
 	return out, nil
+}
+
+// readFullActive reads exactly len(buf) bytes from r while preserving partial progress across
+// idle read timeouts whenever bidirectional activity (lastActive) is within idleDur.
+func readFullActive(conn net.Conn, r io.Reader, buf []byte, idleDur time.Duration, lastActive *atomic.Int64, isDisabled func() bool) error {
+	off := 0
+	for off < len(buf) {
+		if isDisabled != nil && isDisabled() {
+			return stats.ErrUserDisabled
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
+		n, err := r.Read(buf[off:])
+		off += n
+		if n > 0 && lastActive != nil {
+			lastActive.Store(time.Now().UnixNano())
+		}
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && (isDisabled == nil || !isDisabled()) &&
+				lastActive != nil && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// discardActive discards exactly n bytes from r while staying timeout-resumable on active streams.
+func discardActive(conn net.Conn, r io.Reader, n int, idleDur time.Duration, lastActive *atomic.Int64, isDisabled func() bool) error {
+	if n <= 0 {
+		return nil
+	}
+	var scratch [1024]byte
+	rem := n
+	for rem > 0 {
+		want := rem
+		if want > len(scratch) {
+			want = len(scratch)
+		}
+		if err := readFullActive(conn, r, scratch[:want], idleDur, lastActive, isDisabled); err != nil {
+			return err
+		}
+		rem -= want
+	}
+	return nil
+}
+
+// udpRouteKey builds a stable key identifying the outbound UDP socket class (address family +
+// route outbound list) so multi-destination UDP sessions reuse sockets per route+family without
+// sticking IPv6 or proxy-routed packets onto an unrelated IPv4/direct socket.
+func udpRouteKey(route acl.OutboundTarget, isIPv6 bool) string {
+	fam := "4"
+	if isIPv6 {
+		fam = "6"
+	}
+	if len(route.Outbounds) == 0 {
+		return "direct:" + fam
+	}
+	var sb strings.Builder
+	sb.WriteString(fam)
+	for _, o := range route.Outbounds {
+		sb.WriteByte('|')
+		sb.WriteString(strings.ToLower(o.Type))
+		sb.WriteByte(':')
+		sb.WriteString(o.Server)
+		sb.WriteByte(':')
+		sb.WriteString(strconv.Itoa(o.Port))
+		sb.WriteByte(':')
+		sb.WriteString(o.ListenIPv4)
+		sb.WriteByte(':')
+		sb.WriteString(o.ListenIPv6)
+	}
+	return sb.String()
 }
 
 // connectAndRelay acquires a tracked user session (so account expiry / quota exhaustion immediately

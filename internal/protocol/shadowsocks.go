@@ -327,13 +327,13 @@ func (s *Server) handleSS2022TCP(conn net.Conn) {
 	copy(reqSaltCopy, reqSalt[:cs.saltSize])
 
 	ssConn := &ssAEADStreamConn{
-		Conn:       conn,
-		cs:         cs,
-		masterKey:  sessionKey,
-		is2022:     true,
-		reqSalt:    reqSaltCopy,
-		readAEAD:   decAEAD,
-		readNonce:  [12]byte{2},
+		Conn:      conn,
+		cs:        cs,
+		masterKey: sessionKey,
+		is2022:    true,
+		reqSalt:   reqSaltCopy,
+		readAEAD:  decAEAD,
+		readNonce: [12]byte{2},
 	}
 	defer ssConn.releasePendingBuf()
 	s.connectAndRelay(ssConn, matchedUser, destHost, destPort, initialData)
@@ -552,6 +552,11 @@ type ssUDPSession struct {
 	lastSeen  atomic.Int64
 }
 
+type ssUDPKey struct {
+	clientAddr string
+	routeKey   string
+}
+
 func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 	defer s.wg.Done()
 	cs := s.ssSpec
@@ -561,7 +566,7 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 	}
 
 	var natMu sync.Mutex
-	sessions := make(map[string]*ssUDPSession)
+	sessions := make(map[ssUDPKey]*ssUDPSession)
 	asyncSem := make(chan struct{}, 32)
 
 	defer func() {
@@ -590,54 +595,78 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 			rcancel()
 			return
 		}
+		isIPv6 := dstUDP.IP.To4() == nil
+		key := ssUDPKey{clientAddr: clientAddr.String(), routeKey: udpRouteKey(route, isIPv6)}
 
-		keyStr := clientAddr.String()
 		natMu.Lock()
 		if sessions == nil {
 			natMu.Unlock()
 			rcancel()
 			return
 		}
-		sess, exists := sessions[keyStr]
+		sess, exists := sessions[key]
 		// Prevent CGNAT / credential-rotation session hijacking across different users!
 		if exists && (sess.user != matchedUser || !bytes.Equal(sess.masterKey, matchedKey)) {
-			delete(sessions, keyStr)
+			delete(sessions, key)
 			_ = sess.natConn.Close()
 			exists = false
+			sess = nil
 		}
-		if !exists {
+		if exists {
+			sess.lastSeen.Store(time.Now().Unix())
+			natMu.Unlock()
+			rcancel()
+		} else {
 			if len(sessions) >= 2048 {
 				natMu.Unlock()
 				rcancel()
 				return
 			}
-			natPC, lerr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, s.dnsRes)
+			natMu.Unlock()
+
+			// Dial UDP outbound and acquire Redis-backed UDP session OUTSIDE natMu so
+			// slow SOCKS5 dials or Redis latency never stall other Shadowsocks UDP users.
+			natPC, lerr := relay.DialUDPForRoute(rctx, route, isIPv6, s.dnsRes)
+			rcancel()
 			if lerr != nil {
-				natMu.Unlock()
-				rcancel()
 				return
 			}
 			sessID, aerr := matchedUser.AcquireUDPSession(clientIP, s.tracker.IPTTLSeconds(), s.tracker.RedisLimiter(), natPC)
 			if aerr != nil {
 				_ = natPC.Close()
-				natMu.Unlock()
-				rcancel()
 				return
 			}
-			sess = &ssUDPSession{
-				natConn:   natPC,
-				user:      matchedUser,
-				sessID:    sessID,
-				masterKey: matchedKey,
+
+			natMu.Lock()
+			if sessions == nil {
+				natMu.Unlock()
+				_ = natPC.Close()
+				matchedUser.ReleaseUDPSession(sessID)
+				return
 			}
-			sess.lastSeen.Store(time.Now().Unix())
-			sessions[keyStr] = sess
-			go s.pipeSSUDPReply(pc, clientAddr, sess, &natMu, sessions, keyStr)
-		} else {
-			sess.lastSeen.Store(time.Now().Unix())
+			if existing, ok := sessions[key]; ok && existing.user == matchedUser && bytes.Equal(existing.masterKey, matchedKey) {
+				existing.lastSeen.Store(time.Now().Unix())
+				sess = existing
+				natMu.Unlock()
+				_ = natPC.Close()
+				matchedUser.ReleaseUDPSession(sessID)
+			} else {
+				if existing != nil {
+					delete(sessions, key)
+					_ = existing.natConn.Close()
+				}
+				sess = &ssUDPSession{
+					natConn:   natPC,
+					user:      matchedUser,
+					sessID:    sessID,
+					masterKey: matchedKey,
+				}
+				sess.lastSeen.Store(time.Now().Unix())
+				sessions[key] = sess
+				natMu.Unlock()
+				go s.pipeSSUDPReply(pc, clientAddr, sess, &natMu, sessions, key)
+			}
 		}
-		natMu.Unlock()
-		rcancel()
 
 		if ul := matchedUser.EffectiveLimiter(); ul != nil {
 			ul.Wait(len(payload))
@@ -717,14 +746,21 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 		}
 		payload := plain[len(plain)-pr.Len():]
 
-		// Fast inline path when destination is already an IP literal and NAT session exists;
+		// Fast inline path when destination is already an IP literal and matching NAT session exists;
 		// offload domain resolution / new session setup to bounded worker pool so slow DNS never stalls other users!
-		natMu.Lock()
-		_, hasSess := sessions[clientAddr.String()]
-		natMu.Unlock()
-		if _, isIP := netip.ParseAddr(host); isIP == nil && hasSess && matchedUser.EffectiveLimiter() == nil && s.tracker.NodeLimiter.IsUnlimited() {
-			dispatchUDP(clientAddr, clientIP, matchedUser, matchedKey, host, port, payload)
-			continue
+		if ipAddr, isIP := netip.ParseAddr(host); isIP == nil && matchedUser.EffectiveLimiter() == nil && s.tracker.NodeLimiter.IsUnlimited() {
+			fastRoute := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
+			if fastRoute.Action == acl.ActionBlock {
+				continue
+			}
+			fastKey := ssUDPKey{clientAddr: clientAddr.String(), routeKey: udpRouteKey(fastRoute, ipAddr.Unmap().Is6())}
+			natMu.Lock()
+			_, hasSess := sessions[fastKey]
+			natMu.Unlock()
+			if hasSess {
+				dispatchUDP(clientAddr, clientIP, matchedUser, matchedKey, host, port, payload)
+				continue
+			}
 		}
 
 		payCopy := make([]byte, len(payload))
@@ -745,8 +781,8 @@ func (s *Server) pipeSSUDPReply(
 	clientAddr net.Addr,
 	sess *ssUDPSession,
 	natMu *sync.Mutex,
-	sessions map[string]*ssUDPSession,
-	keyStr string,
+	sessions map[ssUDPKey]*ssUDPSession,
+	key ssUDPKey,
 ) {
 	defer func() {
 		_ = sess.natConn.Close()
@@ -754,8 +790,8 @@ func (s *Server) pipeSSUDPReply(
 			sess.user.ReleaseUDPSession(sess.sessID)
 		}
 		natMu.Lock()
-		if sessions != nil && sessions[keyStr] == sess {
-			delete(sessions, keyStr)
+		if sessions != nil && sessions[key] == sess {
+			delete(sessions, key)
 		}
 		natMu.Unlock()
 	}()

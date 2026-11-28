@@ -3,6 +3,7 @@
 package relay
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -22,6 +23,8 @@ func tryCopyFromRawTCP(
 	isUpload bool,
 	idleTimeout time.Duration,
 	abortPeer *atomic.Bool,
+	peerDone *atomic.Bool,
+	lastActive *atomic.Int64,
 ) bool {
 	rawConn, err := srcTCP.SyscallConn()
 	if err != nil {
@@ -39,7 +42,8 @@ func tryCopyFromRawTCP(
 		if (user != nil && user.IsDisabled()) || (abortPeer != nil && abortPeer.Load()) {
 			return true
 		}
-		_ = srcTCP.SetReadDeadline(time.Now().Add(idleTimeout))
+		effIdle := effectiveIdle(idleTimeout, peerDone)
+		_ = srcTCP.SetReadDeadline(time.Now().Add(effIdle))
 		if abortPeer != nil && abortPeer.Load() {
 			_ = srcTCP.SetReadDeadline(time.Now())
 			return true
@@ -77,6 +81,9 @@ func tryCopyFromRawTCP(
 		})
 
 		if nr > 0 {
+			if lastActive != nil {
+				lastActive.Store(time.Now().UnixNano())
+			}
 			if user != nil {
 				if ul := user.EffectiveLimiter(); ul != nil {
 					ul.Wait(nr)
@@ -101,7 +108,15 @@ func tryCopyFromRawTCP(
 				return true
 			}
 		}
-		if eof || readErr != nil || rerr != nil {
+		if eof || readErr != nil {
+			return true
+		}
+		if rerr != nil {
+			if isNetTimeout(rerr) && !(user != nil && user.IsDisabled()) && !(abortPeer != nil && abortPeer.Load()) {
+				if isStreamStillActive(lastActive, effectiveIdle(idleTimeout, peerDone)) {
+					continue
+				}
+			}
 			return true
 		}
 	}
@@ -177,7 +192,10 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 		if recvErr != nil {
 			return 0, nil, nil, nil, recvErr
 		}
-		return 0, nil, nil, nil, err
+		if err != nil {
+			return 0, nil, nil, nil, err
+		}
+		return 0, nil, nil, nil, errors.New("udp recvfrom: nil or unsupported source address")
 	}
 	return nr, raddr, *bp, bp, nil
 }

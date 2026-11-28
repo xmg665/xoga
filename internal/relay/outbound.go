@@ -136,6 +136,15 @@ func dialDirectWithDNSAndRoute(
 ) (net.Conn, error) {
 	hasStrat := out.ListenStrategy != ""
 	strat := dns.ParseStrategy(out.ListenStrategy)
+	if !hasStrat {
+		if out.ListenIPv4 != "" && out.ListenIPv6 == "" {
+			strat = dns.StrategyIPv4Only
+			hasStrat = true
+		} else if out.ListenIPv6 != "" && out.ListenIPv4 == "" {
+			strat = dns.StrategyIPv6Only
+			hasStrat = true
+		}
+	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -145,14 +154,14 @@ func dialDirectWithDNSAndRoute(
 		return nil, err
 	}
 
-	tryDialCandidates := func(cands []netip.Addr) (net.Conn, error) {
+	tryDialCandidates := func(attemptCtx context.Context, cands []netip.Addr, budget time.Duration) (net.Conn, error) {
 		var lastDialErr error
 		limit := min(len(cands), 3)
-		perAttempt := timeout
-		if limit > 1 && timeout > 4*time.Second {
+		perAttempt := budget
+		if limit > 1 && budget > 4*time.Second {
 			// Cap each attempt when multiple candidates exist so one blackholed IP
 			// doesn't exhaust the entire dial budget before trying the next candidate.
-			perAttempt = max(timeout/2, 4*time.Second)
+			perAttempt = max(budget/2, 4*time.Second)
 		}
 		for i := 0; i < limit; i++ {
 			ip := cands[i].Unmap()
@@ -164,20 +173,32 @@ func dialDirectWithDNSAndRoute(
 				Timeout:   perAttempt,
 				KeepAlive: 45 * time.Second,
 			}
-			if ip.Is4() && out.ListenIPv4 != "" {
-				if lip := net.ParseIP(out.ListenIPv4); lip != nil {
-					d.LocalAddr = &net.TCPAddr{IP: lip}
+			if ip.Is4() {
+				if out.ListenIPv4 != "" {
+					if lip := net.ParseIP(out.ListenIPv4); lip != nil {
+						d.LocalAddr = &net.TCPAddr{IP: lip}
+					}
+				} else if out.ListenIPv6 != "" {
+					// IPv6-only bound route must never leak host default IPv4.
+					lastDialErr = errors.New("outbound route is bound to IPv6 only; refusing unbound IPv4 dial")
+					continue
 				}
-			} else if ip.Is6() && out.ListenIPv6 != "" {
-				if lip := net.ParseIP(out.ListenIPv6); lip != nil {
-					d.LocalAddr = &net.TCPAddr{IP: lip}
+			} else if ip.Is6() {
+				if out.ListenIPv6 != "" {
+					if lip := net.ParseIP(out.ListenIPv6); lip != nil {
+						d.LocalAddr = &net.TCPAddr{IP: lip}
+					}
+				} else if out.ListenIPv4 != "" {
+					// IPv4-only bound route must never leak host default IPv6.
+					lastDialErr = errors.New("outbound route is bound to IPv4 only; refusing unbound IPv6 dial")
+					continue
 				}
 			}
 			network := "tcp4"
 			if ip.Is6() {
 				network = "tcp6"
 			}
-			c, derr := d.DialContext(dialCtx, network, net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
+			c, derr := d.DialContext(attemptCtx, network, net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
 			if derr == nil {
 				return c, nil
 			}
@@ -189,18 +210,55 @@ func dialDirectWithDNSAndRoute(
 		return nil, lastDialErr
 	}
 
-	c, dialErr := tryDialCandidates(ips)
-	if dialErr == nil {
-		return c, nil
-	}
-	// Dual-stack graceful fallback: if ipv6_first resolved only AAAA and the host lacks IPv6 routing, fall back to A!
 	effStrat := strat
 	if !hasStrat {
 		effStrat = resolver.DefaultStrategy()
 	}
-	if effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() {
-		if v4s, v4err := resolver.ResolveAll(dialCtx, host, dns.StrategyIPv4Only, true); v4err == nil && len(v4s) > 0 {
-			if c4, err4 := tryDialCandidates(v4s); err4 == nil {
+	willFallbackV4 := effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() && !(out.ListenIPv6 != "" && out.ListenIPv4 == "")
+
+	primaryCtx := dialCtx
+	primaryBudget := timeout
+	var primaryCancel context.CancelFunc
+	if willFallbackV4 {
+		// Reserve at least half the dial budget (or up to 4s for v6) so blackholed IPv6
+		// never exhausts dialCtx before the IPv4 fallback can resolve and connect.
+		v6Budget := timeout / 2
+		if v6Budget > 4*time.Second {
+			v6Budget = 4 * time.Second
+		}
+		if v6Budget < 500*time.Millisecond {
+			v6Budget = timeout / 2
+		}
+		if v6Budget > 0 && v6Budget < timeout {
+			primaryCtx, primaryCancel = context.WithTimeout(dialCtx, v6Budget)
+			primaryBudget = v6Budget
+		}
+	}
+	c, dialErr := tryDialCandidates(primaryCtx, ips, primaryBudget)
+	if primaryCancel != nil {
+		primaryCancel()
+	}
+	if dialErr == nil {
+		return c, nil
+	}
+	// Dual-stack graceful fallback: if ipv6_first resolved only AAAA and the host lacks IPv6 routing, fall back to A!
+	if willFallbackV4 {
+		fbCtx := dialCtx
+		var fbCancel context.CancelFunc
+		if fbCtx.Err() != nil && ctx.Err() == nil {
+			fbCtx, fbCancel = context.WithTimeout(ctx, min(timeout, 5*time.Second))
+		}
+		if fbCancel != nil {
+			defer fbCancel()
+		}
+		if v4s, v4err := resolver.ResolveAll(fbCtx, host, dns.StrategyIPv4Only, true); v4err == nil && len(v4s) > 0 {
+			fbBudget := timeout
+			if dl, ok := fbCtx.Deadline(); ok {
+				if rem := time.Until(dl); rem > 0 && rem < fbBudget {
+					fbBudget = rem
+				}
+			}
+			if c4, err4 := tryDialCandidates(fbCtx, v4s, fbBudget); err4 == nil {
 				return c4, nil
 			}
 		}
@@ -220,16 +278,42 @@ func ResolveUDPTargetForRoute(ctx context.Context, host string, port uint16, rou
 	}
 	strat := dns.StrategyIPv4First
 	hasStrat := false
-	if len(route.Outbounds) > 0 && route.Outbounds[0].ListenStrategy != "" {
-		strat = dns.ParseStrategy(route.Outbounds[0].ListenStrategy)
-		hasStrat = true
+	var directBind *acl.OutboundNode
+	if len(route.Outbounds) > 0 {
+		out := &route.Outbounds[0]
+		t := strings.ToLower(out.Type)
+		if out.ListenStrategy != "" {
+			strat = dns.ParseStrategy(out.ListenStrategy)
+			hasStrat = true
+		}
+		if t == "direct" || t == "" {
+			directBind = out
+			if !hasStrat {
+				if out.ListenIPv4 != "" && out.ListenIPv6 == "" {
+					strat = dns.StrategyIPv4Only
+					hasStrat = true
+				} else if out.ListenIPv6 != "" && out.ListenIPv4 == "" {
+					strat = dns.StrategyIPv6Only
+					hasStrat = true
+				}
+			}
+		}
 	}
 	ip, err := resolver.Resolve(ctx, host, strat, hasStrat)
 	if err != nil {
 		return nil, err
 	}
+	ip = ip.Unmap()
 	if !route.AllowResolvedIP(ip) {
 		return nil, errors.New("resolved UDP IP blocked by ACL/private-IP policy")
+	}
+	if directBind != nil {
+		if ip.Is6() && directBind.ListenIPv6 == "" && directBind.ListenIPv4 != "" {
+			return nil, errors.New("UDP route is bound to IPv4 only; refusing unbound IPv6 destination")
+		}
+		if ip.Is4() && directBind.ListenIPv4 == "" && directBind.ListenIPv6 != "" {
+			return nil, errors.New("UDP route is bound to IPv6 only; refusing unbound IPv4 destination")
+		}
 	}
 	return &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(port)}, nil
 }
@@ -514,8 +598,12 @@ func dialNodeVLESS(ctx context.Context, out acl.OutboundNode, targetHost string,
 
 type vlessClientConn struct {
 	net.Conn
-	readMu  sync.Mutex
-	readHdr bool
+	readMu    sync.Mutex
+	readHdr   bool
+	hdrBuf    [2]byte
+	hdrRead   int
+	hdrParsed bool
+	addonRem  int
 }
 
 func (v *vlessClientConn) CanHalfCloseWrite() bool {
@@ -531,20 +619,33 @@ func (v *vlessClientConn) CloseWrite() error {
 
 func (v *vlessClientConn) Read(p []byte) (int, error) {
 	v.readMu.Lock()
-	if !v.readHdr {
-		v.readHdr = true
-		var rh [2]byte
-		if _, err := io.ReadFull(v.Conn, rh[:]); err != nil {
-			v.readMu.Unlock()
-			return 0, err
+	for !v.readHdr {
+		if !v.hdrParsed {
+			for v.hdrRead < 2 {
+				n, err := v.Conn.Read(v.hdrBuf[v.hdrRead:2])
+				v.hdrRead += n
+				if err != nil {
+					v.readMu.Unlock()
+					return 0, err
+				}
+			}
+			v.hdrParsed = true
+			v.addonRem = int(v.hdrBuf[1])
 		}
-		if rh[1] > 0 {
-			var addon [256]byte
-			if _, err := io.ReadFull(v.Conn, addon[:rh[1]]); err != nil {
+		for v.addonRem > 0 {
+			var discard [256]byte
+			want := v.addonRem
+			if want > len(discard) {
+				want = len(discard)
+			}
+			n, err := v.Conn.Read(discard[:want])
+			v.addonRem -= n
+			if err != nil {
 				v.readMu.Unlock()
 				return 0, err
 			}
 		}
+		v.readHdr = true
 	}
 	v.readMu.Unlock()
 	return v.Conn.Read(p)
@@ -553,11 +654,16 @@ func (v *vlessClientConn) Read(p []byte) (int, error) {
 func dialNodeShadowsocks(ctx context.Context, out acl.OutboundNode, targetHost string, targetPort uint16, resolver *dns.Resolver, timeout time.Duration) (net.Conn, error) {
 	keyLen := 32
 	isChaCha := false
-	switch strings.ToLower(out.Cipher) {
+	switch strings.ToLower(strings.TrimSpace(out.Cipher)) {
+	case "", "aes-256-gcm":
+		keyLen = 32
 	case "aes-128-gcm":
 		keyLen = 16
 	case "chacha20-ietf-poly1305", "chacha20-poly1305":
+		keyLen = 32
 		isChaCha = true
+	default:
+		return nil, fmt.Errorf("unsupported shadowsocks outbound cipher %q", out.Cipher)
 	}
 
 	c, err := dialProxyTransport(ctx, out, resolver, timeout)
@@ -584,14 +690,36 @@ type ssClientConn struct {
 	masterKey  []byte
 	pendingHdr []byte
 
-	writeMu    sync.Mutex
-	writeAEAD  cipher.AEAD
-	writeNonce [12]byte
+	writeMu     sync.Mutex
+	writeAEAD   cipher.AEAD
+	writeNonce  [12]byte
+	unsentWire  []byte
+	writeBroken bool
 
 	readMu    sync.Mutex
 	readAEAD  cipher.AEAD
 	readNonce [12]byte
+	saltBuf   [32]byte
+	saltRead  int
+	lenBuf    [18]byte
+	lenRead   int
+	chunkBuf  *[]byte
+	chunkNeed int
+	chunkRead int
 	leftover  []byte
+}
+
+func (s *ssClientConn) Close() error {
+	err := s.Conn.Close()
+	s.readMu.Lock()
+	if s.chunkBuf != nil {
+		bufpool.Put(s.chunkBuf)
+		s.chunkBuf = nil
+		s.chunkNeed = 0
+		s.chunkRead = 0
+	}
+	s.readMu.Unlock()
+	return err
 }
 
 func (s *ssClientConn) makeSubAEAD(salt []byte) (cipher.AEAD, error) {
@@ -610,57 +738,115 @@ func (s *ssClientConn) makeSubAEAD(salt []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(blk)
 }
 
+func (s *ssClientConn) drainUnsentLocked() error {
+	for len(s.unsentWire) > 0 {
+		nw, err := s.Conn.Write(s.unsentWire)
+		if nw > 0 {
+			s.unsentWire = s.unsentWire[nw:]
+		}
+		if err != nil {
+			return err
+		}
+		if nw == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	s.unsentWire = nil
+	return nil
+}
+
 func (s *ssClientConn) Write(p []byte) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	if s.writeBroken {
+		return 0, errors.New("ss outbound write stream desynchronized after partial write")
+	}
+	if err := s.drainUnsentLocked(); err != nil {
+		return 0, err
+	}
+
 	origLen := len(p)
-	var combined []byte
-	if len(s.pendingHdr) > 0 {
-		combined = make([]byte, 0, len(s.pendingHdr)+len(p))
+	hasHdr := len(s.pendingHdr) > 0
+	hdrLen := len(s.pendingHdr)
+	work := p
+	if hasHdr {
+		combined := make([]byte, 0, hdrLen+len(p))
 		combined = append(combined, s.pendingHdr...)
 		combined = append(combined, p...)
-		s.pendingHdr = nil
-		p = combined
+		work = combined
 	}
 
-	var prefixSalt []byte
-	if s.writeAEAD == nil {
-		prefixSalt = make([]byte, s.keyLen)
-		if _, err := rand.Read(prefixSalt); err != nil {
-			return 0, err
-		}
-		aead, err := s.makeSubAEAD(prefixSalt)
-		if err != nil {
-			return 0, err
-		}
-		s.writeAEAD = aead
-	}
-
-	for len(p) > 0 {
-		chunk := p
+	sentPayload := 0
+	for len(work) > 0 {
+		chunk := work
 		if len(chunk) > 0x3FFF {
-			chunk = p[:0x3FFF]
+			chunk = work[:0x3FFF]
 		}
-		p = p[len(chunk):]
+		work = work[len(chunk):]
 
+		aead := s.writeAEAD
+		var prefixSalt []byte
+		if aead == nil {
+			prefixSalt = make([]byte, s.keyLen)
+			if _, err := rand.Read(prefixSalt); err != nil {
+				return sentPayload, err
+			}
+			var err error
+			aead, err = s.makeSubAEAD(prefixSalt)
+			if err != nil {
+				return sentPayload, err
+			}
+		}
+
+		nextNonce := s.writeNonce
 		bp := bufpool.Get(len(prefixSalt) + 2 + 16 + len(chunk) + 16)
 		out := (*bp)[:0]
 		if len(prefixSalt) > 0 {
 			out = append(out, prefixSalt...)
-			prefixSalt = nil
 		}
 		var lb [2]byte
 		binary.BigEndian.PutUint16(lb[:], uint16(len(chunk)))
-		out = s.writeAEAD.Seal(out, s.writeNonce[:], lb[:], nil)
-		incSSNonce(&s.writeNonce)
-		out = s.writeAEAD.Seal(out, s.writeNonce[:], chunk, nil)
-		incSSNonce(&s.writeNonce)
+		out = aead.Seal(out, nextNonce[:], lb[:], nil)
+		incSSNonce(&nextNonce)
+		out = aead.Seal(out, nextNonce[:], chunk, nil)
+		incSSNonce(&nextNonce)
 
-		_, err := s.Conn.Write(out)
+		nw, err := s.Conn.Write(out)
+		if nw == 0 && err != nil {
+			// Nothing hit the wire: keep pendingHdr, writeAEAD, and writeNonce completely intact.
+			bufpool.Put(bp)
+			return sentPayload, err
+		}
+		// At least 1 byte hit the wire: commit cipher state & header consumption.
+		s.writeAEAD = aead
+		s.writeNonce = nextNonce
+		if hasHdr {
+			s.pendingHdr = nil
+			hasHdr = false
+		}
+		if nw < len(out) {
+			s.unsentWire = append([]byte(nil), out[nw:]...)
+			s.writeBroken = true
+			bufpool.Put(bp)
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			return sentPayload, err
+		}
 		bufpool.Put(bp)
 		if err != nil {
-			return 0, err
+			return sentPayload, err
+		}
+		if hdrLen > 0 {
+			if len(chunk) <= hdrLen {
+				hdrLen -= len(chunk)
+			} else {
+				sentPayload += len(chunk) - hdrLen
+				hdrLen = 0
+			}
+		} else {
+			sentPayload += len(chunk)
 		}
 	}
 	return origLen, nil
@@ -669,33 +855,57 @@ func (s *ssClientConn) Write(p []byte) (int, error) {
 func (s *ssClientConn) flushTargetHeaderIfNeeded() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.drainUnsentLocked(); err != nil {
+		return err
+	}
 	if len(s.pendingHdr) == 0 {
 		return nil
 	}
 	hdr := s.pendingHdr
-	s.pendingHdr = nil
 
-	prefixSalt := make([]byte, s.keyLen)
-	if _, err := rand.Read(prefixSalt); err != nil {
-		return err
+	aead := s.writeAEAD
+	var prefixSalt []byte
+	if aead == nil {
+		prefixSalt = make([]byte, s.keyLen)
+		if _, err := rand.Read(prefixSalt); err != nil {
+			return err
+		}
+		var err error
+		aead, err = s.makeSubAEAD(prefixSalt)
+		if err != nil {
+			return err
+		}
 	}
-	aead, err := s.makeSubAEAD(prefixSalt)
-	if err != nil {
-		return err
-	}
-	s.writeAEAD = aead
 
+	nextNonce := s.writeNonce
 	bp := bufpool.Get(len(prefixSalt) + 2 + 16 + len(hdr) + 16)
 	out := (*bp)[:0]
-	out = append(out, prefixSalt...)
+	if len(prefixSalt) > 0 {
+		out = append(out, prefixSalt...)
+	}
 	var lb [2]byte
 	binary.BigEndian.PutUint16(lb[:], uint16(len(hdr)))
-	out = s.writeAEAD.Seal(out, s.writeNonce[:], lb[:], nil)
-	incSSNonce(&s.writeNonce)
-	out = s.writeAEAD.Seal(out, s.writeNonce[:], hdr, nil)
-	incSSNonce(&s.writeNonce)
+	out = aead.Seal(out, nextNonce[:], lb[:], nil)
+	incSSNonce(&nextNonce)
+	out = aead.Seal(out, nextNonce[:], hdr, nil)
+	incSSNonce(&nextNonce)
 
-	_, werr := s.Conn.Write(out)
+	nw, werr := s.Conn.Write(out)
+	if nw == 0 && werr != nil {
+		bufpool.Put(bp)
+		return werr
+	}
+	s.writeAEAD = aead
+	s.writeNonce = nextNonce
+	s.pendingHdr = nil
+	if nw < len(out) {
+		s.unsentWire = append([]byte(nil), out[nw:]...)
+		bufpool.Put(bp)
+		if werr == nil {
+			werr = io.ErrShortWrite
+		}
+		return werr
+	}
 	bufpool.Put(bp)
 	return werr
 }
@@ -714,38 +924,69 @@ func (s *ssClientConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	if s.readAEAD == nil {
-		salt := make([]byte, s.keyLen)
-		if _, err := io.ReadFull(s.Conn, salt); err != nil {
-			return 0, err
+		for s.saltRead < s.keyLen {
+			n, err := s.Conn.Read(s.saltBuf[s.saltRead:s.keyLen])
+			s.saltRead += n
+			if err != nil {
+				return 0, err
+			}
 		}
-		aead, err := s.makeSubAEAD(salt)
+		aead, err := s.makeSubAEAD(s.saltBuf[:s.keyLen])
 		if err != nil {
 			return 0, err
 		}
 		s.readAEAD = aead
 	}
 
-	var lenEnc [18]byte
-	if _, err := io.ReadFull(s.Conn, lenEnc[:]); err != nil {
-		return 0, err
-	}
-	var lb [2]byte
-	if _, err := s.readAEAD.Open(lb[:0], s.readNonce[:], lenEnc[:], nil); err != nil {
-		return 0, err
-	}
-	incSSNonce(&s.readNonce)
-	cLen := int(binary.BigEndian.Uint16(lb[:]) & 0x3FFF)
-	if cLen == 0 {
-		return 0, io.EOF
+	if s.chunkBuf == nil {
+		for s.lenRead < 18 {
+			n, err := s.Conn.Read(s.lenBuf[s.lenRead:18])
+			s.lenRead += n
+			if err != nil {
+				return 0, err
+			}
+		}
+		var lb [2]byte
+		if _, err := s.readAEAD.Open(lb[:0], s.readNonce[:], s.lenBuf[:], nil); err != nil {
+			s.lenRead = 0
+			return 0, err
+		}
+		s.lenRead = 0
+		incSSNonce(&s.readNonce)
+		cLen := int(binary.BigEndian.Uint16(lb[:]) & 0x3FFF)
+		if cLen == 0 {
+			return 0, io.EOF
+		}
+		s.chunkBuf = bufpool.Get(cLen + 16)
+		s.chunkNeed = cLen + 16
+		s.chunkRead = 0
 	}
 
-	bp := bufpool.Get(cLen + 16)
-	defer bufpool.Put(bp)
-	enc := (*bp)[:cLen+16]
-	if _, err := io.ReadFull(s.Conn, enc); err != nil {
-		return 0, err
+	enc := (*s.chunkBuf)[:s.chunkNeed]
+	for s.chunkRead < s.chunkNeed {
+		n, err := s.Conn.Read(enc[s.chunkRead:s.chunkNeed])
+		s.chunkRead += n
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return 0, err
+			}
+			bufpool.Put(s.chunkBuf)
+			s.chunkBuf = nil
+			s.chunkNeed = 0
+			s.chunkRead = 0
+			return 0, err
+		}
 	}
-	plain, err := s.readAEAD.Open(enc[:0], s.readNonce[:], enc, nil)
+
+	bp := s.chunkBuf
+	need := s.chunkNeed
+	s.chunkBuf = nil
+	s.chunkNeed = 0
+	s.chunkRead = 0
+	defer bufpool.Put(bp)
+
+	plain, err := s.readAEAD.Open((*bp)[:0], s.readNonce[:], (*bp)[:need], nil)
 	if err != nil {
 		return 0, err
 	}
@@ -819,6 +1060,11 @@ func clientWSHandshake(c net.Conn, out acl.OutboundNode) (net.Conn, error) {
 	_, _ = rand.Read(nonce[:])
 	wsKey := base64.StdEncoding.EncodeToString(nonce[:])
 
+	h := sha1.New()
+	_, _ = h.Write([]byte(wsKey))
+	_, _ = h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	expectedAccept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
 	path := out.WSPath
 	if path == "" {
 		path = "/"
@@ -826,6 +1072,10 @@ func clientWSHandshake(c net.Conn, out acl.OutboundNode) (net.Conn, error) {
 	host := out.SNI
 	if host == "" {
 		host = out.Server
+	}
+	// RFC 3986 / RFC 7230: bare IPv6 literals in Host header must be bracketed.
+	if ip, ierr := netip.ParseAddr(strings.Trim(host, "[]")); ierr == nil && ip.Is6() {
+		host = "[" + ip.String() + "]"
 	}
 
 	req := "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + wsKey + "\r\n\r\n"
@@ -837,6 +1087,7 @@ func clientWSHandshake(c net.Conn, out acl.OutboundNode) (net.Conn, error) {
 	if err != nil || !strings.HasPrefix(status, "HTTP/1.1 101") {
 		return nil, errors.New("outbound websocket upgrade failed")
 	}
+	gotAccept := ""
 	for hdrCnt := 0; ; hdrCnt++ {
 		if hdrCnt >= 64 {
 			return nil, errors.New("too many outbound websocket headers")
@@ -848,64 +1099,169 @@ func clientWSHandshake(c net.Conn, out acl.OutboundNode) (net.Conn, error) {
 		if line == "" {
 			break
 		}
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "sec-websocket-accept") {
+			gotAccept = strings.TrimSpace(v)
+		}
+	}
+	if gotAccept != expectedAccept {
+		return nil, errors.New("outbound websocket Sec-WebSocket-Accept mismatch")
 	}
 	return &wsClientConn{Conn: c, br: br}, nil
 }
 
 type wsClientConn struct {
 	net.Conn
-	br       *bufio.Reader
-	readMu   sync.Mutex
-	frameRem int64
-	writeMu  sync.Mutex
+	br *bufio.Reader
+
+	readMu      sync.Mutex
+	frameRem    int64
+	masked      bool
+	maskKey     [4]byte
+	maskPos     int
+	hdrBuf      [14]byte // preserves partial WS frame header across read timeouts
+	hdrRead     int
+	ctrlOp      byte // 0=none, 0x9=ping, 0xFF=discard
+	ctrlRem     int64
+	ctrlMasked  bool
+	ctrlMaskKey [4]byte
+	ctrlBuf     [125]byte
+	ctrlRead    int
+
+	writeMu       sync.Mutex
+	deadlineMu    sync.Mutex
+	writeDeadline time.Time
+}
+
+func (w *wsClientConn) SetWriteDeadline(t time.Time) error {
+	w.deadlineMu.Lock()
+	w.writeDeadline = t
+	err := w.Conn.SetWriteDeadline(t)
+	w.deadlineMu.Unlock()
+	return err
+}
+
+func (w *wsClientConn) SetDeadline(t time.Time) error {
+	w.deadlineMu.Lock()
+	w.writeDeadline = t
+	err := w.Conn.SetDeadline(t)
+	w.deadlineMu.Unlock()
+	return err
 }
 
 func (w *wsClientConn) Read(p []byte) (int, error) {
 	w.readMu.Lock()
 	defer w.readMu.Unlock()
 	for w.frameRem == 0 {
-		var hdr [2]byte
-		if _, err := io.ReadFull(w.br, hdr[:]); err != nil {
-			return 0, err
+		if w.ctrlOp != 0 {
+			if w.ctrlOp == 0x9 {
+				for w.ctrlRem > 0 {
+					n, err := w.br.Read(w.ctrlBuf[w.ctrlRead : w.ctrlRead+int(w.ctrlRem)])
+					w.ctrlRead += n
+					w.ctrlRem -= int64(n)
+					if err != nil {
+						return 0, err
+					}
+				}
+				pingData := w.ctrlBuf[:w.ctrlRead]
+				if w.ctrlMasked {
+					for i := range pingData {
+						pingData[i] ^= w.ctrlMaskKey[i&3]
+					}
+				}
+				w.ctrlOp = 0
+				w.ctrlRead = 0
+				_ = w.writeControlFrame(0xA, pingData)
+				continue
+			}
+			var discardBuf [256]byte
+			for w.ctrlRem > 0 {
+				want := int64(len(discardBuf))
+				if want > w.ctrlRem {
+					want = w.ctrlRem
+				}
+				n, err := w.br.Read(discardBuf[:want])
+				w.ctrlRem -= int64(n)
+				if err != nil {
+					return 0, err
+				}
+			}
+			w.ctrlOp = 0
+			continue
 		}
-		op := hdr[0] & 0x0F
-		plen := int64(hdr[1] & 0x7F)
-		if plen == 126 {
-			var e [2]byte
-			if _, err := io.ReadFull(w.br, e[:]); err != nil {
+
+		for w.hdrRead < 2 {
+			n, err := w.br.Read(w.hdrBuf[w.hdrRead:2])
+			w.hdrRead += n
+			if err != nil {
 				return 0, err
 			}
-			plen = int64(binary.BigEndian.Uint16(e[:]))
-		} else if plen == 127 {
-			var e [8]byte
-			if _, err := io.ReadFull(w.br, e[:]); err != nil {
+		}
+		op := w.hdrBuf[0] & 0x0F
+		masked := (w.hdrBuf[1] & 0x80) != 0
+		lenCode := w.hdrBuf[1] & 0x7F
+		need := 2
+		if lenCode == 126 {
+			need += 2
+		} else if lenCode == 127 {
+			need += 8
+		}
+		if masked {
+			need += 4
+		}
+		for w.hdrRead < need {
+			n, err := w.br.Read(w.hdrBuf[w.hdrRead:need])
+			w.hdrRead += n
+			if err != nil {
 				return 0, err
 			}
-			plen = int64(binary.BigEndian.Uint64(e[:]))
+		}
+		w.hdrRead = 0
+
+		pos := 2
+		var plen int64
+		switch lenCode {
+		case 126:
+			plen = int64(binary.BigEndian.Uint16(w.hdrBuf[pos : pos+2]))
+			pos += 2
+		case 127:
+			plen = int64(binary.BigEndian.Uint64(w.hdrBuf[pos : pos+8]))
+			pos += 8
 			if plen < 0 || plen > 16*1024*1024 {
 				return 0, errors.New("outbound websocket frame too large")
 			}
+		default:
+			plen = int64(lenCode)
 		}
 		if op >= 0x8 && plen > 125 {
 			return 0, errors.New("outbound websocket control frame exceeds 125 bytes")
 		}
+		var mkey [4]byte
+		if masked {
+			copy(mkey[:], w.hdrBuf[pos:pos+4])
+		}
 		if op == 0x8 {
 			return 0, io.EOF
 		}
-		if op == 0x9 { // Ping -> reply masked Pong so upstream CDN/WS server never drops idle tunnel
-			var ping [125]byte
-			if _, err := io.ReadFull(w.br, ping[:plen]); err != nil {
-				return 0, err
+		if op == 0x9 { // Ping -> reply masked Pong with bounded write deadline
+			if plen == 0 {
+				_ = w.writeControlFrame(0xA, nil)
+			} else {
+				w.ctrlOp = 0x9
+				w.ctrlRem = plen
+				w.ctrlMasked = masked
+				w.ctrlMaskKey = mkey
+				w.ctrlRead = 0
 			}
-			_ = w.writeClientFrame(0xA, ping[:plen])
 			continue
 		}
 		if op == 0x1 || op == 0x2 || op == 0x0 {
 			w.frameRem = plen
+			w.masked = masked
+			w.maskKey = mkey
+			w.maskPos = 0
 		} else if plen > 0 {
-			if _, err := io.CopyN(io.Discard, w.br, plen); err != nil {
-				return 0, err
-			}
+			w.ctrlOp = 0xFF
+			w.ctrlRem = plen
 		}
 	}
 	toRead := int64(len(p))
@@ -913,7 +1269,15 @@ func (w *wsClientConn) Read(p []byte) (int, error) {
 		toRead = w.frameRem
 	}
 	n, err := w.br.Read(p[:toRead])
-	w.frameRem -= int64(n)
+	if n > 0 {
+		if w.masked {
+			for i := 0; i < n; i++ {
+				p[i] ^= w.maskKey[w.maskPos&3]
+				w.maskPos++
+			}
+		}
+		w.frameRem -= int64(n)
+	}
 	return n, err
 }
 
@@ -927,10 +1291,34 @@ func (w *wsClientConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (w *wsClientConn) writeClientFrame(opcode byte, p []byte) error {
+func (w *wsClientConn) writeControlFrame(opcode byte, p []byte) error {
+	if len(p) > 125 {
+		p = p[:125]
+	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
+	w.deadlineMu.Lock()
+	pongDL := time.Now().Add(5 * time.Second)
+	if w.writeDeadline.IsZero() || pongDL.Before(w.writeDeadline) {
+		_ = w.Conn.SetWriteDeadline(pongDL)
+	}
+	w.deadlineMu.Unlock()
+	defer func() {
+		w.deadlineMu.Lock()
+		_ = w.Conn.SetWriteDeadline(w.writeDeadline)
+		w.deadlineMu.Unlock()
+	}()
+	return w.writeClientFrameLocked(opcode, p)
+}
+
+func (w *wsClientConn) writeClientFrame(opcode byte, p []byte) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return w.writeClientFrameLocked(opcode, p)
+}
+
+func (w *wsClientConn) writeClientFrameLocked(opcode byte, p []byte) error {
 	var mkey [4]byte
 	_, _ = rand.Read(mkey[:])
 
@@ -972,22 +1360,63 @@ func (w *wsClientConn) writeClientFrame(opcode byte, p []byte) error {
 	return err
 }
 
-// DialUDPForRoute opens a PacketConn honoring SOCKS5 `UDP ASSOCIATE` when `route` targets a SOCKS5 outbound
-// (e.g. WARP wireproxy `127.0.0.1:40000`), falling back cleanly to a local bound UDP socket if unsupported.
+// DialUDPForRoute opens a PacketConn honoring `route.Outbounds` strictly:
+// - `block` rejects UDP.
+// - `socks5` uses SOCKS5 `UDP ASSOCIATE`.
+// - `direct` honors single-family `listen_ipv4`/`listen_ipv6` bindings without leaking the opposite family.
+// - Non-SOCKS5 proxy routes or failed SOCKS5 routes NEVER silently fall back to direct egress.
 func DialUDPForRoute(ctx context.Context, route acl.OutboundTarget, preferIPv6 bool, resolver *dns.Resolver) (net.PacketConn, error) {
+	if route.Action == acl.ActionBlock {
+		return nil, errors.New("UDP blocked by ACL/audit rule")
+	}
+	if len(route.Outbounds) == 0 {
+		return net.ListenPacket("udp", "")
+	}
+
+	var lastErr error
 	for _, out := range route.Outbounds {
-		t := strings.ToLower(out.Type)
-		if t == "socks5" || t == "socks" {
-			if pc, err := dialSOCKS5UDPAssociate(ctx, out, resolver, 5*time.Second); err == nil {
+		switch strings.ToLower(out.Type) {
+		case "block":
+			return nil, errors.New("UDP blocked by route outbound")
+		case "socks5", "socks":
+			pc, err := dialSOCKS5UDPAssociate(ctx, out, resolver, 5*time.Second)
+			if err == nil {
 				return pc, nil
 			}
+			lastErr = err
+		case "direct", "":
+			if preferIPv6 {
+				if out.ListenIPv6 != "" {
+					if ip := net.ParseIP(out.ListenIPv6); ip != nil {
+						return net.ListenPacket("udp6", net.JoinHostPort(ip.String(), "0"))
+					}
+				} else if out.ListenIPv4 != "" {
+					lastErr = errors.New("UDP route is bound to IPv4 only; refusing unbound IPv6 socket")
+					continue
+				}
+			} else {
+				if out.ListenIPv4 != "" {
+					if ip := net.ParseIP(out.ListenIPv4); ip != nil {
+						return net.ListenPacket("udp4", net.JoinHostPort(ip.String(), "0"))
+					}
+				} else if out.ListenIPv6 != "" {
+					lastErr = errors.New("UDP route is bound to IPv6 only; refusing unbound IPv4 socket")
+					continue
+				}
+			}
+			pc, err := net.ListenPacket("udp", "")
+			if err == nil {
+				return pc, nil
+			}
+			lastErr = err
+		default:
+			lastErr = fmt.Errorf("UDP relay unsupported for outbound type %q", out.Type)
 		}
 	}
-	localBind := ""
-	if lu := LocalUDPAddrForRoute(route, preferIPv6); lu != nil {
-		localBind = net.JoinHostPort(lu.IP.String(), "0")
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	return net.ListenPacket("udp", localBind)
+	return nil, errors.New("no UDP-capable outbound available for route")
 }
 
 type socks5UDPPacketConn struct {
@@ -1100,9 +1529,15 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 		return nil, errors.New("socks5 udp invalid relay port")
 	}
 	if len(bndIP) == 0 || bndIP.IsUnspecified() {
-		if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-			bndIP = ta.IP
+		if peerIP := ExtractClientIP(c.RemoteAddr()); peerIP.IsValid() && !peerIP.IsUnspecified() {
+			bndIP = net.IP(peerIP.AsSlice())
+		} else if srvIP, perr := netip.ParseAddr(strings.Trim(out.Server, "[]")); perr == nil && !srvIP.IsUnspecified() {
+			bndIP = net.IP(srvIP.Unmap().AsSlice())
 		}
+	}
+	if len(bndIP) == 0 || bndIP.IsUnspecified() {
+		c.Close()
+		return nil, errors.New("socks5 udp: could not determine relay IP address")
 	}
 	_ = c.SetDeadline(time.Time{})
 
@@ -1112,7 +1547,7 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 		bindNet = "udp6"
 		localBind = "[::]:0"
 	}
-	if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok && ta.IP.IsLoopback() {
+	if peerIP := ExtractClientIP(c.RemoteAddr()); peerIP.IsValid() && peerIP.IsLoopback() {
 		if bndIP.To4() != nil {
 			localBind = "127.0.0.1:0"
 		} else {
@@ -1140,8 +1575,8 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 
 func (s *socks5UDPPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	ua, ok := addr.(*net.UDPAddr)
-	if !ok {
-		return 0, errors.New("socks5 udp expects *net.UDPAddr")
+	if !ok || ua == nil || ua.IP == nil {
+		return 0, errors.New("socks5 udp expects non-nil *net.UDPAddr with valid IP")
 	}
 	bp := bufpool.Get(24 + len(p))
 	defer bufpool.Put(bp)
@@ -1150,9 +1585,11 @@ func (s *socks5UDPPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if ip4 := ua.IP.To4(); ip4 != nil {
 		pkt = append(pkt, 0x01)
 		pkt = append(pkt, ip4...)
-	} else {
+	} else if ip16 := ua.IP.To16(); ip16 != nil {
 		pkt = append(pkt, 0x04)
-		pkt = append(pkt, ua.IP.To16()...)
+		pkt = append(pkt, ip16...)
+	} else {
+		return 0, errors.New("socks5 udp invalid destination IP")
 	}
 	var pb [2]byte
 	binary.BigEndian.PutUint16(pb[:], uint16(ua.Port))

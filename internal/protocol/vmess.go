@@ -318,7 +318,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		}
 	}
 	if matched == nil && s.cfg.VMessAuthMode != "aead" {
-		if entry, stamp, ok := s.legacy.lookup(authID); ok {
+		if entry, stamp, ok := s.legacy.lookupIn(idx, authID); ok {
 			if entry.User.IsDisabled() {
 				return nil, nil, "", 0, 0, "user_disabled"
 			}
@@ -330,11 +330,9 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 		}
 	}
 	if matched == nil && len(s.cfg.VMessLegacyUsers) != 0 {
-		user, hdr := s.readLegacyVMessHeader(idx, br, authID)
-		if user == nil {
-			return nil, nil, "", 0, 0, "legacy_auth_failed"
+		if user, hdr := s.readLegacyVMessHeader(idx, br, authID); user != nil {
+			return s.finishVMessHandshake(conn, br, user, hdr, true)
 		}
-		return s.finishVMessHandshake(conn, br, user, hdr, true)
 	}
 	if matched == nil {
 		kind, uid, skew := diagnoseUnmatchedVMess(idx, authID)
@@ -621,6 +619,9 @@ func newVMessStreamConn(c net.Conn, br io.Reader, reqKey, reqIV [16]byte, respV,
 	if (secType == 0x03 || secType == 0x04) && (opt&0x01) == 0 {
 		return nil, errors.New("VMess AEAD cipher requires ChunkStream (opt & 0x01)")
 	}
+	if (opt & 0x10) != 0 {
+		return nil, errors.New("VMess RequestOptionAuthenticatedLength (opt & 0x10) is not supported")
+	}
 	rawStream := !isUDP && (secType == 0x06 || (opt&0x01) == 0)
 	chunkMask := !rawStream && (opt&0x04) != 0 && secType != 0x06
 	wsFast, _ := c.(wsPrependWriter)
@@ -800,7 +801,9 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 		v.hasPendingMask = false
 
 		size := int(binary.BigEndian.Uint16(v.hdrBytes[:]) ^ sizeMask)
-		if size == 0 && overhead == 0 && padLen == 0 {
+		// Non-AEAD VMess streams (AES-128-CFB and SecurityTypeNone) signal EOF via a bare
+		// 2-byte length equal to 0 or padLen with no trailing FNV1a/padding body.
+		if v.readAEAD == nil && (size == 0 || size == padLen) {
 			return 0, io.EOF
 		}
 		if size < overhead+padLen || size > 65535 {
@@ -847,6 +850,11 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 			if _, err := v.readAEAD.Open(chunk[:0], nonce[:], chunk[:overhead], nil); err != nil {
 				bufpool.Put(bp)
 				return 0, err
+			}
+		} else if v.readLegacyCFB && len(chunk) >= 4 {
+			if binary.BigEndian.Uint32(chunk[:4]) != fnv1a32(nil) {
+				bufpool.Put(bp)
+				return 0, errors.New("vmess cfb eof fnv1a mismatch")
 			}
 		}
 		bufpool.Put(bp)
@@ -935,26 +943,33 @@ func (v *vmessStreamConn) writeFramedLocked(part []byte) error {
 	const wsHeadroom = 10
 	bp := bufpool.Get(wsHeadroom + 2 + len(part) + 16 + padLen)
 	out := (*bp)[:wsHeadroom+2]
-	if v.writeAEAD != nil {
-		var nonce [12]byte
-		binary.BigEndian.PutUint16(nonce[0:2], v.writeCount)
-		copy(nonce[2:12], v.respIV[2:12])
-		v.writeCount++
-		out = v.writeAEAD.Seal(out, nonce[:], part, nil)
-	} else if v.writeCFB != nil {
-		var fnvBytes [4]byte
-		binary.BigEndian.PutUint32(fnvBytes[:], fnv1a32(part))
-		out = append(out, fnvBytes[:]...)
-		out = append(out, part...)
+	var wireSize uint16
+	if len(part) == 0 && v.writeAEAD == nil {
+		// Non-AEAD VMess EOF chunk (AES-128-CFB / None): emit only the 2-byte masked
+		// size (= padLen, or 0 without global padding) with no FNV1a header or padding body.
+		wireSize = uint16(padLen) ^ sizeMask
 	} else {
-		out = append(out, part...)
+		if v.writeAEAD != nil {
+			var nonce [12]byte
+			binary.BigEndian.PutUint16(nonce[0:2], v.writeCount)
+			copy(nonce[2:12], v.respIV[2:12])
+			v.writeCount++
+			out = v.writeAEAD.Seal(out, nonce[:], part, nil)
+		} else if v.writeCFB != nil {
+			var fnvBytes [4]byte
+			binary.BigEndian.PutUint32(fnvBytes[:], fnv1a32(part))
+			out = append(out, fnvBytes[:]...)
+			out = append(out, part...)
+		} else {
+			out = append(out, part...)
+		}
+		if padLen > 0 {
+			padStart := len(out)
+			out = out[:padStart+padLen]
+			_, _ = rand.Read(out[padStart:])
+		}
+		wireSize = uint16(len(out)-(wsHeadroom+2)) ^ sizeMask
 	}
-	if padLen > 0 {
-		padStart := len(out)
-		out = out[:padStart+padLen]
-		_, _ = rand.Read(out[padStart:])
-	}
-	wireSize := uint16(len(out)-(wsHeadroom+2)) ^ sizeMask
 	binary.BigEndian.PutUint16(out[wsHeadroom:wsHeadroom+2], wireSize)
 	if v.writeCFB != nil {
 		v.writeCFB.XORKeyStream(out[wsHeadroom:], out[wsHeadroom:])

@@ -273,7 +273,7 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 				}
 			}
 			if s, ok := cc["obfs"].(string); ok && s != "" {
-				spec.Hy2Obfs = strings.ToLower(strings.TrimSpace(s))
+				spec.Hy2Obfs = normalizeHy2Obfs(s)
 			}
 			if s, ok := cc["obfs_password"].(string); ok && s != "" {
 				spec.Hy2ObfsPassword = strings.TrimSpace(s)
@@ -294,10 +294,14 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	if spec.RealityPrivateKey != "" || c.cfg.IsRealityConfigured() {
 		spec.TLSMode = 2
 		if spec.RealityDest == "" && spec.ServerName != "" {
-			spec.RealityDest = net.JoinHostPort(spec.ServerName, "443")
+			spec.RealityDest = formatRealityDest(spec.ServerName, 443)
 		}
 		if len(spec.RealityServerNames) == 0 && spec.ServerName != "" {
-			spec.RealityServerNames = []string{spec.ServerName}
+			for _, sn := range strings.Split(spec.ServerName, ",") {
+				if trimmed := strings.TrimSpace(sn); trimmed != "" {
+					spec.RealityServerNames = append(spec.RealityServerNames, trimmed)
+				}
+			}
 		}
 	}
 	if spec.Protocol == "hysteria2" {
@@ -431,18 +435,20 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 		}
 		if i == 0 {
 			hostPart := rawPart
-			// Sometimes host:port#listenPort
+			// Sometimes host:port#listenPort or [2001:db8::1]:443#listenPort
 			if idx := strings.IndexByte(rawPart, '#'); idx > 0 {
 				hostPart = rawPart[:idx]
 				if p, err := strconv.Atoi(rawPart[idx+1:]); err == nil && p > 0 {
 					spec.ServerPort = p
 				}
 			}
-			if hOnly, portStr, hasColon := strings.Cut(hostPart, ":"); hasColon {
+			if hOnly, portStr, err := net.SplitHostPort(hostPart); err == nil {
 				hostPart = hOnly
 				if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 && spec.ServerPort == 0 {
 					spec.ServerPort = p
 				}
+			} else if strings.HasPrefix(hostPart, "[") && strings.HasSuffix(hostPart, "]") {
+				hostPart = strings.Trim(hostPart, "[]")
 			}
 			firstHost = strings.TrimSpace(hostPart)
 			continue
@@ -524,7 +530,7 @@ func parseMetronServerString(srv string, spec *NodeSpec) {
 				case "servername", "server_name":
 					spec.ServerName = v
 				case "obfs":
-					spec.Hy2Obfs = strings.ToLower(v)
+					spec.Hy2Obfs = normalizeHy2Obfs(v)
 				case "obfs_password", "obfs-password":
 					spec.Hy2ObfsPassword = v
 				case "up_mbps", "up":
@@ -736,7 +742,7 @@ func (c *SSPanelClient) PushStatus(ctx context.Context, st SystemStatus) error {
 func (c *SSPanelClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) ([]byte, string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, redactErr(err)
 	}
 	req.Header.Set("User-Agent", "xoga/1.0")
 	req.Header.Set("Accept", "application/json")
@@ -802,7 +808,7 @@ func (c *SSPanelClient) doPost(ctx context.Context, fullURL string, v any) error
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, &buf)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	req.Header.Set("User-Agent", "xoga/1.0")
 	req.Header.Set("Content-Type", "application/json")

@@ -21,6 +21,8 @@ func tryCopyFromRawTCP(
 	_ bool,
 	_ time.Duration,
 	_ *atomic.Bool,
+	_ *atomic.Bool,
+	_ *atomic.Int64,
 ) bool {
 	return false
 }

@@ -1,6 +1,9 @@
 package version
 
-import "runtime"
+import (
+	"runtime"
+	"strings"
+)
 
 var (
 	Version   = "1.3.6"
@@ -9,5 +12,6 @@ var (
 )
 
 func Summary() string {
-	return "xoga v" + Version + " (" + runtime.GOOS + "/" + runtime.GOARCH + ", " + runtime.Version() + ", commit " + Commit + ")"
+	ver := strings.TrimPrefix(strings.TrimSpace(Version), "v")
+	return "xoga v" + ver + " (" + runtime.GOOS + "/" + runtime.GOARCH + ", " + runtime.Version() + ", commit " + Commit + ")"
 }

@@ -10,8 +10,9 @@ import (
 // Unlike mutex-based token buckets, hot-path checks use a single atomic CAS on a nanosecond
 // virtual arrival timestamp with zero heap allocations and zero background goroutines.
 type Bucket struct {
-	rateBps      atomic.Int64 // bytes per second; <= 0 means unlimited
-	nextFreeNano atomic.Int64 // virtual scheduling timestamp (UnixNano)
+	rateBps      atomic.Int64  // bytes per second; <= 0 means unlimited
+	nextFreeNano atomic.Int64  // virtual scheduling timestamp (UnixNano)
+	epoch        atomic.Uint64 // incremented when rate increases or becomes unlimited
 }
 
 func NewBucketMbps(mbps float64) *Bucket {
@@ -29,20 +30,21 @@ func NewBucketBps(bps int64) *Bucket {
 // SetMbps updates the rate limit in Megabits per second (1 Mbps = 125,000 bytes/sec).
 func (b *Bucket) SetMbps(mbps float64) {
 	if mbps <= 0 {
-		b.rateBps.Store(0)
+		b.SetBytesPerSec(0)
 		return
 	}
 	bps := int64(mbps * 125000.0)
 	if bps < 1024 {
 		bps = 1024
 	}
-	b.rateBps.Store(bps)
+	b.SetBytesPerSec(bps)
 }
 
 func (b *Bucket) SetBytesPerSec(bps int64) {
 	if bps <= 0 {
 		b.rateBps.Store(0)
 		b.nextFreeNano.Store(0)
+		b.epoch.Add(1)
 		return
 	}
 	prev := b.rateBps.Swap(bps)
@@ -52,6 +54,7 @@ func (b *Bucket) SetBytesPerSec(bps int64) {
 		if b.nextFreeNano.Load() > now+int64(250*time.Millisecond) {
 			b.nextFreeNano.Store(now)
 		}
+		b.epoch.Add(1)
 	}
 }
 
@@ -71,43 +74,70 @@ func (b *Bucket) Wait(n int) {
 	if b == nil || n <= 0 {
 		return
 	}
-	bps := b.rateBps.Load()
-	if bps <= 0 {
-		return
-	}
+	const (
+		burstWindowNano   = int64(250 * time.Millisecond)
+		maxQueueDelayNano = int64(2 * time.Second)
+		sleepStepNano     = int64(200 * time.Millisecond)
+	)
 
-	// Cost of n bytes in nanoseconds: n * 1e9 / bps
-	costNano := (int64(n) * 1_000_000_000) / bps
-	// Allow up to 250ms burst window for smooth TCP congestion window ramp-up,
-	// and cap queued future delay at 2s so mass concurrent streams never sleep indefinitely after close/kick.
-	const burstWindowNano = int64(250 * time.Millisecond)
-	const maxQueueDelayNano = int64(2 * time.Second)
-
-	now := time.Now().UnixNano()
-	minBase := now - burstWindowNano
-	maxNext := now + maxQueueDelayNano
-
-	var waitNano int64
+	var targetNano int64
+	var startEpoch uint64
 	for {
+		startEpoch = b.epoch.Load()
+		bps := b.rateBps.Load()
+		if bps <= 0 {
+			return
+		}
+		// Cost of n bytes in nanoseconds: n * 1e9 / bps
+		costNano := (int64(n) * 1_000_000_000) / bps
+		if costNano <= 0 {
+			return
+		}
+
+		now := time.Now().UnixNano()
+		minBase := now - burstWindowNano
+		maxNext := now + maxQueueDelayNano
+
 		prev := b.nextFreeNano.Load()
 		base := prev
 		if base < minBase {
 			base = minBase
 		}
 		next := base + costNano
-		if next > maxNext {
-			next = maxNext
+		// When concurrent streams fill the virtual queue past maxQueueDelayNano, wait
+		// without reserving rather than clamping `next` (which would drop token debt
+		// and allow bandwidth-limit bypass under high concurrency).
+		if next > maxNext && base > now {
+			wait := base - now
+			if wait > sleepStepNano {
+				wait = sleepStepNano
+			}
+			if wait < int64(2*time.Millisecond) {
+				wait = int64(2 * time.Millisecond)
+			}
+			time.Sleep(time.Duration(wait))
+			continue
 		}
 		if b.nextFreeNano.CompareAndSwap(prev, next) {
-			if next > now {
-				waitNano = next - now
-			}
+			targetNano = next
 			break
 		}
 	}
 
-	if waitNano > int64(time.Millisecond) {
-		time.Sleep(time.Duration(waitNano))
+	for {
+		if b.rateBps.Load() <= 0 || b.epoch.Load() != startEpoch {
+			return
+		}
+		rem := targetNano - time.Now().UnixNano()
+		if rem <= int64(time.Millisecond) {
+			return
+		}
+		if rem > sleepStepNano {
+			time.Sleep(time.Duration(sleepStepNano))
+			continue
+		}
+		time.Sleep(time.Duration(rem))
+		return
 	}
 }
 

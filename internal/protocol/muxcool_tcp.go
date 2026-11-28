@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -137,6 +138,7 @@ func (s *Server) runMuxTCPSubSession(
 	user *stats.UserEntry,
 	sub *muxTCPSubSession,
 	writeFrame func([]byte) error,
+	onActivity func(),
 	onDone func(),
 ) {
 	defer func() {
@@ -200,12 +202,22 @@ func (s *Server) runMuxTCPSubSession(
 		idleDur = 120 * time.Second
 	}
 
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().UnixNano())
+	touch := func() {
+		lastActive.Store(time.Now().UnixNano())
+		if onActivity != nil {
+			onActivity()
+		}
+	}
+
 	// Upload writer goroutine: drains firstChunk + sub.txCh -> remoteConn
 	go func() {
 		writeRemote := func(chunk []byte) bool {
 			if len(chunk) == 0 {
 				return true
 			}
+			touch()
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(len(chunk))
 			}
@@ -213,6 +225,9 @@ func (s *Server) runMuxTCPSubSession(
 			user.AddUpload(int64(len(chunk)))
 			_ = remoteConn.SetWriteDeadline(time.Now().Add(idleDur))
 			_, werr := remoteConn.Write(chunk)
+			if werr == nil {
+				touch()
+			}
 			return werr == nil
 		}
 		if len(firstChunk) > 0 && !writeRemote(firstChunk) {
@@ -243,6 +258,7 @@ func (s *Server) runMuxTCPSubSession(
 		_ = remoteConn.SetReadDeadline(time.Now().Add(idleDur))
 		n, rerr := remoteConn.Read(fbuf[8 : 8+maxMuxChunk])
 		if n > 0 {
+			touch()
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -255,6 +271,11 @@ func (s *Server) runMuxTCPSubSession(
 			}
 		}
 		if rerr != nil {
+			var ne net.Error
+			if errors.As(rerr, &ne) && ne.Timeout() && !user.IsDisabled() && !sub.aborted.Load() &&
+				time.Since(time.Unix(0, lastActive.Load())) < idleDur {
+				continue
+			}
 			isErr := rerr != io.EOF && !sub.aborted.Load()
 			_ = writeFrame(encodeMuxTCPEndFrame(sid, isErr))
 			return

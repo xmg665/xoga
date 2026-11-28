@@ -51,6 +51,7 @@ type Config struct {
 	ProxyProtocol      bool
 	ForceProxyProtocol bool
 	UDPProxyProtocol   bool
+	TrustForwardedIP   bool // explicitly trust HTTP CF-Connecting-IP/X-Forwarded-For/X-Real-IP headers from public CDN peers
 	ListenIP           string
 	ListenPort         int // optional local port override (0 = follow panel server_port)
 
@@ -241,6 +242,8 @@ func (c *Config) ApplyKV(key, val string) {
 		c.ProxyProtocol = parseBool(val, false)
 	case "udp_proxy_protocol":
 		c.UDPProxyProtocol = parseBool(val, false)
+	case "trust_forwarded_ip":
+		c.TrustForwardedIP = parseBool(val, false)
 	case "listen_ip":
 		c.ListenIP = val
 	case "listen_port":
@@ -518,7 +521,7 @@ var knownEnvKeys = []string{
 	"type", "server_type", "node_id", "soga_key", "api",
 	"webapi_url", "webapi_key", "webapi_mukey",
 	"cert_file", "key_file", "cert_mode", "cert_domain", "cert_key_length", "dns_provider", "force_close_ssl",
-	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "listen_ip", "listen_port",
+	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "trust_forwarded_ip", "listen_ip", "listen_port",
 	"redis_ip_limit_enable", "redis_enable", "redis_ip_limit_addr", "redis_addr",
 	"redis_ip_limit_password", "redis_password", "redis_ip_limit_db", "redis_db",
 	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",

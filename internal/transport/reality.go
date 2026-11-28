@@ -46,12 +46,17 @@ func BuildRealityListener(inner net.Listener, opts RealityOptions) (net.Listener
 	dest := strings.TrimSpace(opts.Dest)
 	if dest == "" {
 		if len(sniList) > 0 {
-			dest = net.JoinHostPort(sniList[0], "443")
+			cand := strings.TrimSpace(sniList[0])
+			if _, _, err := net.SplitHostPort(cand); err == nil {
+				dest = cand
+			} else {
+				dest = net.JoinHostPort(strings.Trim(cand, "[]"), "443")
+			}
 		} else {
 			dest = "www.apple.com:443"
 		}
 	} else if _, _, splitErr := net.SplitHostPort(dest); splitErr != nil {
-		dest = net.JoinHostPort(dest, "443")
+		dest = net.JoinHostPort(strings.Trim(dest, "[]"), "443")
 	}
 
 	serverNames := make(map[string]bool, max(len(sniList), 1))
@@ -138,7 +143,7 @@ func parseShortIDHex(s string) ([8]byte, error) {
 		return out, fmt.Errorf("short_id %q exceeds 16 hex chars", s)
 	}
 	if len(s)%2 == 1 {
-		s = "0" + s
+		return out, fmt.Errorf("short_id %q must have an even number of hex characters", s)
 	}
 	decoded, err := hex.DecodeString(s)
 	if err != nil {

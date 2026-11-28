@@ -61,9 +61,9 @@ func (s Strategy) String() string {
 }
 
 const (
-	qTypeA    uint16 = 1
-	qTypeAAAA uint16 = 28
-	maxCacheEntries  = 4096
+	qTypeA          uint16 = 1
+	qTypeAAAA       uint16 = 28
+	maxCacheEntries        = 4096
 )
 
 type upstreamRule struct {
@@ -220,7 +220,9 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 		cache:           make(map[cacheKey]cacheEntry, 256),
 		inflight:        make(map[cacheKey]*inflightCall, 32),
 		dohClient: &http.Client{
-			Timeout: 5 * time.Second,
+			// Do NOT set a hard Client.Timeout here because reloadNow(true) uses an 8s
+			// context timeout for remote dns_config_url while exchangeDoH enforces a 5s
+			// per-query context timeout.
 			Transport: &http.Transport{
 				ForceAttemptHTTP2:   true,
 				MaxIdleConns:        8,
@@ -232,6 +234,7 @@ func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defau
 	}
 	r.maxTTLSec.Store(600)
 	r.reloadNow(true)
+	r.lastCheck.Store(time.Now().Unix())
 	return r
 }
 
@@ -310,11 +313,25 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 	strat := r.defaultStrategy
 
 	if sn != nil {
+		// Pass 1: evaluate explicit domain rules first so catch-all servers listed earlier
+		// in `servers:` (e.g. `- address: 1.1.1.1`) never shadow specific unlock rules.
 		for i := range sn.rules {
-			if sn.rules[i].matches(domain) {
+			if !sn.rules[i].isCatch && sn.rules[i].matches(domain) {
 				servers = []string{sn.rules[i].server}
 				strat = sn.rules[i].strategy
 				break
+			}
+		}
+		// Pass 2: fall back to catch-all rules (preserving strategy of the first catch-all
+		// and collecting all catch-all servers for failover).
+		if len(servers) == 0 {
+			for i := range sn.rules {
+				if sn.rules[i].isCatch {
+					if len(servers) == 0 {
+						strat = sn.rules[i].strategy
+					}
+					servers = append(servers, sn.rules[i].server)
+				}
 			}
 		}
 		if len(servers) == 0 && len(sn.defaultServers) > 0 {
@@ -356,14 +373,28 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 		call = &inflightCall{done: make(chan struct{})}
 		r.inflight[ck] = call
 		go func(srvs []string) {
-			sfCtx, sfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			perSrv := 5 * time.Second
+			totalBudget := 5 * time.Second
+			if len(srvs) > 1 {
+				perSrv = 3 * time.Second
+				if len(srvs) > 2 {
+					perSrv = 2500 * time.Millisecond
+				}
+				totalBudget = time.Duration(len(srvs)) * perSrv
+				if totalBudget > 10*time.Second {
+					totalBudget = 10 * time.Second
+				}
+			}
+			sfCtx, sfCancel := context.WithTimeout(context.Background(), totalBudget)
 			defer sfCancel()
 
 			var addrs []netip.Addr
 			var ttl uint32
 			var lastErr error
 			for _, srv := range srvs {
-				addrs, ttl, lastErr = r.queryServerWithStrategy(sfCtx, srv, domain, strat)
+				srvCtx, srvCancel := context.WithTimeout(sfCtx, perSrv)
+				addrs, ttl, lastErr = r.queryServerWithStrategy(srvCtx, srv, domain, strat)
+				srvCancel()
 				if lastErr == nil && len(addrs) > 0 {
 					r.putCache(ck, addrs, ttl)
 					break
@@ -510,11 +541,11 @@ func (r *Resolver) querySingleType(ctx context.Context, srv, domain string, qtyp
 	if err != nil {
 		return nil, 0, err
 	}
-	addrs, ttl, decErr := decodeDNSAnswers(respWire, txID, qtype, allowZeroID)
+	addrs, ttl, decErr := decodeDNSAnswersForDomain(respWire, txID, domain, qtype, allowZeroID)
 	if isUDP && errors.Is(decErr, errDNSTruncated) {
 		// RFC 1035 TC=1 fallback over TCP when large CNAME chains truncate 512-byte UDP packet
 		if tcpWire, terr := exchangeTCP(ctx, udpTarget, reqWire); terr == nil {
-			return decodeDNSAnswers(tcpWire, txID, qtype, false)
+			return decodeDNSAnswersForDomain(tcpWire, txID, domain, qtype, false)
 		}
 	}
 	return addrs, ttl, decErr
@@ -522,7 +553,9 @@ func (r *Resolver) querySingleType(ctx context.Context, srv, domain string, qtyp
 
 func (r *Resolver) exchangeDoH(ctx context.Context, dohURL string, wire []byte) ([]byte, error) {
 	// Per RFC 8484, DoH requests set DNS ID to 0 for HTTP cache friendliness (we accept original or 0)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(wire))
+	dohCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(dohCtx, http.MethodPost, dohURL, bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
@@ -683,6 +716,10 @@ func encodeDNSQuery(domain string, qtype uint16) ([]byte, uint16, error) {
 }
 
 func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID bool) ([]netip.Addr, uint32, error) {
+	return decodeDNSAnswersForDomain(msg, expectedID, "", qtype, allowZeroID)
+}
+
+func decodeDNSAnswersForDomain(msg []byte, expectedID uint16, expectedDomain string, qtype uint16, allowZeroID bool) ([]netip.Addr, uint32, error) {
 	if len(msg) < 12 {
 		return nil, 0, errors.New("short DNS packet")
 	}
@@ -712,11 +749,21 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID b
 
 	pos := 12
 	for i := 0; i < qdCount; i++ {
-		next, err := skipDNSName(msg, pos)
+		qname, next, err := readDNSName(msg, pos)
 		if err != nil || next+4 > len(msg) {
 			return nil, 0, errors.New("malformed DNS question")
 		}
-		// Validate QCLASS == IN (1) to reject non-Internet class responses
+		if expectedDomain != "" {
+			want := strings.TrimSuffix(expectedDomain, ".")
+			if !strings.EqualFold(qname, want) {
+				return nil, 0, fmt.Errorf("DNS QNAME mismatch: got %q, want %q", qname, want)
+			}
+		}
+		// Validate QTYPE matches the requested record type and QCLASS == IN (1)
+		respQType := binary.BigEndian.Uint16(msg[next : next+2])
+		if respQType != qtype {
+			return nil, 0, fmt.Errorf("DNS QTYPE=%d (expected %d)", respQType, qtype)
+		}
 		qclass := binary.BigEndian.Uint16(msg[next+2 : next+4])
 		if qclass != 1 {
 			return nil, 0, fmt.Errorf("DNS QCLASS=%d (expected IN=1)", qclass)
@@ -772,6 +819,63 @@ func decodeDNSAnswers(msg []byte, expectedID uint16, qtype uint16, allowZeroID b
 	return addrs, minTTL, nil
 }
 
+func readDNSName(msg []byte, pos int) (string, int, error) {
+	var bld strings.Builder
+	cur := pos
+	nextPos := 0
+	jumped := false
+	ptrHops := 0
+	labels := 0
+	for cur < len(msg) {
+		b := msg[cur]
+		if b == 0 {
+			if !jumped {
+				nextPos = cur + 1
+			}
+			return bld.String(), nextPos, nil
+		}
+		if (b & 0xC0) == 0xC0 {
+			if cur+1 >= len(msg) {
+				return "", 0, errors.New("truncated pointer")
+			}
+			if !jumped {
+				nextPos = cur + 2
+				jumped = true
+			}
+			ptr := int(b&0x3F)<<8 | int(msg[cur+1])
+			if ptr >= len(msg) {
+				return "", 0, errors.New("pointer out of range")
+			}
+			cur = ptr
+			ptrHops++
+			if ptrHops > 16 {
+				return "", 0, errors.New("compression pointer loop")
+			}
+			continue
+		}
+		if (b & 0xC0) != 0 {
+			return "", 0, errors.New("invalid DNS label header")
+		}
+		l := int(b)
+		if cur+1+l > len(msg) {
+			return "", 0, errors.New("truncated DNS label")
+		}
+		if bld.Len() > 0 {
+			bld.WriteByte('.')
+		}
+		if bld.Len()+l > 255 {
+			return "", 0, errors.New("DNS name exceeds 255 bytes")
+		}
+		bld.Write(msg[cur+1 : cur+1+l])
+		cur += 1 + l
+		labels++
+		if labels > 128 {
+			return "", 0, errors.New("DNS name has too many labels")
+		}
+	}
+	return "", 0, errors.New("unterminated DNS name")
+}
+
 func skipDNSName(msg []byte, pos int) (int, error) {
 	jumps := 0
 	for pos < len(msg) {
@@ -785,9 +889,15 @@ func skipDNSName(msg []byte, pos int) (int, error) {
 			}
 			return pos + 2, nil
 		}
+		if (b & 0xC0) != 0 {
+			return 0, errors.New("invalid DNS label header")
+		}
+		if pos+1+int(b) > len(msg) {
+			return 0, errors.New("truncated DNS label")
+		}
 		pos += 1 + int(b)
 		jumps++
-		if jumps > 64 {
+		if jumps > 128 {
 			return 0, errors.New("name too long")
 		}
 	}
@@ -836,6 +946,11 @@ func fallbackSystemResolveAll(ctx context.Context, host string, strat Strategy, 
 
 // maybeHotReload checks `/etc/xoga/dns.yml` mtime at most once every 5 seconds and hot-swaps rules!
 func (r *Resolver) maybeHotReload() {
+	// Skip hot-reload when driven by a remote dns_config_url or when no local dns.yml path exists;
+	// otherwise reloadNow(false) would run with empty raw bytes and wipe rules + cache every 5s.
+	if r.remoteURL != "" || r.configPath == "" {
+		return
+	}
 	now := time.Now().Unix()
 	prev := r.lastCheck.Load()
 	if now-prev < 5 || !r.lastCheck.CompareAndSwap(prev, now) {
@@ -845,17 +960,24 @@ func (r *Resolver) maybeHotReload() {
 }
 
 func (r *Resolver) reloadNow(initial bool) {
+	if !initial && (r.remoteURL != "" || r.configPath == "") {
+		return
+	}
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
 
 	var raw []byte
+	loaded := false
 	if r.remoteURL != "" && initial {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.remoteURL, nil)
 		if err == nil {
 			if resp, derr := r.dohClient.Do(req); derr == nil {
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					raw, _ = io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+					if data, rerr := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024)); rerr == nil && len(data) > 0 {
+						raw = data
+						loaded = true
+					}
 				}
 				_ = resp.Body.Close()
 			}
@@ -865,7 +987,7 @@ func (r *Resolver) reloadNow(initial bool) {
 
 	// When a remote URL is configured, skip local file hot-reload to prevent
 	// overwriting remote config with stale local dns.yml on file mtime changes.
-	if len(raw) == 0 && r.configPath != "" && (r.remoteURL == "" || initial) {
+	if !loaded && r.configPath != "" && (r.remoteURL == "" || initial) {
 		st, err := os.Stat(r.configPath)
 		if err != nil {
 			if initial {
@@ -885,6 +1007,12 @@ func (r *Resolver) reloadNow(initial bool) {
 		}
 		r.lastMtime = st.ModTime()
 		raw = data
+		loaded = true
+	}
+
+	// Never overwrite the active snapshot or flush cache on a non-initial reload when nothing was loaded.
+	if !initial && !loaded {
+		return
 	}
 
 	rules, extraDefaults := ParseDNSYAML(string(raw), r.defaultStrategy)
@@ -909,6 +1037,21 @@ func (r *Resolver) reloadNow(initial bool) {
 	}
 }
 
+func yamlIndent(line string) int {
+	n := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case ' ':
+			n++
+		case '\t':
+			n += 2
+		default:
+			return n
+		}
+	}
+	return n
+}
+
 // ParseDNSYAML parses soga-style `dns.yml` (both top-level server keys like
 // `https://.../dns-query:` or `154.x.x.x:` with `strategy:` + `rules:` AND `servers:` list)
 // without requiring a heavy external YAML reflection library.
@@ -919,6 +1062,7 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 	var cur *upstreamRule
 	inServersList := false
 	inRulesList := false
+	serverItemIndent := -1
 
 	flush := func() {
 		if cur != nil && cur.server != "" {
@@ -943,14 +1087,15 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 			continue
 		}
 
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		indent := yamlIndent(line)
 
 		// Top-level key (indent == 0)
-		if indent == 0 && strings.HasSuffix(trimmed, ":") {
+		if indent == 0 && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
 			key := strings.TrimSpace(strings.TrimSuffix(trimmed, ":"))
 			key = strings.Trim(key, "\"'")
 			flush()
 			inRulesList = false
+			serverItemIndent = -1
 			if strings.EqualFold(key, "servers") || strings.EqualFold(key, "nameservers") || strings.EqualFold(key, "default") {
 				inServersList = true
 				continue
@@ -965,27 +1110,44 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 		}
 
 		if inServersList && strings.HasPrefix(trimmed, "-") {
-			item := strings.TrimSpace(trimmed[1:])
-			lowerItem := strings.ToLower(item)
-			// Support soga structured `servers:\n  - address: 1.1.1.1\n    domains: [...]` list items!
-			if strings.HasPrefix(lowerItem, "address:") || strings.HasPrefix(lowerItem, "server:") {
-				flush()
-				inRulesList = false
-				_, addrVal, _ := strings.Cut(item, ":")
-				srv := strings.Trim(strings.TrimSpace(addrVal), "\"'")
-				cur = &upstreamRule{
-					server:   srv,
-					strategy: defStrat,
-					exact:    make(map[string]struct{}),
+			// Distinguish top-level `servers:` list items (at serverItemIndent) from nested
+			// `domains:`/`rules:` patterns inside a structured server entry (deeper indent).
+			isTopServerItem := serverItemIndent < 0 || indent <= serverItemIndent
+			if isTopServerItem {
+				serverItemIndent = indent
+				item := strings.TrimSpace(trimmed[1:])
+				lowerItem := strings.ToLower(item)
+				// Support soga structured `servers:\n  - address: 1.1.1.1\n    domains: [...]` list items!
+				if strings.HasPrefix(lowerItem, "address:") || strings.HasPrefix(lowerItem, "server:") {
+					flush()
+					inRulesList = false
+					_, addrVal, _ := strings.Cut(item, ":")
+					srv := strings.Trim(strings.TrimSpace(addrVal), "\"'")
+					cur = &upstreamRule{
+						server:   srv,
+						strategy: defStrat,
+						exact:    make(map[string]struct{}),
+					}
+					continue
 				}
-				continue
-			}
-			if cur == nil || !inRulesList {
-				srv := strings.Trim(item, "\"'")
-				if srv != "" && !strings.Contains(srv, ": ") {
-					defaultServers = append(defaultServers, srv)
+				if strings.HasPrefix(lowerItem, "strategy:") || strings.HasPrefix(lowerItem, "rules:") ||
+					strings.HasPrefix(lowerItem, "domains:") || strings.HasPrefix(lowerItem, "match:") {
+					flush()
+					inRulesList = false
+					cur = &upstreamRule{
+						strategy: defStrat,
+						exact:    make(map[string]struct{}),
+					}
+					trimmed = item
+				} else {
+					flush()
+					inRulesList = false
+					srv := strings.Trim(item, "\"'")
+					if srv != "" && !strings.Contains(srv, ": ") {
+						defaultServers = append(defaultServers, srv)
+					}
+					continue
 				}
-				continue
 			}
 		}
 
@@ -1016,12 +1178,16 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 			inRulesList = false
 		case "rules", "domains", "match":
 			cur.sawRulesKey = true
-			inRulesList = true
 			if strings.HasPrefix(v, "[") && strings.HasSuffix(v, "]") {
+				inRulesList = false
 				for _, item := range acl.SplitQuotedArrayItems(v[1 : len(v)-1]) {
 					cur.addPattern(item)
 				}
+			} else {
+				inRulesList = true
 			}
+		default:
+			inRulesList = false
 		}
 	}
 	flush()

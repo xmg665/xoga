@@ -374,9 +374,13 @@ func CreateInstance(args []string) error {
 	}
 
 	_ = exec.Command("systemctl", "daemon-reload").Run()
-	_ = exec.Command("systemctl", "enable", unit).Run()
+	if err := exec.Command("systemctl", "enable", unit).Run(); err != nil {
+		return fmt.Errorf("设置开机自启失败 (%s): %w", unit, err)
+	}
 	if len(args[1:]) > 0 {
-		_ = exec.Command("systemctl", "restart", unit).Run()
+		if err := exec.Command("systemctl", "restart", unit).Run(); err != nil {
+			return fmt.Errorf("启动实例 [%s] 失败 (%s): %w", instName, unit, err)
+		}
 		fmt.Printf("%s实例 [%s] 已启动并设置开机自启%s\n", ansiGreen, instName, ansiPlain)
 	} else {
 		fmt.Printf("%s请编辑 %s 或运行 `xoga config %s k=v` 后执行 `xoga start %s`%s\n",
@@ -408,8 +412,11 @@ func RemoveInstances(names []string) error {
 }
 
 func RenameInstance(oldName, newName string) error {
-	if oldName == "xoga" || newName == "xoga" || !validInstanceRe.MatchString(newName) {
-		return errors.New("不支持重命名默认实例 xoga，或新实例名称不合法")
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if oldName == "xoga" || oldName == "default" || newName == "xoga" || newName == "default" ||
+		!validInstanceRe.MatchString(oldName) || !validInstanceRe.MatchString(newName) {
+		return errors.New("不支持重命名默认实例 xoga，或实例名称不合法")
 	}
 	_, oldUnit, oldConf := ResolveUnitAndConfig(oldName)
 	_, newUnit, newConf := ResolveUnitAndConfig(newName)
@@ -472,23 +479,59 @@ func HandleConfigCmd(args []string) error {
 	return nil
 }
 
-func ShowLogs(args []string) int {
-	instance := "xoga"
-	follow := false
-	lines := "1000"
-	for _, a := range args {
-		switch a {
-		case "-f", "--follow":
+func parseShowLogsArgs(args []string, instanceExists func(string) bool) (instance, lines string, follow bool, err error) {
+	instance = "xoga"
+	lines = "1000"
+	hasInstance := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-f" || a == "--follow":
 			follow = true
-		default:
-			if !strings.HasPrefix(a, "-") {
-				if isDigits(a) {
-					lines = a
-				} else {
+		case a == "-n" || a == "--lines":
+			if i+1 < len(args) && isDigits(args[i+1]) {
+				lines = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--lines="):
+			if val := strings.TrimPrefix(a, "--lines="); isDigits(val) {
+				lines = val
+			}
+		case strings.HasPrefix(a, "-n") && len(a) > 2 && isDigits(a[2:]):
+			lines = a[2:]
+		case !strings.HasPrefix(a, "-"):
+			if isDigits(a) {
+				// Numeric instance names (e.g. "101") take precedence when their config file exists
+				// and no instance name was already provided.
+				if !hasInstance && instanceExists != nil && instanceExists(a) {
 					instance = a
+					hasInstance = true
+				} else {
+					lines = a
 				}
+			} else {
+				instance = a
+				hasInstance = true
 			}
 		}
+	}
+	if err = ValidateInstanceName(instance); err != nil {
+		return "", "", false, err
+	}
+	return instance, lines, follow, nil
+}
+
+func ShowLogs(args []string) int {
+	instance, lines, follow, err := parseShowLogsArgs(args, func(name string) bool {
+		if ValidateInstanceName(name) != nil {
+			return false
+		}
+		_, _, confPath := ResolveUnitAndConfig(name)
+		return fileExists(confPath)
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s%v%s\n", ansiRed, err, ansiPlain)
+		return 1
 	}
 	_, unit, _ := ResolveUnitAndConfig(instance)
 	jArgs := []string{"-u", unit, "-e", "--no-pager", "-n", lines}

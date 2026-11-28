@@ -122,9 +122,10 @@ install_xoga() {
         systemctl stop "${u}" >/dev/null 2>&1 || true
     done
 
-    rm -rf /usr/local/xoga
+    # Update packaged files in place without wiping user auxiliary files in /usr/local/xoga.
     mkdir -p /usr/local/xoga /etc/xoga
-    mv "${tmp_stage}/"* /usr/local/xoga/
+    rm -f /usr/local/xoga/xoga
+    cp -rf "${tmp_stage}/." /usr/local/xoga/
     rm -rf "${tmp_stage}"
 
     chmod +x /usr/local/xoga/xoga

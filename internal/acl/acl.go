@@ -347,15 +347,13 @@ func (e *Engine) DecideForNode(nodeID int, destHost string, destPort uint16, sni
 	if e != nil && e.IsPortForbidden(destPort) {
 		return OutboundTarget{Action: ActionBlock, RuleName: "forbidden-port", MatchedRule: true}
 	}
-	if e != nil && e.banPrivateIP {
-		if ip, err := netip.ParseAddr(destHost); err == nil {
-			if IsReservedOrPrivateIP(ip) {
-				return OutboundTarget{Action: ActionBlock, RuleName: "ban-private-ip", MatchedRule: true}
-			}
-		}
-	}
 	res := e.decideInternal(nodeID, destHost, sniffDomain, sniffProto)
 	if e != nil {
+		if e.banPrivateIP && res.RuleName != "whitelist" && res.Action != ActionBlock {
+			if ip, err := netip.ParseAddr(destHost); err == nil && IsReservedOrPrivateIP(ip) {
+				return OutboundTarget{Action: ActionBlock, RuleName: "ban-private-ip", MatchedRule: true, eng: e, ForbidPrivate: true}
+			}
+		}
 		res.eng = e
 		res.ForbidPrivate = e.banPrivateIP && res.RuleName != "whitelist"
 	}
@@ -887,7 +885,8 @@ func ParseRoutesTOML(path string) []compiledRule {
 		} else if len(d.outs) == 1 && d.outs[0].Type == "direct" && d.outs[0].ListenIPv4 == "" && d.outs[0].ListenIPv6 == "" && d.outs[0].ListenStrategy == "" {
 			act = ActionDirect
 		} else if len(d.outs) == 0 {
-			act = ActionBlock
+			logger.Warnf("routes.toml: skipping route %q with unresolved outbound (tag=%q outbound=%q)", name, d.outTag, d.outbound)
+			continue
 		}
 
 		cr := newCompiledRule(name, act)

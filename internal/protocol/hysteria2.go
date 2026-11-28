@@ -47,6 +47,15 @@ func (c *hy2QuicCloser) Close() error {
 	return c.qconn.CloseWithError(0, "user session terminated")
 }
 
+func normalizeHy2Obfs(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "none", "plain", "false", "null", "0":
+		return ""
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+}
+
 // startHysteria2 starts a QUIC + HTTP/3 Hysteria 2 server supporting:
 // - HTTP/3 `/auth` (`233 HyOK`) + active-probing HTTP/3 `404` web server masquerade
 // - Optional Salamander UDP packet obfuscation (`obfs=salamander`)
@@ -59,7 +68,8 @@ func (s *Server) startHysteria2(addr string) error {
 	}
 
 	pktConn := rawUDP
-	if s.spec.Hy2Obfs == "salamander" {
+	hy2Obfs := normalizeHy2Obfs(s.spec.Hy2Obfs)
+	if hy2Obfs == "salamander" {
 		if s.spec.Hy2ObfsPassword == "" {
 			_ = rawUDP.Close()
 			return fmt.Errorf("init hysteria2: salamander obfs requires a password")
@@ -70,7 +80,7 @@ func (s *Server) startHysteria2(addr string) error {
 			return fmt.Errorf("init hysteria2 salamander obfs: %w", oerr)
 		}
 		pktConn = obfsConn
-	} else if s.spec.Hy2Obfs != "" {
+	} else if hy2Obfs != "" {
 		_ = rawUDP.Close()
 		return fmt.Errorf("init hysteria2: unsupported obfs type %q", s.spec.Hy2Obfs)
 	}
@@ -165,8 +175,10 @@ func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Release old mux session and counters before re-authenticating with potentially different user
+		// Release old mux session and reset authed before re-authenticating so a failed
+		// re-auth never leaves authed==true with user==nil.
 		if oldUser := h.user.Swap(nil); oldUser != nil {
+			h.authed.Store(false)
 			oldUser.ReleaseMuxSession(h.sessConnID)
 			h.sessConnID = 0
 		}
@@ -334,13 +346,9 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 		return
 	}
 
-	// Send Hysteria 2 TCPResponse OK immediately so client sends its first payload (TLS ClientHello / HTTP)
-	if err := writeHy2TCPResponse(sc, true, ""); err != nil {
-		return
-	}
-
-	// Peek initial payload for SNI / HTTP / BitTorrent sniffing (releasing 2 KiB pooled buffer immediately!)
-	peeked, perr := h.srv.peekInitialPayload(sc)
+	// Peek any 0-RTT initial payload (bounded 50ms wait so wait-for-response clients aren't delayed)
+	// for SNI / HTTP / BitTorrent sniffing before dialing and reporting the real TCPResponse status.
+	peeked, perr := h.srv.peekInitialPayloadWithTimeout(sc, 50*time.Millisecond)
 	if perr != nil {
 		return
 	}
@@ -348,6 +356,7 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	sn := sniff.Inspect(peeked)
 	route := aclEng.DecideForNode(h.srv.cfg.NodeID, host, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
+		_ = writeHy2TCPResponse(sc, false, "blocked by policy")
 		return
 	}
 
@@ -364,9 +373,15 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	remoteConn, err := relay.DialOutbound(dialCtx, effectiveHost, destPort, route, h.srv.dnsRes, 10*time.Second)
 	cancel()
 	if err != nil {
+		_ = writeHy2TCPResponse(sc, false, err.Error())
 		return
 	}
 	defer remoteConn.Close()
+
+	// Report TCPResponse OK only after outbound dial succeeds so clients receive real dial errors.
+	if err := writeHy2TCPResponse(sc, true, ""); err != nil {
+		return
+	}
 
 	idleDur := time.Duration(h.srv.cfg.ConnIdleSec) * time.Second
 	if idleDur < 15*time.Second {
@@ -375,11 +390,64 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	relay.PipeBidirectional(sc, remoteConn, peeked, user, h.srv.tracker.NodeLimiter, idleDur, false)
 }
 
+type hy2UDPKey struct {
+	sessID   uint32
+	routeKey string
+}
+
 type hy2UDPSess struct {
 	udpConn   net.PacketConn
+	user      *stats.UserEntry
 	udpSlotID uint64
 	lastSeen  atomic.Int64
-	lastAddr  string
+
+	addrMu  sync.RWMutex
+	addrMap map[netip.AddrPort]string // maps resolved remote ip:port -> original domain:port for Hy2 replies
+}
+
+func normalizeUDPAddrPort(addr net.Addr) (netip.AddrPort, bool) {
+	ua, ok := addr.(*net.UDPAddr)
+	if !ok || ua == nil || ua.IP == nil {
+		return netip.AddrPort{}, false
+	}
+	ip, ok := netip.AddrFromSlice(ua.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(ua.Port)), true
+}
+
+func (s *hy2UDPSess) rememberDomain(dst *net.UDPAddr, origAddr string) {
+	ap, ok := normalizeUDPAddrPort(dst)
+	if !ok {
+		return
+	}
+	s.addrMu.Lock()
+	if s.addrMap == nil {
+		s.addrMap = make(map[netip.AddrPort]string, 4)
+	}
+	if len(s.addrMap) >= 64 {
+		if _, exists := s.addrMap[ap]; !exists {
+			for k := range s.addrMap {
+				delete(s.addrMap, k)
+				break
+			}
+		}
+	}
+	s.addrMap[ap] = origAddr
+	s.addrMu.Unlock()
+}
+
+func (s *hy2UDPSess) replyAddrString(raddr net.Addr) string {
+	if ap, ok := normalizeUDPAddrPort(raddr); ok {
+		s.addrMu.RLock()
+		orig := s.addrMap[ap]
+		s.addrMu.RUnlock()
+		if orig != "" {
+			return orig
+		}
+	}
+	return raddr.String()
 }
 
 type hy2FragAssembly struct {
@@ -392,17 +460,13 @@ type hy2FragAssembly struct {
 }
 
 func (h *hy2ConnState) serveDatagrams() {
-	user := h.user.Load()
-	if user == nil {
-		return
-	}
 	idleDur := time.Duration(h.srv.cfg.UDPIdleSec) * time.Second
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
 	}
 
 	var mu sync.Mutex
-	sessions := make(map[uint32]*hy2UDPSess)
+	sessions := make(map[hy2UDPKey]*hy2UDPSess)
 	frags := make(map[uint64]*hy2FragAssembly)
 	var outPktID atomic.Uint32
 
@@ -417,12 +481,18 @@ func (h *hy2ConnState) serveDatagrams() {
 
 	ctx := h.qconn.Context()
 	for {
-		if user.IsDisabled() {
-			_ = h.qconn.CloseWithError(0, "quota/account expired")
-			return
-		}
 		dgram, err := h.qconn.ReceiveDatagram(ctx)
 		if err != nil {
+			return
+		}
+		// Load current user dynamically so re-authentication never leaves serveDatagrams
+		// pinned to a stale or previously disabled UserEntry pointer.
+		user := h.user.Load()
+		if user == nil {
+			continue
+		}
+		if user.IsDisabled() {
+			_ = h.qconn.CloseWithError(0, "quota/account expired")
 			return
 		}
 		sessID, pktID, fragID, fragCnt, addrStr, payload, perr := parseHy2UDPMessage(dgram)
@@ -508,75 +578,117 @@ func (h *hy2ConnState) serveDatagrams() {
 			rcancel()
 			continue
 		}
+		isIPv6 := dstUDP.IP.To4() == nil
+		key := hy2UDPKey{sessID: sessID, routeKey: udpRouteKey(route, isIPv6)}
+		_, isHostIP := netip.ParseAddr(strings.Trim(host, "[]"))
 
 		mu.Lock()
-		us, exists := sessions[sessID]
-		if !exists {
+		if sessions == nil {
+			mu.Unlock()
+			rcancel()
+			return
+		}
+		us, exists := sessions[key]
+		if exists && us.user != user {
+			delete(sessions, key)
+			_ = us.udpConn.Close()
+			exists = false
+			us = nil
+		}
+		if exists {
+			us.lastSeen.Store(time.Now().Unix())
+			mu.Unlock()
+			rcancel()
+		} else {
 			if len(sessions) >= 128 {
 				mu.Unlock()
 				rcancel()
 				continue
 			}
-			uconn, lerr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, h.srv.dnsRes)
+			mu.Unlock()
+
+			// Dial outbound UDP and acquire Redis-backed UDP slot OUTSIDE mu.
+			uconn, lerr := relay.DialUDPForRoute(rctx, route, isIPv6, h.srv.dnsRes)
+			rcancel()
 			if lerr != nil {
-				mu.Unlock()
-				rcancel()
 				continue
 			}
 			slotID, serr := user.AcquireUDPSession(h.clientIP, h.srv.tracker.IPTTLSeconds(), h.srv.tracker.RedisLimiter(), uconn)
 			if serr != nil {
 				_ = uconn.Close()
-				mu.Unlock()
-				rcancel()
 				continue
 			}
-			us = &hy2UDPSess{udpConn: uconn, udpSlotID: slotID, lastAddr: addrStr}
-			us.lastSeen.Store(time.Now().Unix())
-			sessions[sessID] = us
 
-			go func(sid uint32, sess *hy2UDPSess) {
-				defer func() {
-					_ = sess.udpConn.Close()
-					user.ReleaseUDPSession(sess.udpSlotID)
-					mu.Lock()
-					if sessions != nil && sessions[sid] == sess {
-						delete(sessions, sid)
-					}
-					mu.Unlock()
-				}()
+			mu.Lock()
+			if sessions == nil {
+				mu.Unlock()
+				_ = uconn.Close()
+				user.ReleaseUDPSession(slotID)
+				return
+			}
+			if existing, ok := sessions[key]; ok && existing.user == user {
+				existing.lastSeen.Store(time.Now().Unix())
+				us = existing
+				mu.Unlock()
+				_ = uconn.Close()
+				user.ReleaseUDPSession(slotID)
+			} else {
+				if existing != nil {
+					delete(sessions, key)
+					_ = existing.udpConn.Close()
+				}
+				us = &hy2UDPSess{udpConn: uconn, user: user, udpSlotID: slotID}
+				us.lastSeen.Store(time.Now().Unix())
+				sessions[key] = us
+				mu.Unlock()
 
-				for {
-					if user.IsDisabled() {
-						return
-					}
-					_ = sess.udpConn.SetReadDeadline(time.Now().Add(idleDur))
-					rn, raddr, rbuf, bp, rerr := relay.ReadPacketZeroIdle(sess.udpConn)
-					if rerr != nil {
-						var ne net.Error
-						if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idleDur {
+				go func(k hy2UDPKey, sess *hy2UDPSess) {
+					defer func() {
+						_ = sess.udpConn.Close()
+						sess.user.ReleaseUDPSession(sess.udpSlotID)
+						mu.Lock()
+						if sessions != nil && sessions[k] == sess {
+							delete(sessions, k)
+						}
+						mu.Unlock()
+					}()
+
+					for {
+						if sess.user.IsDisabled() {
+							return
+						}
+						_ = sess.udpConn.SetReadDeadline(time.Now().Add(idleDur))
+						rn, raddr, rbuf, bp, rerr := relay.ReadPacketZeroIdle(sess.udpConn)
+						if rerr != nil {
+							var ne net.Error
+							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idleDur {
+								continue
+							}
+							return
+						}
+						if raddr == nil {
+							bufpool.Put(bp)
 							continue
 						}
-						return
-					}
-					sess.lastSeen.Store(time.Now().Unix())
-					if ul := user.EffectiveLimiter(); ul != nil {
-						ul.Wait(rn)
-					}
-					h.srv.tracker.NodeLimiter.Wait(rn)
-					user.AddDownload(int64(rn))
+						sess.lastSeen.Store(time.Now().Unix())
+						if ul := sess.user.EffectiveLimiter(); ul != nil {
+							ul.Wait(rn)
+						}
+						h.srv.tracker.NodeLimiter.Wait(rn)
+						sess.user.AddDownload(int64(rn))
 
-					srcStr := raddr.String()
-					pid := uint16(outPktID.Add(1))
-					sendHy2UDPDatagrams(h.qconn, sid, pid, srcStr, rbuf[:rn])
-					bufpool.Put(bp)
-				}
-			}(sessID, us)
-		} else {
-			us.lastSeen.Store(time.Now().Unix())
+						srcStr := sess.replyAddrString(raddr)
+						pid := uint16(outPktID.Add(1))
+						sendHy2UDPDatagrams(h.qconn, k.sessID, pid, srcStr, rbuf[:rn])
+						bufpool.Put(bp)
+					}
+				}(key, us)
+			}
 		}
-		mu.Unlock()
-		rcancel()
 
+		if isHostIP != nil {
+			us.rememberDomain(dstUDP, addrStr)
+		}
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(len(payload))
 		}

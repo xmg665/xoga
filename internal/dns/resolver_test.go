@@ -278,3 +278,135 @@ servers:
 		t.Fatalf("follower DNS lookup was poisoned by leader context cancellation: %v", ferr)
 	}
 }
+
+func TestRemoteURLHotReloadPreservesRulesAndCache(t *testing.T) {
+	udpUnlock, stopUnlock := startMockUDPDNS(t, [4]byte{198, 51, 100, 12})
+	defer stopUnlock()
+
+	remoteSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `
+"`+udpUnlock+`":
+  strategy: ipv4_only
+  rules:
+    - geosite:netflix
+`)
+	}))
+	defer remoteSrv.Close()
+
+	res := NewResolver("", remoteSrv.URL, nil, "ipv4_first")
+	ip1, err := res.Resolve(context.Background(), "www.netflix.com", 0, false)
+	if err != nil || ip1.String() != "198.51.100.12" {
+		t.Fatalf("initial remote DNS unlock failed: ip=%v err=%v", ip1, err)
+	}
+
+	// Simulate >5s elapsed so maybeHotReload triggers; remote rules and cache MUST survive.
+	res.lastCheck.Store(0)
+	res.maybeHotReload()
+	res.reloadNow(false)
+
+	if !res.HasRuleForDomain("www.netflix.com") {
+		t.Fatal("remote dns_config_url rules were wiped by hot reload")
+	}
+	res.cacheMu.RLock()
+	cacheLen := len(res.cache)
+	res.cacheMu.RUnlock()
+	if cacheLen == 0 {
+		t.Fatal("DNS cache was wiped by no-op hot reload")
+	}
+
+	// Also verify empty configPath + empty remoteURL does not wipe cache every 5s.
+	resNoFile := NewResolver("", "", []string{udpUnlock}, "ipv4_only")
+	if _, err := resNoFile.Resolve(context.Background(), "cachekeep.example.com", 0, false); err != nil {
+		t.Fatal(err)
+	}
+	resNoFile.lastCheck.Store(0)
+	resNoFile.maybeHotReload()
+	resNoFile.cacheMu.RLock()
+	cacheLen2 := len(resNoFile.cache)
+	resNoFile.cacheMu.RUnlock()
+	if cacheLen2 == 0 {
+		t.Fatal("DNS cache was wiped when configPath and remoteURL are both empty")
+	}
+}
+
+func TestCatchAllDoesNotShadowDomainRulesAndYAMLIndent(t *testing.T) {
+	udpDefault, stopDef := startMockUDPDNS(t, [4]byte{192, 0, 2, 1})
+	defer stopDef()
+	udpNetflix, stopNF := startMockUDPDNS(t, [4]byte{198, 51, 100, 99})
+	defer stopNF()
+
+	yml := `
+servers:
+  - address: "` + udpDefault + `"
+  - address: "` + udpNetflix + `"
+    domains:
+      - "geosite:netflix"
+  - 8.8.8.8
+`
+	rules, defs := ParseDNSYAML(yml, StrategyIPv4Only)
+	found8888 := false
+	for _, d := range defs {
+		if d == "8.8.8.8" {
+			found8888 = true
+		}
+	}
+	if !found8888 {
+		t.Fatalf("expected plain `- 8.8.8.8` after structured server to be parsed into defaultServers, got %v", defs)
+	}
+	for _, r := range rules {
+		if r.server == udpNetflix && r.matches("8.8.8.8") {
+			t.Fatal("plain `- 8.8.8.8` was misparsed as a domain pattern under previous structured server")
+		}
+	}
+
+	dnsFile := filepath.Join(t.TempDir(), "dns.yml")
+	if err := os.WriteFile(dnsFile, []byte(yml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res := NewResolver(dnsFile, "", nil, "ipv4_only")
+	ipNF, err := res.Resolve(context.Background(), "www.netflix.com", 0, false)
+	if err != nil || ipNF.String() != "198.51.100.99" {
+		t.Fatalf("catch-all server shadowed explicit netflix rule: got %v (err=%v)", ipNF, err)
+	}
+	ipOther, err := res.Resolve(context.Background(), "other.example.com", 0, false)
+	if err != nil || ipOther.String() != "192.0.2.1" {
+		t.Fatalf("expected catch-all server for unmatched domain: got %v (err=%v)", ipOther, err)
+	}
+}
+
+func TestDecodeDNSAnswersQNameQTypeValidationAndFailoverBudget(t *testing.T) {
+	reqA, txID, err := encodeDNSQuery("example.com", qTypeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respA := buildMockDNSResponse(reqA, [4]byte{93, 184, 216, 34}, [16]byte{})
+
+	// Valid match
+	addrs, _, err := decodeDNSAnswersForDomain(respA, txID, "example.com", qTypeA, false)
+	if err != nil || len(addrs) != 1 || addrs[0].String() != "93.184.216.34" {
+		t.Fatalf("expected valid decode, got addrs=%v err=%v", addrs, err)
+	}
+	// Mismatched QNAME must be rejected
+	if _, _, err := decodeDNSAnswersForDomain(respA, txID, "attacker.com", qTypeA, false); err == nil {
+		t.Fatal("expected QNAME mismatch to be rejected")
+	}
+	// Mismatched QTYPE must be rejected
+	if _, _, err := decodeDNSAnswersForDomain(respA, txID, "example.com", qTypeAAAA, false); err == nil {
+		t.Fatal("expected QTYPE mismatch to be rejected")
+	}
+
+	// Per-server failover budget: server 1 drops packets, server 2 answers promptly
+	deadPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deadPC.Close()
+	goodAddr, stopGood := startMockUDPDNS(t, [4]byte{203, 0, 113, 55})
+	defer stopGood()
+
+	res := NewResolver("", "", []string{deadPC.LocalAddr().String(), goodAddr}, "ipv4_only")
+	ip, err := res.Resolve(context.Background(), "failover.example.com", 0, false)
+	if err != nil || ip.String() != "203.0.113.55" {
+		t.Fatalf("expected failover to 2nd DNS server, got ip=%v err=%v", ip, err)
+	}
+}

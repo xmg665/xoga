@@ -42,10 +42,10 @@ const (
 )
 
 // handleAnyTLS implements the official AnyTLS v1 & v2 multiplexed session protocol:
-// 1. Auth: `[sha256(password) (32B) | padding0_len (2B BE) | padding0]`
-// 2. Session framing: `[cmd (1B) | streamId (4B BE) | dataLen (2B BE) | data]`
-// 3. Supports `v=2` `cmdServerSettings` + `cmdSYNACK`, dynamic `paddingScheme` updates,
-//    concurrent TCP streams (`SocksAddr`), and `sing-box` `sp.v2.udp-over-tcp.arpa` UDP relay.
+//  1. Auth: `[sha256(password) (32B) | padding0_len (2B BE) | padding0]`
+//  2. Session framing: `[cmd (1B) | streamId (4B BE) | dataLen (2B BE) | data]`
+//  3. Supports `v=2` `cmdServerSettings` + `cmdSYNACK`, dynamic `paddingScheme` updates,
+//     concurrent TCP streams (`SocksAddr`), and `sing-box` `sp.v2.udp-over-tcp.arpa` UDP relay.
 func (s *Server) handleAnyTLS(conn net.Conn) {
 	br := bufio.NewReaderSize(conn, 4096)
 
@@ -89,6 +89,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 		doneCh:  make(chan struct{}),
 		streams: make(map[uint32]*anytlsStream),
 	}
+	sess.lastActive.Store(time.Now().UnixNano())
 	if scheme := strings.TrimSpace(s.spec.AnyTLSPaddingScheme); scheme != "" {
 		sum := md5.Sum([]byte(scheme))
 		sess.paddingScheme = []byte(scheme)
@@ -107,8 +108,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 		if user.IsDisabled() {
 			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
-		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+		if err := readFullActive(conn, br, hdr[:], idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 			return
 		}
 		cmd := hdr[0]
@@ -118,7 +118,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 		switch cmd {
 		case anytlsCmdWaste:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
@@ -127,7 +127,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 			var data []byte
 			if dataLen > 0 {
 				data = make([]byte, dataLen)
-				if _, err := io.ReadFull(br, data); err != nil {
+				if err := readFullActive(conn, br, data, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
@@ -146,17 +146,23 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 					clientPadMD5 = strings.ToLower(strings.TrimSpace(v))
 				}
 			}
+			// Send cmdServerSettings & cmdUpdatePaddingScheme synchronously before processing
+			// subsequent cmdSYN frames so cmdServerSettings can never race behind cmdSYNACK.
 			if clientVer >= 2 {
 				sess.peerVersion.Store(int32(clientVer))
-				sess.enqueueCtrl(anytlsCmdServerSettings, 0, []byte("v=2"))
+				if err := sess.writeFrame(anytlsCmdServerSettings, 0, []byte("v=2")); err != nil {
+					return
+				}
 			}
 			if len(sess.paddingScheme) > 0 && clientPadMD5 != sess.paddingMD5 {
-				sess.enqueueCtrl(anytlsCmdUpdatePaddingScheme, 0, sess.paddingScheme)
+				if err := sess.writeFrame(anytlsCmdUpdatePaddingScheme, 0, sess.paddingScheme); err != nil {
+					return
+				}
 			}
 
 		case anytlsCmdHeartRequest:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
@@ -164,19 +170,20 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 
 		case anytlsCmdHeartResponse:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
 
 		case anytlsCmdSYN:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
 			if !sess.seenSettings.Load() {
-				sess.enqueueCtrl(anytlsCmdAlert, 0, []byte("cmdSettings required before cmdSYN"))
+				// Write cmdAlert synchronously before closing the connection so it isn't dropped.
+				_ = sess.writeFrame(anytlsCmdAlert, 0, []byte("cmdSettings required before cmdSYN"))
 				return
 			}
 			st := sess.openStream(streamID)
@@ -189,7 +196,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 				continue
 			}
 			payload := make([]byte, dataLen)
-			if _, err := io.ReadFull(br, payload); err != nil {
+			if err := readFullActive(conn, br, payload, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 				return
 			}
 			if st := sess.getStream(streamID); st != nil {
@@ -198,7 +205,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 
 		case anytlsCmdFIN:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
@@ -206,7 +213,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 
 		default:
 			if dataLen > 0 {
-				if _, err := io.CopyN(io.Discard, br, int64(dataLen)); err != nil {
+				if err := discardActive(conn, br, dataLen, idleDur, &sess.lastActive, user.IsDisabled); err != nil {
 					return
 				}
 			}
@@ -229,6 +236,7 @@ type anytlsSession struct {
 
 	seenSettings atomic.Bool
 	peerVersion  atomic.Int32
+	lastActive   atomic.Int64
 	closed       atomic.Bool
 	closeOnce    sync.Once
 
@@ -294,6 +302,8 @@ func (s *anytlsSession) writeFrame(cmd byte, streamID uint32, data []byte) error
 		// Prevent subsequent stream writes from injecting headers into a partially-written frame!
 		s.closed.Store(true)
 		_ = s.conn.Close()
+	} else {
+		s.lastActive.Store(time.Now().UnixNano())
 	}
 	return err
 }
@@ -455,23 +465,6 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 	}
 
-	var initRoute acl.OutboundTarget
-	if isConnect && fixedHost != "" {
-		initRoute = s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, fixedHost, fixedPort, "", "")
-		if initRoute.Action == acl.ActionBlock {
-			return
-		}
-	} else {
-		initRoute = s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, "1.1.1.1", 443, "", "")
-	}
-	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	udpConn, err := relay.DialUDPForRoute(dctx, initRoute, false, s.srv.dnsRes)
-	dcancel()
-	if err != nil {
-		return
-	}
-	defer udpConn.Close()
-
 	idleDur := time.Duration(s.srv.cfg.UDPIdleSec) * time.Second
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
@@ -480,50 +473,150 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 	var lastActive atomic.Int64
 	lastActive.Store(time.Now().Unix())
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		bp := bufpool.Get(bufpool.MaxUDPSize)
-		buf := *bp
-		defer bufpool.Put(bp)
+	var writeMu sync.Mutex
+	writeFrameToStream := func(b []byte) error {
+		writeMu.Lock()
+		_, err := st.Write(b)
+		writeMu.Unlock()
+		return err
+	}
 
-		for {
-			if s.user.IsDisabled() {
-				return
-			}
-			_ = udpConn.SetReadDeadline(time.Now().Add(idleDur))
-			n, raddr, rerr := udpConn.ReadFrom(buf)
-			if rerr != nil {
-				var ne net.Error
-				if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+	var sockMu sync.Mutex
+	sockets := make(map[string]net.PacketConn)
+	streamClosed := false
+	var wg sync.WaitGroup
+
+	closeAllSockets := func() {
+		sockMu.Lock()
+		streamClosed = true
+		for _, pc := range sockets {
+			_ = pc.Close()
+		}
+		sockets = nil
+		sockMu.Unlock()
+	}
+
+	startReader := func(key string, pc net.PacketConn) {
+		wg.Add(1)
+		go func() {
+			defer func() {
+				_ = pc.Close()
+				sockMu.Lock()
+				remaining := 0
+				if sockets != nil && sockets[key] == pc {
+					delete(sockets, key)
+					remaining = len(sockets)
+				}
+				wasClosed := streamClosed
+				sockMu.Unlock()
+				if !wasClosed && remaining == 0 {
+					_ = st.Close()
+				}
+				wg.Done()
+			}()
+			bp := bufpool.Get(bufpool.MaxUDPSize)
+			buf := *bp
+			defer bufpool.Put(bp)
+
+			for {
+				if s.user.IsDisabled() {
+					_ = st.Close()
+					return
+				}
+				_ = pc.SetReadDeadline(time.Now().Add(idleDur))
+				n, raddr, rerr := pc.ReadFrom(buf)
+				if rerr != nil {
+					var ne net.Error
+					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+						continue
+					}
+					return
+				}
+				ua, ok := raddr.(*net.UDPAddr)
+				if !ok || ua == nil || ua.IP == nil {
 					continue
 				}
-				return
-			}
-			ua, ok := raddr.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			lastActive.Store(time.Now().Unix())
-			if ul := s.user.EffectiveLimiter(); ul != nil {
-				ul.Wait(n)
-			}
-			s.srv.tracker.NodeLimiter.Wait(n)
-			s.user.AddDownload(int64(n))
+				lastActive.Store(time.Now().Unix())
+				if ul := s.user.EffectiveLimiter(); ul != nil {
+					ul.Wait(n)
+				}
+				s.srv.tracker.NodeLimiter.Wait(n)
+				s.user.AddDownload(int64(n))
 
-			var frame bytes.Buffer
-			if !isConnect {
-				writeUoTAddr(&frame, ua)
+				var frame bytes.Buffer
+				if !isConnect && !writeUoTAddr(&frame, ua) {
+					continue
+				}
+				var l2 [2]byte
+				binary.BigEndian.PutUint16(l2[:], uint16(n))
+				frame.Write(l2[:])
+				frame.Write(buf[:n])
+				if werr := writeFrameToStream(frame.Bytes()); werr != nil {
+					_ = st.Close()
+					return
+				}
 			}
-			var l2 [2]byte
-			binary.BigEndian.PutUint16(l2[:], uint16(n))
-			frame.Write(l2[:])
-			frame.Write(buf[:n])
-			if _, werr := st.Write(frame.Bytes()); werr != nil {
-				return
-			}
+		}()
+	}
+
+	getOrDialSocket := func(ctx context.Context, route acl.OutboundTarget, isIPv6 bool) (net.PacketConn, error) {
+		key := udpRouteKey(route, isIPv6)
+		sockMu.Lock()
+		if streamClosed || sockets == nil {
+			sockMu.Unlock()
+			return nil, net.ErrClosed
 		}
-	}()
+		if pc, ok := sockets[key]; ok {
+			sockMu.Unlock()
+			return pc, nil
+		}
+		if len(sockets) >= 8 {
+			sockMu.Unlock()
+			return nil, errors.New("too many UDP route sockets in UoT stream")
+		}
+		sockMu.Unlock()
+
+		// Dial outside sockMu so slow SOCKS5 UDP ASSOCIATE never blocks sibling goroutines.
+		newPC, err := relay.DialUDPForRoute(ctx, route, isIPv6, s.srv.dnsRes)
+		if err != nil {
+			return nil, err
+		}
+
+		sockMu.Lock()
+		if streamClosed || sockets == nil {
+			sockMu.Unlock()
+			_ = newPC.Close()
+			return nil, net.ErrClosed
+		}
+		if existing, ok := sockets[key]; ok {
+			sockMu.Unlock()
+			_ = newPC.Close()
+			return existing, nil
+		}
+		sockets[key] = newPC
+		startReader(key, newPC)
+		sockMu.Unlock()
+		return newPC, nil
+	}
+
+	// For connected UoT v2 mode, resolve & dial up front using the actual target's route and IP family.
+	if isConnect && fixedHost != "" {
+		initRoute := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, fixedHost, fixedPort, "", "")
+		if initRoute.Action == acl.ActionBlock {
+			return
+		}
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		initDst, rerr := relay.ResolveUDPTargetForRoute(dctx, fixedHost, fixedPort, initRoute, s.srv.dnsRes)
+		if rerr != nil {
+			dcancel()
+			return
+		}
+		_, derr := getOrDialSocket(dctx, initRoute, initDst.IP.To4() == nil)
+		dcancel()
+		if derr != nil {
+			return
+		}
+	}
 
 	bp := bufpool.Get(bufpool.MaxUDPSize)
 	inBuf := *bp
@@ -584,8 +677,13 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
 		dstAddr, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.srv.dnsRes)
-		rcancel()
 		if err != nil {
+			rcancel()
+			continue
+		}
+		udpConn, derr := getOrDialSocket(rctx, route, dstAddr.IP.To4() == nil)
+		rcancel()
+		if derr != nil {
 			continue
 		}
 
@@ -597,8 +695,8 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		_, _ = udpConn.WriteTo(inBuf[:pktLen], dstAddr)
 	}
 
-	_ = udpConn.Close()
-	<-done
+	closeAllSockets()
+	wg.Wait()
 }
 
 func readUoTAddr(r io.Reader) (string, uint16, error) {
@@ -644,17 +742,23 @@ func readUoTAddrWithAF(r io.Reader, af byte) (string, uint16, error) {
 	return host, binary.BigEndian.Uint16(pb[:]), nil
 }
 
-func writeUoTAddr(w *bytes.Buffer, ua *net.UDPAddr) {
+func writeUoTAddr(w *bytes.Buffer, ua *net.UDPAddr) bool {
+	if ua == nil || ua.IP == nil {
+		return false
+	}
 	if ip4 := ua.IP.To4(); ip4 != nil {
 		w.WriteByte(0x00)
 		w.Write(ip4)
-	} else {
+	} else if ip16 := ua.IP.To16(); ip16 != nil {
 		w.WriteByte(0x01)
-		w.Write(ua.IP.To16())
+		w.Write(ip16)
+	} else {
+		return false
 	}
 	var pb [2]byte
 	binary.BigEndian.PutUint16(pb[:], uint16(ua.Port))
 	w.Write(pb[:])
+	return true
 }
 
 type anytlsStream struct {

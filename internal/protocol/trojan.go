@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -81,15 +82,6 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	}
 	defer user.ReleaseSession(connID)
 
-	nodeRoute := s.aclEng.Load().DecideForNode(s.cfg.NodeID, "1.1.1.1", 443, "", "")
-	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	udpConn, err := relay.DialUDPForRoute(dctx, nodeRoute, false, s.dnsRes)
-	dcancel()
-	if err != nil {
-		return
-	}
-	defer udpConn.Close()
-
 	idleDur := time.Duration(s.cfg.UDPIdleSec) * time.Second
 	if idleDur < 10*time.Second {
 		idleDur = 60 * time.Second
@@ -98,42 +90,123 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	var lastActive atomic.Int64
 	lastActive.Store(time.Now().Unix())
 
-	// Remote UDP -> Trojan stream
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		bp := bufpool.Get(bufpool.MaxUDPSize)
-		buf := *bp
-		defer bufpool.Put(bp)
+	var writeMu sync.Mutex
+	var sockMu sync.Mutex
+	sockets := make(map[string]net.PacketConn)
+	streamClosed := false
+	var wg sync.WaitGroup
 
-		for {
-			_ = udpConn.SetReadDeadline(time.Now().Add(idleDur))
-			n, raddr, err := udpConn.ReadFrom(buf)
-			if err != nil {
-				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+	closeAllSockets := func() {
+		sockMu.Lock()
+		streamClosed = true
+		for _, pc := range sockets {
+			_ = pc.Close()
+		}
+		sockets = nil
+		sockMu.Unlock()
+	}
+
+	startReader := func(key string, pc net.PacketConn) {
+		wg.Add(1)
+		go func() {
+			defer func() {
+				_ = pc.Close()
+				sockMu.Lock()
+				remaining := 0
+				if sockets != nil && sockets[key] == pc {
+					delete(sockets, key)
+					remaining = len(sockets)
+				}
+				wasClosed := streamClosed
+				sockMu.Unlock()
+				if !wasClosed && remaining == 0 {
+					_ = conn.Close()
+				}
+				wg.Done()
+			}()
+			bp := bufpool.Get(bufpool.MaxUDPSize)
+			buf := *bp
+			defer bufpool.Put(bp)
+
+			for {
+				if user.IsDisabled() {
+					_ = conn.Close()
+					return
+				}
+				_ = pc.SetReadDeadline(time.Now().Add(idleDur))
+				n, raddr, rerr := pc.ReadFrom(buf)
+				if rerr != nil {
+					var ne net.Error
+					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+						continue
+					}
+					return
+				}
+				ua, ok := raddr.(*net.UDPAddr)
+				if !ok {
 					continue
 				}
-				return
-			}
-			ua, ok := raddr.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			lastActive.Store(time.Now().Unix())
-			if ul := user.EffectiveLimiter(); ul != nil {
-				ul.Wait(n)
-			}
-			s.tracker.NodeLimiter.Wait(n)
-			user.AddDownload(int64(n))
+				lastActive.Store(time.Now().Unix())
+				if ul := user.EffectiveLimiter(); ul != nil {
+					ul.Wait(n)
+				}
+				s.tracker.NodeLimiter.Wait(n)
+				user.AddDownload(int64(n))
 
-			pkt := encodeTrojanUDPPacket(ua, buf[:n])
-			_ = conn.SetWriteDeadline(time.Now().Add(idleDur))
-			if _, werr := conn.Write(pkt); werr != nil {
-				return
+				pkt := encodeTrojanUDPPacket(ua, buf[:n])
+				if pkt == nil {
+					continue
+				}
+				writeMu.Lock()
+				_ = conn.SetWriteDeadline(time.Now().Add(idleDur))
+				_, werr := conn.Write(pkt)
+				writeMu.Unlock()
+				if werr != nil {
+					_ = conn.Close()
+					return
+				}
 			}
+		}()
+	}
+
+	getOrDialSocket := func(ctx context.Context, route acl.OutboundTarget, isIPv6 bool) (net.PacketConn, error) {
+		key := udpRouteKey(route, isIPv6)
+		sockMu.Lock()
+		if streamClosed || sockets == nil {
+			sockMu.Unlock()
+			return nil, net.ErrClosed
 		}
-	}()
+		if pc, ok := sockets[key]; ok {
+			sockMu.Unlock()
+			return pc, nil
+		}
+		if len(sockets) >= 8 {
+			sockMu.Unlock()
+			return nil, errors.New("too many UDP route sockets in Trojan UDP session")
+		}
+		sockMu.Unlock()
+
+		newPC, derr := relay.DialUDPForRoute(ctx, route, isIPv6, s.dnsRes)
+		if derr != nil {
+			return nil, derr
+		}
+
+		sockMu.Lock()
+		if streamClosed || sockets == nil {
+			sockMu.Unlock()
+			_ = newPC.Close()
+			return nil, net.ErrClosed
+		}
+		if existing, ok := sockets[key]; ok {
+			sockMu.Unlock()
+			_ = newPC.Close()
+			return existing, nil
+		}
+		sockets[key] = newPC
+		startReader(key, newPC)
+		sockMu.Unlock()
+		return newPC, nil
+	}
 
 	// Trojan stream -> Remote UDP
 	bp := bufpool.Get(bufpool.MaxUDPSize)
@@ -141,6 +214,9 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	defer bufpool.Put(bp)
 
 	for {
+		if user.IsDisabled() {
+			break
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		// Read the first byte (ATYP) separately: only retry on timeout when 0 bytes
 		// were consumed so partial reads can never desynchronize the stream.
@@ -176,9 +252,15 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
 		dstAddr, err := relay.ResolveUDPTargetForRoute(rctx, host, port, route, s.dnsRes)
-		rcancel()
 		if err != nil {
+			rcancel()
 			logger.Debugf("trojan udp resolve %s failed: %v", host, err)
+			continue
+		}
+		udpConn, derr := getOrDialSocket(rctx, route, dstAddr.IP.To4() == nil)
+		rcancel()
+		if derr != nil {
+			logger.Debugf("trojan udp dial %s failed: %v", host, derr)
 			continue
 		}
 
@@ -191,8 +273,8 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		_, _ = udpConn.WriteTo(payload[:pktLen], dstAddr)
 	}
 
-	_ = udpConn.Close()
-	<-done
+	closeAllSockets()
+	wg.Wait()
 }
 
 func encodeTrojanUDPPacket(ua *net.UDPAddr, data []byte) []byte {

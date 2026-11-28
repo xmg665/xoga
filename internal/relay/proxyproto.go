@@ -161,7 +161,15 @@ func (p *proxyProtoConn) parseHeader() error {
 		return nil
 	}
 
-	// PROXY protocol v2 binary signature (16-byte header + addrlen)
+	// PROXY protocol v2 binary signature (16-byte header + addrlen).
+	// Fast-reject non-PROXY packets before blocking for 16 bytes so short 6-15B payloads never stall 5s.
+	if !bytes.Equal(hdr[:6], proxyV2Sig[:6]) {
+		if p.requireHdr {
+			return errors.New("connection lacks required PROXY protocol header")
+		}
+		p.leftover = append(p.leftover, hdr[:n]...)
+		return nil
+	}
 	if n < 16 {
 		m, rerr := io.ReadFull(p.Conn, hdr[n:16])
 		n += m

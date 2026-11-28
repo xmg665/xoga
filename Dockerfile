@@ -7,7 +7,7 @@ RUN go mod download
 COPY . .
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=1.3.2
+ARG VERSION=1.3.6
 RUN VER="${VERSION#v}" && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath \

@@ -162,6 +162,39 @@ type uniConfigResp struct {
 	} `json:"base_config"`
 }
 
+func normalizeHy2Obfs(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "none", "plain", "false", "null", "0":
+		return ""
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+}
+
+func firstCSVHost(s string) string {
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			return part
+		}
+	}
+	return ""
+}
+
+func formatRealityDest(host string, defaultPort int) string {
+	host = firstCSVHost(host)
+	if host == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	if defaultPort <= 0 {
+		defaultPort = 443
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(defaultPort))
+}
+
 func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) {
 	c.mu.Lock()
 	etag := c.configETag
@@ -169,7 +202,7 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	c.mu.Unlock()
 
 	body, newETag, status, err := c.doGet(ctx, c.endpointWithType("config", curNT), etag)
-	if err != nil && (curNT == "" || curNT == "auto") && (status == 400 || status == 404 || status == 422) {
+	if err != nil && (curNT == "" || curNT == "auto") && (status == 400 || status == 404 || status == 422 || status == 500) {
 		// Auto-discover node_type from V2Board / NewV2Board / Xboard when `server_type=auto`
 		for _, cand := range autoUniProxyProbeTypes {
 			if altBody, altETag, altStatus, altErr := c.doGet(ctx, c.endpointWithType("config", cand), ""); altErr == nil {
@@ -244,7 +277,7 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 		PushInterval:      parseAnyInt(raw.BaseConfig.PushInterval),
 		Hy2UpMbps:         raw.UpMbps,
 		Hy2DownMbps:       raw.DownMbps,
-		Hy2Obfs:           strings.ToLower(strings.TrimSpace(raw.Obfs)),
+		Hy2Obfs:           normalizeHy2Obfs(raw.Obfs),
 		Hy2ObfsPassword:   strings.TrimSpace(raw.ObfsPassword),
 		Hy2IgnoreClientBW: c.cfg.Hy2IgnoreClientBW,
 	}
@@ -253,7 +286,7 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	}
 	// V2bX / V2Board compatibility: when `obfs` contains a password string directly and `obfs-password` is empty
 	if spec.Hy2Obfs != "" && spec.Hy2Obfs != "salamander" && spec.Hy2ObfsPassword == "" {
-		spec.Hy2ObfsPassword = raw.Obfs
+		spec.Hy2ObfsPassword = strings.TrimSpace(raw.Obfs)
 		spec.Hy2Obfs = "salamander"
 	}
 	if proto == "hysteria2" || proto == "anytls" {
@@ -340,11 +373,7 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 			if ts.Dest != "" {
 				spec.RealityDest = strings.TrimSpace(ts.Dest)
 			} else if ts.ServerName != "" {
-				dp := parseAnyInt(ts.ServerPort)
-				if dp <= 0 {
-					dp = 443
-				}
-				spec.RealityDest = net.JoinHostPort(ts.ServerName, strconv.Itoa(dp))
+				spec.RealityDest = formatRealityDest(ts.ServerName, parseAnyInt(ts.ServerPort))
 			}
 			if len(ts.ServerNames) > 0 {
 				spec.RealityServerNames = append(spec.RealityServerNames, ts.ServerNames...)
@@ -392,17 +421,128 @@ func (c *UniProxyClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error)
 	return spec, nil
 }
 
+type flexFloat64 struct {
+	val float64
+	set bool
+}
+
+func (f *flexFloat64) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+		if s == "" || strings.EqualFold(s, "null") {
+			return nil
+		}
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		f.val = v
+		f.set = true
+	}
+	return nil
+}
+
+type flexInt struct {
+	val int
+	set bool
+}
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+		if s == "" || strings.EqualFold(s, "null") {
+			return nil
+		}
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		f.val = v
+		f.set = true
+		return nil
+	}
+	if fv, err := strconv.ParseFloat(s, 64); err == nil {
+		f.val = int(fv)
+		f.set = true
+	}
+	return nil
+}
+
+type flexInt64 struct {
+	val int64
+	set bool
+}
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+		if s == "" || strings.EqualFold(s, "null") {
+			return nil
+		}
+	}
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		f.val = v
+		f.set = true
+		return nil
+	}
+	if fv, err := strconv.ParseFloat(s, 64); err == nil {
+		f.val = int64(fv)
+		f.set = true
+	}
+	return nil
+}
+
+type flexBool struct {
+	val bool
+	set bool
+}
+
+func (f *flexBool) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+		if s == "" || strings.EqualFold(s, "null") {
+			return nil
+		}
+	}
+	switch strings.ToLower(s) {
+	case "true", "yes", "on":
+		f.val = true
+		f.set = true
+	case "false", "no", "off":
+		f.val = false
+		f.set = true
+	default:
+		if v, err := strconv.ParseFloat(s, 64); err == nil {
+			f.val = v != 0
+			f.set = true
+		}
+	}
+	return nil
+}
+
 type uniUsersResp struct {
 	Users []struct {
-		ID             int    `json:"id"`
-		UUID           string `json:"uuid"`
-		SpeedLimit     *int   `json:"speed_limit"`
-		DeviceLimit    *int   `json:"device_limit"`
-		Banned         *int   `json:"banned"`
-		ExpiredAt      *int64 `json:"expired_at"`
-		U              *int64 `json:"u"`
-		D              *int64 `json:"d"`
-		TransferEnable *int64 `json:"transfer_enable"`
+		ID             int         `json:"id"`
+		UUID           string      `json:"uuid"`
+		SpeedLimit     flexFloat64 `json:"speed_limit"`
+		DeviceLimit    flexInt     `json:"device_limit"`
+		Banned         flexBool    `json:"banned"`
+		ExpiredAt      flexInt64   `json:"expired_at"`
+		U              flexInt64   `json:"u"`
+		D              flexInt64   `json:"d"`
+		TransferEnable flexInt64   `json:"transfer_enable"`
 	} `json:"users"`
 }
 
@@ -423,7 +563,7 @@ func applyConfigProtocolOverrides(cfg *config.Config, spec *NodeSpec) {
 		spec.RealityServerNames = append([]string(nil), cfg.RealityServerNames...)
 	}
 	if cfg.Hy2Obfs != "" {
-		spec.Hy2Obfs = cfg.Hy2Obfs
+		spec.Hy2Obfs = normalizeHy2Obfs(cfg.Hy2Obfs)
 	}
 	if cfg.Hy2ObfsPassword != "" {
 		spec.Hy2ObfsPassword = cfg.Hy2ObfsPassword
@@ -480,39 +620,39 @@ func (c *UniProxyClient) FetchUsers(ctx context.Context) ([]stats.SyncUserSpec, 
 		if u.ID <= 0 || u.UUID == "" {
 			continue
 		}
-		if u.Banned != nil && *u.Banned != 0 {
+		if u.Banned.set && u.Banned.val {
 			continue
 		}
-		if u.ExpiredAt != nil && *u.ExpiredAt > 0 {
-			if *u.ExpiredAt <= nowUnix {
+		if u.ExpiredAt.set && u.ExpiredAt.val > 0 {
+			if u.ExpiredAt.val <= nowUnix {
 				continue
 			}
-			if earliestExp == 0 || *u.ExpiredAt < earliestExp {
-				earliestExp = *u.ExpiredAt
+			if earliestExp == 0 || u.ExpiredAt.val < earliestExp {
+				earliestExp = u.ExpiredAt.val
 			}
 		}
 		var remain int64 = -1
-		if u.TransferEnable != nil && *u.TransferEnable > 0 {
+		if u.TransferEnable.set && u.TransferEnable.val > 0 {
 			var used int64
-			if u.U != nil {
-				used += *u.U
+			if u.U.set {
+				used += u.U.val
 			}
-			if u.D != nil {
-				used += *u.D
+			if u.D.set {
+				used += u.D.val
 			}
-			remain = *u.TransferEnable - used
+			remain = u.TransferEnable.val - used
 			if remain <= 0 {
 				continue
 			}
 		}
 		var speedBps int64
-		if u.SpeedLimit != nil && *u.SpeedLimit > 0 {
+		if u.SpeedLimit.set && u.SpeedLimit.val > 0 {
 			// V2Board / Xboard speed_limit is configured in Mbps (1 Mbps = 125,000 B/s)
-			speedBps = int64(*u.SpeedLimit) * 125000
+			speedBps = int64(u.SpeedLimit.val * 125000.0)
 		}
 		var devLim int
-		if u.DeviceLimit != nil && *u.DeviceLimit > 0 {
-			devLim = *u.DeviceLimit
+		if u.DeviceLimit.set && u.DeviceLimit.val > 0 {
+			devLim = u.DeviceLimit.val
 		}
 		out = append(out, stats.SyncUserSpec{
 			ID:          u.ID,
@@ -635,7 +775,7 @@ func (c *UniProxyClient) PushStatus(ctx context.Context, st SystemStatus) error 
 func (c *UniProxyClient) doGet(ctx context.Context, fullURL, ifNoneMatch string) ([]byte, string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", 0, redactErr(err)
 	}
 	req.Header.Set("User-Agent", "xoga/1.0")
 	req.Header.Set("Accept", "application/json")
@@ -670,7 +810,7 @@ func (c *UniProxyClient) doPostJSON(ctx context.Context, fullURL string, v any, 
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, &buf)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	req.Header.Set("User-Agent", "xoga/1.0")
 	req.Header.Set("Content-Type", "application/json")

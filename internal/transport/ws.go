@@ -173,7 +173,10 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 		return nil, errors.New("missing Sec-WebSocket-Key")
 	}
 
-	// Decode V2Ray/Xray/Mihomo Early Data from Sec-WebSocket-Protocol if present
+	// Decode V2Ray/Xray/Mihomo Early Data from Sec-WebSocket-Protocol if present.
+	// Guard against plain ASCII WebSocket subprotocol tokens (e.g. "chat", "binary",
+	// "graphql-ws") which happen to consist of valid base64 characters and would
+	// otherwise inject garbage bytes before the proxy handshake.
 	var earlyData []byte
 	var echoedProto string
 	if wsProto != "" {
@@ -181,7 +184,7 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 		if comma := strings.IndexByte(token, ','); comma > 0 {
 			token = strings.TrimSpace(token[:comma])
 		}
-		if decoded, derr := decodeBase64Flexible(token); derr == nil && len(decoded) > 0 {
+		if decoded, derr := decodeBase64Flexible(token); derr == nil && isLikelyWSEarlyData(token, decoded) {
 			earlyData = decoded
 			echoedProto = token
 		}
@@ -234,10 +237,29 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 
 func decodeBase64Flexible(s string) ([]byte, error) {
 	s = strings.TrimRight(s, "=")
-	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+	if len(s) == 0 {
+		return nil, errors.New("empty base64 token")
+	}
+	if b, err := base64.RawURLEncoding.Strict().DecodeString(s); err == nil {
 		return b, nil
 	}
-	return base64.RawStdEncoding.DecodeString(s)
+	return base64.RawStdEncoding.Strict().DecodeString(s)
+}
+
+// isLikelyWSEarlyData distinguishes real Xray/sing-box/Mihomo base64 early-data
+// payloads (>=16 bytes of VMess/VLESS/Trojan/SS handshake) from plain ASCII
+// RFC 6455 subprotocol names such as "chat", "binary", or "graphql-transport-ws".
+func isLikelyWSEarlyData(token string, decoded []byte) bool {
+	if len(decoded) < 16 {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '+' || c == '/' || c == '=' {
+			return true
+		}
+	}
+	return false
 }
 
 type wsConn struct {
@@ -262,7 +284,9 @@ type wsConn struct {
 	ctrlBuf     [125]byte
 	ctrlRead    int
 
-	writeMu sync.Mutex
+	writeMu       sync.Mutex
+	deadlineMu    sync.Mutex
+	writeDeadline time.Time
 }
 
 func (w *wsConn) IsBufferedStream() bool { return true }
@@ -536,14 +560,41 @@ func (w *wsConn) WritePrependWSFrame(buf []byte, payloadOffset int) error {
 	return nil
 }
 
+func (w *wsConn) SetWriteDeadline(t time.Time) error {
+	w.deadlineMu.Lock()
+	w.writeDeadline = t
+	err := w.Conn.SetWriteDeadline(t)
+	w.deadlineMu.Unlock()
+	return err
+}
+
+func (w *wsConn) SetDeadline(t time.Time) error {
+	w.deadlineMu.Lock()
+	w.writeDeadline = t
+	err := w.Conn.SetDeadline(t)
+	w.deadlineMu.Unlock()
+	return err
+}
+
 func (w *wsConn) writeControlFrame(opcode byte, payload []byte) error {
 	if len(payload) > 125 {
 		payload = payload[:125]
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
-	_ = w.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	defer func() { _ = w.Conn.SetWriteDeadline(time.Time{}) }()
+
+	w.deadlineMu.Lock()
+	pongDL := time.Now().Add(5 * time.Second)
+	if w.writeDeadline.IsZero() || pongDL.Before(w.writeDeadline) {
+		_ = w.Conn.SetWriteDeadline(pongDL)
+	}
+	w.deadlineMu.Unlock()
+	defer func() {
+		w.deadlineMu.Lock()
+		_ = w.Conn.SetWriteDeadline(w.writeDeadline)
+		w.deadlineMu.Unlock()
+	}()
+
 	hdr := [2]byte{0x80 | opcode, byte(len(payload))}
 	bufs := net.Buffers{hdr[:], payload}
 	_, err := bufs.WriteTo(w.rawWriter)

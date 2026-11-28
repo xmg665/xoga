@@ -71,13 +71,13 @@ type UserEntry struct {
 	_ [64]byte
 
 	// Limits & dynamic speed limit state
-	baseSpeedBps    atomic.Int64
-	deviceLimit     atomic.Int32
-	tcpLimit        atomic.Int32
-	overSpeedSec    atomic.Int32
-	throttledUntil  atomic.Int64 // Unix seconds
-	dyWhitelisted   atomic.Bool
-	Limiter         *limiter.Bucket
+	baseSpeedBps   atomic.Int64
+	deviceLimit    atomic.Int32
+	tcpLimit       atomic.Int32
+	overSpeedSec   atomic.Int32
+	throttledUntil atomic.Int64 // Unix seconds
+	dyWhitelisted  atomic.Bool
+	Limiter        *limiter.Bucket
 
 	// Active connections registry for instant millisecond-level disconnect on expiry / quota exhaustion
 	connsMu     sync.Mutex
@@ -662,7 +662,22 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 	staticSpeedBps := int64(t.cfg.UserSpeedLimit * 125000.0)
 
 	for _, sp := range specs {
-		if sp.QuotaExhausted {
+		if sp.QuotaExhausted || sp.ID <= 0 {
+			continue
+		}
+		wantUUID := strings.TrimSpace(sp.UUIDOrPass)
+		wantPass := strings.TrimSpace(sp.UUIDOrPass)
+		if alt := strings.TrimSpace(sp.AltPasswd); alt != "" {
+			wantPass = alt
+		}
+		if wantUUID == "" {
+			wantUUID = wantPass
+		}
+		if wantUUID == "" && wantPass == "" {
+			continue
+		}
+		// Deduplicate duplicate user IDs within a single panel sync payload.
+		if _, dup := seen[sp.ID]; dup {
 			continue
 		}
 		seen[sp.ID] = struct{}{}
@@ -678,15 +693,6 @@ func (t *Tracker) ReconcileUsers(specs []SyncUserSpec) (entries []*UserEntry, ad
 			}
 		}
 		_, dyWhite := t.cfg.DyLimitWhiteUserIDs[sp.ID]
-
-		wantUUID := sp.UUIDOrPass
-		wantPass := sp.UUIDOrPass
-		if sp.AltPasswd != "" {
-			wantPass = sp.AltPasswd
-		}
-		if wantUUID == "" {
-			wantUUID = wantPass
-		}
 
 		if existing, ok := t.users[sp.ID]; ok {
 			if existing.UUID != wantUUID || existing.Passwd != wantPass {
@@ -934,17 +940,34 @@ func parseUUIDBytes(s string) ([16]byte, error) {
 	return out, err
 }
 
-// redisIPLimiter implements a minimal, zero-dependency Redis RESP2 client with persistent
-// keep-alive connection reuse for global IP limiting across multi-node clusters.
+const (
+	redisPoolSize    = 8
+	redisMaxInflight = 16
+)
+
+type redisConn struct {
+	conn net.Conn
+	br   *bufio.Reader
+}
+
+func (rc *redisConn) close() {
+	if rc != nil && rc.conn != nil {
+		_ = rc.conn.Close()
+		rc.conn = nil
+		rc.br = nil
+	}
+}
+
+// redisIPLimiter implements a minimal, zero-dependency Redis RESP2 client with a bounded
+// pool of persistent keep-alive connections for global IP limiting across multi-node clusters.
 type redisIPLimiter struct {
 	addr   string
 	passwd string
 	db     int
 	useTLS bool
 
-	mu   sync.Mutex
-	conn net.Conn
-	br   *bufio.Reader
+	pool chan *redisConn
+	sem  chan struct{}
 }
 
 func newRedisIPLimiter(cfg *config.Config) *redisIPLimiter {
@@ -953,15 +976,12 @@ func newRedisIPLimiter(cfg *config.Config) *redisIPLimiter {
 		passwd: cfg.RedisIPLimitPassword,
 		db:     cfg.RedisIPLimitDB,
 		useTLS: cfg.RedisIPLimitTLS,
+		pool:   make(chan *redisConn, redisPoolSize),
+		sem:    make(chan struct{}, redisMaxInflight),
 	}
 }
 
-func (r *redisIPLimiter) dialLocked() error {
-	if r.conn != nil {
-		_ = r.conn.Close()
-		r.conn = nil
-		r.br = nil
-	}
+func (r *redisIPLimiter) dialConn() (*redisConn, error) {
 	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond, KeepAlive: 45 * time.Second}
 	var conn net.Conn
 	var err error
@@ -971,60 +991,114 @@ func (r *redisIPLimiter) dialLocked() error {
 		conn, err = dialer.Dial("tcp", r.addr)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	_ = conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	br := bufio.NewReaderSize(conn, 512)
 	if r.passwd != "" {
 		if _, err := writeRESP(conn, "AUTH", r.passwd); err != nil {
 			_ = conn.Close()
-			return err
+			return nil, err
 		}
 		if _, err := readRESPLine(br); err != nil {
 			_ = conn.Close()
-			return err
+			return nil, err
 		}
 	}
 	if r.db > 0 {
 		if _, err := writeRESP(conn, "SELECT", strconv.Itoa(r.db)); err != nil {
 			_ = conn.Close()
-			return err
+			return nil, err
 		}
 		if _, err := readRESPLine(br); err != nil {
 			_ = conn.Close()
-			return err
+			return nil, err
 		}
 	}
-	r.conn = conn
-	r.br = br
-	return nil
+	return &redisConn{conn: conn, br: br}, nil
+}
+
+func (r *redisIPLimiter) borrowConn() (*redisConn, error) {
+	select {
+	case rc := <-r.pool:
+		return rc, nil
+	default:
+	}
+	return r.dialConn()
+}
+
+func (r *redisIPLimiter) returnConn(rc *redisConn) {
+	if rc == nil || rc.conn == nil {
+		return
+	}
+	select {
+	case r.pool <- rc:
+	default:
+		rc.close()
+	}
 }
 
 func (r *redisIPLimiter) CheckAndTouch(userID int, ip string, maxIPs int, expirySec int) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Bound total concurrent Redis handshakes without serializing all users behind a single mutex.
+	timer := time.NewTimer(1500 * time.Millisecond)
+	select {
+	case r.sem <- struct{}{}:
+		timer.Stop()
+		defer func() { <-r.sem }()
+	case <-timer.C:
+		return true, errors.New("redis ip limiter busy")
+	}
+
+	key := fmt.Sprintf("xoga:ip:%d", userID)
+	rejected := false
+	needZRem := false
 
 	for attempt := 0; attempt < 2; attempt++ {
-		if r.conn == nil {
-			if err := r.dialLocked(); err != nil {
-				return true, err
+		rc, err := r.borrowConn()
+		if err != nil {
+			if rejected {
+				return false, nil
 			}
+			return true, err
 		}
-		allowed, err := r.execPipelineLocked(userID, ip, maxIPs, expirySec)
+		if needZRem {
+			// Previous attempt already verified cnt > maxIPs and inserted ip; ONLY run ZREM
+			// so retrying never re-runs ZADD and never fails open after rejection.
+			if zerr := rc.execZRem(key, ip); zerr == nil {
+				r.returnConn(rc)
+				return false, nil
+			}
+			rc.close()
+			continue
+		}
+		allowed, addedNew, err := rc.execPipeline(key, ip, maxIPs, expirySec)
 		if err == nil {
-			return allowed, nil
+			if !allowed {
+				rejected = true
+				if addedNew {
+					if zerr := rc.execZRem(key, ip); zerr != nil {
+						rc.close()
+						needZRem = true
+						continue
+					}
+				}
+				r.returnConn(rc)
+				return false, nil
+			}
+			r.returnConn(rc)
+			return true, nil
 		}
-		_ = r.conn.Close()
-		r.conn = nil
-		r.br = nil
+		rc.close()
+	}
+	if rejected {
+		return false, nil
 	}
 	return true, errors.New("redis pipeline failed after reconnect")
 }
 
-func (r *redisIPLimiter) execPipelineLocked(userID int, ip string, maxIPs int, expirySec int) (bool, error) {
-	_ = r.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+func (rc *redisConn) execPipeline(key, ip string, maxIPs int, expirySec int) (allowed bool, addedNew bool, err error) {
+	_ = rc.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 	now := time.Now().Unix()
-	key := fmt.Sprintf("xoga:ip:%d", userID)
 	minScore := strconv.FormatInt(now-int64(expirySec), 10)
 	nowStr := strconv.FormatInt(now, 10)
 	expStr := strconv.Itoa(expirySec + 10)
@@ -1035,39 +1109,39 @@ func (r *redisIPLimiter) execPipelineLocked(userID int, ip string, maxIPs int, e
 	appendRESP(&sb, "ZCARD", key)
 	appendRESP(&sb, "EXPIRE", key, expStr)
 
-	if _, err := r.conn.Write([]byte(sb.String())); err != nil {
-		return true, err
+	if _, err := rc.conn.Write([]byte(sb.String())); err != nil {
+		return true, false, err
 	}
-	if _, err := readRESPLine(r.br); err != nil {
-		return true, err
+	if _, err := readRESPLine(rc.br); err != nil {
+		return true, false, err
 	}
-	zaddLine, err := readRESPLine(r.br)
+	zaddLine, err := readRESPLine(rc.br)
 	if err != nil {
-		return true, err
+		return true, false, err
 	}
-	cardLine, err := readRESPLine(r.br)
+	cardLine, err := readRESPLine(rc.br)
 	if err != nil {
-		return true, err
+		return true, false, err
 	}
-	if _, err := readRESPLine(r.br); err != nil {
-		return true, err
+	if _, err := readRESPLine(rc.br); err != nil {
+		return true, false, err
 	}
 	if strings.HasPrefix(cardLine, ":") {
 		cnt, _ := strconv.Atoi(strings.TrimSpace(cardLine[1:]))
 		if cnt > maxIPs {
-			// Remove newly inserted rejected IP immediately so it never pollutes the ZSET or locks out valid devices!
-			if strings.TrimSpace(zaddLine) == ":1" {
-				if _, werr := writeRESP(r.conn, "ZREM", key, ip); werr != nil {
-					return false, werr
-				}
-				if _, rerr := readRESPLine(r.br); rerr != nil {
-					return false, rerr
-				}
-			}
-			return false, nil
+			return false, strings.TrimSpace(zaddLine) == ":1", nil
 		}
 	}
-	return true, nil
+	return true, false, nil
+}
+
+func (rc *redisConn) execZRem(key, ip string) error {
+	_ = rc.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	if _, err := writeRESP(rc.conn, "ZREM", key, ip); err != nil {
+		return err
+	}
+	_, err := readRESPLine(rc.br)
+	return err
 }
 
 func appendRESP(sb *strings.Builder, args ...string) {

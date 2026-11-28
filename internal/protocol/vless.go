@@ -281,7 +281,10 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer func() {
+			_ = conn.Close()
+			close(done)
+		}()
 		bp := bufpool.Get(bufpool.MaxUDPSize)
 		buf := *bp
 		defer bufpool.Put(bp)
@@ -355,8 +358,16 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 type xudpSubSession struct {
 	pc       net.PacketConn
 	lastSeen atomic.Int64
-	lastHost string
-	lastPort uint16
+}
+
+type xudpKey struct {
+	sid      uint16
+	routeKey string
+}
+
+type xudpDest struct {
+	host string
+	port uint16
 }
 
 // handleVLESSMux implements Xray VLESS `cmd == 0x03` (`RequestCommandMux` / XUDP) UDP sub-session framing,
@@ -378,17 +389,27 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		muxIdleDur = connIdle
 	}
 
+	var lastActive atomic.Int64
+	lastActive.Store(time.Now().UnixNano())
+	touchMux := func() {
+		lastActive.Store(time.Now().UnixNano())
+	}
+
 	var writeMu sync.Mutex
 	writeXUDP := func(frame []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		_ = conn.SetWriteDeadline(time.Now().Add(muxIdleDur))
 		_, werr := conn.Write(frame)
+		if werr == nil {
+			touchMux()
+		}
 		return werr
 	}
 
 	var sessMu sync.Mutex
-	sessions := make(map[uint16]*xudpSubSession)
+	sessions := make(map[xudpKey]*xudpSubSession)
+	lastDests := make(map[uint16]xudpDest)
 	tcpSessions := make(map[uint16]*muxTCPSubSession)
 	defer func() {
 		sessMu.Lock()
@@ -399,6 +420,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 			ts.abort()
 		}
 		sessions = nil
+		lastDests = nil
 		tcpSessions = nil
 		sessMu.Unlock()
 	}()
@@ -414,15 +436,14 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		if user.IsDisabled() {
 			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(muxIdleDur))
-		if _, err := io.ReadFull(conn, metaLenBuf[:]); err != nil {
+		if err := readFullActive(conn, conn, metaLenBuf[:], muxIdleDur, &lastActive, user.IsDisabled); err != nil {
 			return
 		}
 		metaLen := int(binary.BigEndian.Uint16(metaLenBuf[:]))
 		if metaLen < 4 || metaLen > len(metaBuf) {
 			return
 		}
-		if _, err := io.ReadFull(conn, metaBuf[:metaLen]); err != nil {
+		if err := readFullActive(conn, conn, metaBuf[:metaLen], muxIdleDur, &lastActive, user.IsDisabled); err != nil {
 			return
 		}
 		sid := binary.BigEndian.Uint16(metaBuf[0:2])
@@ -450,7 +471,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		var payload []byte
 		if (opt & 0x01) != 0 {
 			var dlenBuf [2]byte
-			if _, err := io.ReadFull(conn, dlenBuf[:]); err != nil {
+			if err := readFullActive(conn, conn, dlenBuf[:], muxIdleDur, &lastActive, user.IsDisabled); err != nil {
 				return
 			}
 			dlen := int(binary.BigEndian.Uint16(dlenBuf[:]))
@@ -458,7 +479,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 				return
 			}
 			if dlen > 0 {
-				if _, err := io.ReadFull(conn, inBuf[:dlen]); err != nil {
+				if err := readFullActive(conn, conn, inBuf[:dlen], muxIdleDur, &lastActive, user.IsDisabled); err != nil {
 					return
 				}
 				payload = inBuf[:dlen]
@@ -474,9 +495,13 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 			if tSub != nil && (opt&0x02) != 0 {
 				delete(tcpSessions, sid)
 			}
-			us := sessions[sid]
-			if us != nil {
-				delete(sessions, sid)
+			delete(lastDests, sid)
+			var toClose []*xudpSubSession
+			for k, us := range sessions {
+				if k.sid == sid {
+					delete(sessions, k)
+					toClose = append(toClose, us)
+				}
 			}
 			sessMu.Unlock()
 			if tSub != nil {
@@ -489,7 +514,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 					tSub.closeClientTx()
 				}
 			}
-			if us != nil {
+			for _, us := range toClose {
 				_ = us.pc.Close()
 			}
 			continue
@@ -519,7 +544,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 				tSub.enqueue(payload)
 			}
 			subID := sid
-			go s.runMuxTCPSubSession(subID, host, port, user, tSub, writeXUDP, func() {
+			go s.runMuxTCPSubSession(subID, host, port, user, tSub, writeXUDP, touchMux, func() {
 				sessMu.Lock()
 				if tcpSessions != nil && tcpSessions[subID] == tSub {
 					delete(tcpSessions, subID)
@@ -547,11 +572,14 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		}
 
 		sessMu.Lock()
-		us := sessions[sid]
-		if !hasAddr && us != nil {
-			host = us.lastHost
-			port = us.lastPort
-			hasAddr = host != ""
+		if !hasAddr {
+			if ld, ok := lastDests[sid]; ok && ld.host != "" {
+				host = ld.host
+				port = ld.port
+				hasAddr = true
+			}
+		} else {
+			lastDests[sid] = xudpDest{host: host, port: port}
 		}
 		sessMu.Unlock()
 		if !hasAddr || len(payload) == 0 {
@@ -568,75 +596,98 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 			rcancel()
 			continue
 		}
+		isIPv6 := dstUDP.IP.To4() == nil
+		key := xudpKey{sid: sid, routeKey: udpRouteKey(route, isIPv6)}
 
 		sessMu.Lock()
-		us = sessions[sid]
-		if us == nil {
+		if sessions == nil {
+			sessMu.Unlock()
+			rcancel()
+			return
+		}
+		us := sessions[key]
+		if us != nil {
+			us.lastSeen.Store(time.Now().Unix())
+			sessMu.Unlock()
+			rcancel()
+		} else {
 			if len(sessions) >= 256 {
 				sessMu.Unlock()
 				rcancel()
 				continue
 			}
-			pc, derr := relay.DialUDPForRoute(rctx, route, dstUDP.IP.To4() == nil, s.dnsRes)
+			sessMu.Unlock()
+
+			// Dial outbound UDP socket outside sessMu so slow SOCKS5 dials never stall other sub-sessions.
+			pc, derr := relay.DialUDPForRoute(rctx, route, isIPv6, s.dnsRes)
+			rcancel()
 			if derr != nil {
-				sessMu.Unlock()
-				rcancel()
 				continue
 			}
-			us = &xudpSubSession{pc: pc, lastHost: host, lastPort: port}
-			us.lastSeen.Store(time.Now().Unix())
-			sessions[sid] = us
 
-			go func(subID uint16, sub *xudpSubSession) {
-				defer func() {
-					_ = sub.pc.Close()
-					sessMu.Lock()
-					if sessions != nil && sessions[subID] == sub {
-						delete(sessions, subID)
-					}
-					sessMu.Unlock()
-				}()
-				rbp := bufpool.Get(bufpool.MaxUDPSize)
-				rbuf := *rbp
-				defer bufpool.Put(rbp)
+			sessMu.Lock()
+			if sessions == nil {
+				sessMu.Unlock()
+				_ = pc.Close()
+				return
+			}
+			if existing := sessions[key]; existing != nil {
+				existing.lastSeen.Store(time.Now().Unix())
+				us = existing
+				sessMu.Unlock()
+				_ = pc.Close()
+			} else {
+				us = &xudpSubSession{pc: pc}
+				us.lastSeen.Store(time.Now().Unix())
+				sessions[key] = us
+				sessMu.Unlock()
 
-				for {
-					if user.IsDisabled() {
-						return
-					}
-					_ = sub.pc.SetReadDeadline(time.Now().Add(idleDur))
-					rn, raddr, rerr := sub.pc.ReadFrom(rbuf)
-					if rerr != nil {
-						var ne net.Error
-						if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sub.lastSeen.Load(), 0)) < idleDur {
+				go func(k xudpKey, sub *xudpSubSession) {
+					defer func() {
+						_ = sub.pc.Close()
+						sessMu.Lock()
+						if sessions != nil && sessions[k] == sub {
+							delete(sessions, k)
+						}
+						sessMu.Unlock()
+					}()
+					rbp := bufpool.Get(bufpool.MaxUDPSize)
+					rbuf := *rbp
+					defer bufpool.Put(rbp)
+
+					for {
+						if user.IsDisabled() {
+							return
+						}
+						_ = sub.pc.SetReadDeadline(time.Now().Add(idleDur))
+						rn, raddr, rerr := sub.pc.ReadFrom(rbuf)
+						if rerr != nil {
+							var ne net.Error
+							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sub.lastSeen.Load(), 0)) < idleDur {
+								continue
+							}
+							return
+						}
+						ua, ok := raddr.(*net.UDPAddr)
+						if !ok || rn <= 0 {
 							continue
 						}
-						return
-					}
-					ua, ok := raddr.(*net.UDPAddr)
-					if !ok || rn <= 0 {
-						continue
-					}
-					sub.lastSeen.Store(time.Now().Unix())
-					if ul := user.EffectiveLimiter(); ul != nil {
-						ul.Wait(rn)
-					}
-					s.tracker.NodeLimiter.Wait(rn)
-					user.AddDownload(int64(rn))
+						sub.lastSeen.Store(time.Now().Unix())
+						touchMux()
+						if ul := user.EffectiveLimiter(); ul != nil {
+							ul.Wait(rn)
+						}
+						s.tracker.NodeLimiter.Wait(rn)
+						user.AddDownload(int64(rn))
 
-					frame := encodeXUDPReplyFrame(subID, ua, rbuf[:rn])
-					if frame == nil || writeXUDP(frame) != nil {
-						return
+						frame := encodeXUDPReplyFrame(k.sid, ua, rbuf[:rn])
+						if frame == nil || writeXUDP(frame) != nil {
+							return
+						}
 					}
-				}
-			}(sid, us)
-		} else {
-			us.lastHost = host
-			us.lastPort = port
-			us.lastSeen.Store(time.Now().Unix())
+				}(key, us)
+			}
 		}
-		sessMu.Unlock()
-		rcancel()
 
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(len(payload))
