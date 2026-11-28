@@ -72,7 +72,23 @@ func startEchoTCPAndUDP(t *testing.T) (tcpPort uint16, udpPort uint16) {
 
 func freeLocalPort(t *testing.T, network string) int {
 	t.Helper()
-	if network == "udp" {
+	switch network {
+	case "tcp+udp":
+		for i := 0; i < 64; i++ {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			port := ln.Addr().(*net.TCPAddr).Port
+			pc, uerr := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			_ = ln.Close()
+			if uerr == nil {
+				_ = pc.Close()
+				return port
+			}
+		}
+		t.Fatal("failed to allocate local port free on both TCP and UDP")
+	case "udp":
 		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)

@@ -125,20 +125,25 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 			buf := *bp
 			defer bufpool.Put(bp)
 
+			nextWait := idleDur
 			for {
 				if user.IsDisabled() {
 					_ = conn.Close()
 					return
 				}
-				_ = pc.SetReadDeadline(time.Now().Add(idleDur))
+				_ = pc.SetReadDeadline(time.Now().Add(nextWait))
 				n, raddr, rerr := pc.ReadFrom(buf)
 				if rerr != nil {
 					var ne net.Error
-					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-						continue
+					if errors.As(rerr, &ne) && ne.Timeout() {
+						if rem, ok := remainingIdleWait(&lastActive, idleDur); ok {
+							nextWait = rem
+							continue
+						}
 					}
 					return
 				}
+				nextWait = idleDur
 				ua, ok := raddr.(*net.UDPAddr)
 				if !ok {
 					continue
@@ -210,22 +215,27 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	payload := *bp
 	defer bufpool.Put(bp)
 
+	nextWait := idleDur
 	for {
 		if user.IsDisabled() {
 			break
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
+		_ = conn.SetReadDeadline(time.Now().Add(nextWait))
 		// Read the first byte (ATYP) separately: only retry on timeout when 0 bytes
 		// were consumed so partial reads can never desynchronize the stream.
 		var atyp [1]byte
 		rn, err := conn.Read(atyp[:])
 		if rn == 0 {
 			var ne net.Error
-			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-				continue
+			if err != nil && errors.As(err, &ne) && ne.Timeout() {
+				if rem, ok := remainingIdleWait(&lastActive, idleDur); ok {
+					nextWait = rem
+					continue
+				}
 			}
 			break
 		}
+		nextWait = idleDur
 		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		host, port, err := parseSOCKS5AddrWithAtyp(conn, atyp[0])
 		if err != nil {

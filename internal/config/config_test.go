@@ -135,6 +135,9 @@ func TestTrustedProxyCIDRsAndGCPercentSet(t *testing.T) {
 	if def.GCPercent != 100 || def.GCPercentSet {
 		t.Fatalf("unexpected default GCPercent=%d GCPercentSet=%v", def.GCPercent, def.GCPercentSet)
 	}
+	if def.ForwardedIPHeader != "auto" {
+		t.Fatalf("unexpected default ForwardedIPHeader=%q want auto", def.ForwardedIPHeader)
+	}
 
 	tmp := filepath.Join(t.TempDir(), "xoga.conf")
 	raw := `
@@ -145,6 +148,7 @@ webapi_key=k
 v2ray_reduce_memory=true
 gc_percent=100
 trusted_proxy_cidrs=203.175.12.253, 172.64.0.0/13, 2606:4700::/32
+forwarded_ip_header=X-Real-IP
 `
 	if err := os.WriteFile(tmp, []byte(raw), 0644); err != nil {
 		t.Fatal(err)
@@ -156,6 +160,9 @@ trusted_proxy_cidrs=203.175.12.253, 172.64.0.0/13, 2606:4700::/32
 	if !cfg.GCPercentSet || cfg.GCPercent != 100 {
 		t.Fatalf("explicit gc_percent=100 must set GCPercentSet=true, got %d (%v)", cfg.GCPercent, cfg.GCPercentSet)
 	}
+	if cfg.ForwardedIPHeader != "x-real-ip" {
+		t.Fatalf("ForwardedIPHeader mismatch: got %q want x-real-ip", cfg.ForwardedIPHeader)
+	}
 	wantCIDRs := []string{"203.175.12.253", "172.64.0.0/13", "2606:4700::/32"}
 	if len(cfg.TrustedProxyCIDRs) != len(wantCIDRs) {
 		t.Fatalf("TrustedProxyCIDRs mismatch: got %v want %v", cfg.TrustedProxyCIDRs, wantCIDRs)
@@ -166,20 +173,24 @@ trusted_proxy_cidrs=203.175.12.253, 172.64.0.0/13, 2606:4700::/32
 		}
 	}
 
-	// Verify env var override for TRUSTED_PROXY_CIDRS and XOGA_GC_PERCENT
+	// Verify env var override for TRUSTED_PROXY_CIDRS, FORWARDED_IP_HEADER, and XOGA_GC_PERCENT
 	t.Setenv("TRUSTED_PROXY_CIDRS", "43.217.251.51/32,103.147.198.84")
+	t.Setenv("XOGA_FORWARDED_IP_HEADER", "x-forwarded-for")
 	t.Setenv("XOGA_GC_PERCENT", "120")
 	cfg.ApplyEnv()
 	if len(cfg.TrustedProxyCIDRs) != 2 || cfg.TrustedProxyCIDRs[0] != "43.217.251.51/32" || cfg.TrustedProxyCIDRs[1] != "103.147.198.84" {
 		t.Fatalf("env override for trusted_proxy_cidrs failed: %v", cfg.TrustedProxyCIDRs)
 	}
+	if cfg.ForwardedIPHeader != "x-forwarded-for" {
+		t.Fatalf("env override for XOGA_FORWARDED_IP_HEADER failed: %q", cfg.ForwardedIPHeader)
+	}
 	if cfg.GCPercent != 120 || !cfg.GCPercentSet {
 		t.Fatalf("env override for XOGA_GC_PERCENT failed: %d (%v)", cfg.GCPercent, cfg.GCPercentSet)
 	}
 
-	// CloneForNode must preserve GCPercentSet and TrustedProxyCIDRs
+	// CloneForNode must preserve GCPercentSet, TrustedProxyCIDRs, and ForwardedIPHeader
 	cloned := cfg.CloneForNode(782)
-	if !cloned.GCPercentSet || len(cloned.TrustedProxyCIDRs) != 2 {
-		t.Fatalf("CloneForNode dropped GCPercentSet or TrustedProxyCIDRs: %+v", cloned)
+	if !cloned.GCPercentSet || len(cloned.TrustedProxyCIDRs) != 2 || cloned.ForwardedIPHeader != "x-forwarded-for" {
+		t.Fatalf("CloneForNode dropped GCPercentSet, TrustedProxyCIDRs, or ForwardedIPHeader: %+v", cloned)
 	}
 }

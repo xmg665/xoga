@@ -296,6 +296,7 @@ type Server struct {
 	ssPSK             []byte
 	ssPSKBlk          cipher.Block
 	trustedProxyCIDRs []netip.Prefix
+	forwardedIPHeader transport.ForwardedIPHeaderMode
 
 	ipHints ipHintCache
 	hotRing hotUserRing
@@ -317,9 +318,10 @@ type Server struct {
 	nextSrvConn uint64
 	activeConns map[uint64]io.Closer
 
-	// testIdleOverride is used solely by unit tests in package protocol to exercise
-	// idle timeout survival paths without waiting 10-30s; always 0 in production.
-	testIdleOverride time.Duration
+	// testIdleOverride and testUDPIdleOverride are used solely by unit tests in package protocol
+	// to exercise idle timeout survival and cleanup paths without waiting 10-30s; always 0 in production.
+	testIdleOverride    time.Duration
+	testUDPIdleOverride time.Duration
 }
 
 func (s *Server) connIdleDur(minFloor, fallback time.Duration) time.Duration {
@@ -334,6 +336,9 @@ func (s *Server) connIdleDur(minFloor, fallback time.Duration) time.Duration {
 }
 
 func (s *Server) udpIdleDur(minFloor, fallback time.Duration) time.Duration {
+	if s.testUDPIdleOverride > 0 {
+		return s.testUDPIdleOverride
+	}
 	if s.testIdleOverride > 0 {
 		return s.testIdleOverride
 	}
@@ -387,12 +392,17 @@ func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker,
 	if len(invalidCIDRs) > 0 {
 		logger.Warnf("[node %d] Ignoring invalid trusted_proxy_cidrs entries: %v", cfg.NodeID, invalidCIDRs)
 	}
+	fwdHeaderMode, validFwdMode := transport.ParseForwardedIPHeaderMode(cfg.ForwardedIPHeader)
+	if !validFwdMode {
+		logger.Warnf("[node %d] Ignoring invalid forwarded_ip_header %q (supported: auto, x-forwarded-for, x-real-ip, cf-connecting-ip); using auto", cfg.NodeID, cfg.ForwardedIPHeader)
+	}
 	s := &Server{
 		cfg:               cfg,
 		spec:              spec,
 		tracker:           tracker,
 		dnsRes:            res,
 		trustedProxyCIDRs: trustedCIDRs,
+		forwardedIPHeader: fwdHeaderMode,
 	}
 	s.aclEng.Store(initialACL)
 
@@ -591,7 +601,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		// real client IP via PROXY header and do not strip client-spoofed CF-Connecting-IP/XFF.
 		// Trust forwarded headers only when trust_forwarded_ip=true, peer is loopback/private,
 		// or peer matches explicitly configured trusted_proxy_cidrs.
-		wsConn, err := transport.AcceptWebSocketWithTrustedProxies(conn, s.spec.WSPath, s.cfg.TrustForwardedIP, s.trustedProxyCIDRs)
+		wsConn, err := transport.AcceptWebSocketWithTrustedProxies(conn, s.spec.WSPath, s.cfg.TrustForwardedIP, s.trustedProxyCIDRs, s.forwardedIPHeader)
 		if err != nil {
 			logger.Debugf("ws upgrade failed from %s: %v", conn.RemoteAddr(), err)
 			return
@@ -667,28 +677,47 @@ func (s *Server) peekInitialPayloadWithTimeout(clientConn net.Conn, wait time.Du
 	return out, nil
 }
 
+func remainingIdleWait(lastActive *atomic.Int64, idleDur time.Duration) (time.Duration, bool) {
+	if lastActive == nil {
+		return 0, false
+	}
+	elapsed := time.Since(time.Unix(0, lastActive.Load()))
+	if elapsed >= idleDur {
+		return 0, false
+	}
+	rem := idleDur - elapsed
+	if rem > idleDur {
+		rem = idleDur
+	}
+	return rem, true
+}
+
 // readFullActive reads exactly len(buf) bytes from r while preserving partial progress across
 // idle read timeouts whenever bidirectional activity (lastActive) is within idleDur.
 func readFullActive(conn net.Conn, r io.Reader, buf []byte, idleDur time.Duration, lastActive *atomic.Int64, isDisabled func() bool) error {
 	off := 0
+	nextWait := idleDur
 	for off < len(buf) {
 		if isDisabled != nil && isDisabled() {
 			return stats.ErrUserDisabled
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
+		_ = conn.SetReadDeadline(time.Now().Add(nextWait))
 		n, err := r.Read(buf[off:])
 		off += n
 		if n > 0 && lastActive != nil {
 			lastActive.Store(time.Now().UnixNano())
+			nextWait = idleDur
 		}
 		if off >= len(buf) {
 			return nil
 		}
 		if err != nil {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && (isDisabled == nil || !isDisabled()) &&
-				lastActive != nil && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-				continue
+			if errors.As(err, &ne) && ne.Timeout() && (isDisabled == nil || !isDisabled()) {
+				if rem, ok := remainingIdleWait(lastActive, idleDur); ok {
+					nextWait = rem
+					continue
+				}
 			}
 			return err
 		}

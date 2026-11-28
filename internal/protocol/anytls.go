@@ -511,20 +511,25 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 			buf := *bp
 			defer bufpool.Put(bp)
 
+			nextWait := idleDur
 			for {
 				if s.user.IsDisabled() {
 					_ = st.Close()
 					return
 				}
-				_ = pc.SetReadDeadline(time.Now().Add(idleDur))
+				_ = pc.SetReadDeadline(time.Now().Add(nextWait))
 				n, raddr, rerr := pc.ReadFrom(buf)
 				if rerr != nil {
 					var ne net.Error
-					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-						continue
+					if errors.As(rerr, &ne) && ne.Timeout() {
+						if rem, ok := remainingIdleWait(&lastActive, idleDur); ok {
+							nextWait = rem
+							continue
+						}
 					}
 					return
 				}
+				nextWait = idleDur
 				ua, ok := raddr.(*net.UDPAddr)
 				if !ok || ua == nil || ua.IP == nil {
 					continue
@@ -615,11 +620,12 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 	inBuf := *bp
 	defer bufpool.Put(bp)
 
+	nextWait := idleDur
 	for {
 		if s.user.IsDisabled() {
 			break
 		}
-		_ = st.SetReadDeadline(time.Now().Add(idleDur))
+		_ = st.SetReadDeadline(time.Now().Add(nextWait))
 		host, port := fixedHost, fixedPort
 		var l2 [2]byte
 		if !isConnect {
@@ -628,11 +634,15 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 			var af [1]byte
 			rn, rerr := st.Read(af[:])
 			if rn == 0 {
-				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-					continue
+				if errors.Is(rerr, context.DeadlineExceeded) {
+					if rem, ok := remainingIdleWait(&lastActive, idleDur); ok {
+						nextWait = rem
+						continue
+					}
 				}
 				break
 			}
+			nextWait = idleDur
 			_ = st.SetReadDeadline(time.Now().Add(idleDur))
 			var aerr error
 			host, port, aerr = readUoTAddrWithAF(st, af[0])
@@ -645,11 +655,15 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		} else {
 			rn, rerr := st.Read(l2[:1])
 			if rn == 0 {
-				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
-					continue
+				if errors.Is(rerr, context.DeadlineExceeded) {
+					if rem, ok := remainingIdleWait(&lastActive, idleDur); ok {
+						nextWait = rem
+						continue
+					}
 				}
 				break
 			}
+			nextWait = idleDur
 			_ = st.SetReadDeadline(time.Now().Add(idleDur))
 			if _, err := io.ReadFull(st, l2[1:]); err != nil {
 				break

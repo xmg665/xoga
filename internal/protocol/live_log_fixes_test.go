@@ -57,7 +57,7 @@ func TestNEW1WebSocketTrustedProxyCIDRsBehindProxyProtocol(t *testing.T) {
 	}
 	defer srv.Close()
 
-	sendViaProxy := func(proxySrcIP, xffIP string) {
+	sendViaProxy := func(proxySrcIP, extraHeaders string) {
 		t.Helper()
 		c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(srvPort)), 2*time.Second)
 		if err != nil {
@@ -73,7 +73,7 @@ func TestNEW1WebSocketTrustedProxyCIDRsBehindProxyProtocol(t *testing.T) {
 			"Connection: Upgrade\r\n" +
 			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 			"Sec-WebSocket-Version: 13\r\n" +
-			"X-Forwarded-For: " + xffIP + "\r\n\r\n"
+			extraHeaders + "\r\n"
 		if _, err := c.Write([]byte(upgrade)); err != nil {
 			t.Fatal(err)
 		}
@@ -111,7 +111,7 @@ func TestNEW1WebSocketTrustedProxyCIDRsBehindProxyProtocol(t *testing.T) {
 	}
 
 	// 1. Trusted L7 relay 203.175.12.253 -> X-Forwarded-For 198.51.100.42 IS trusted!
-	sendViaProxy("203.175.12.253", "198.51.100.42")
+	sendViaProxy("203.175.12.253", "X-Forwarded-For: 198.51.100.42\r\n")
 	alive := tr.SnapshotAliveMap()
 	foundReal := false
 	for _, ip := range alive[1] {
@@ -127,7 +127,7 @@ func TestNEW1WebSocketTrustedProxyCIDRsBehindProxyProtocol(t *testing.T) {
 	}
 
 	// 2. Untrusted public IP 203.0.113.50 spoofing XFF 198.51.100.99 -> MUST track 203.0.113.50!
-	sendViaProxy("203.0.113.50", "198.51.100.99")
+	sendViaProxy("203.0.113.50", "X-Forwarded-For: 198.51.100.99\r\n")
 	alive2 := tr.SnapshotAliveMap()
 	foundUntrusted := false
 	for _, ip := range alive2[1] {
@@ -141,6 +141,121 @@ func TestNEW1WebSocketTrustedProxyCIDRsBehindProxyProtocol(t *testing.T) {
 	if !foundUntrusted {
 		t.Fatalf("expected untrusted peer real IP 203.0.113.50, got %v", alive2[1])
 	}
+
+	// 3. Trusted non-Cloudflare HAProxy relay 203.175.12.253 where client spoofs CF-Connecting-IP & X-Real-IP
+	//    while HAProxy appends real client IP 198.51.100.66 to X-Forwarded-For -> MUST track 198.51.100.66!
+	sendViaProxy("203.175.12.253",
+		"CF-Connecting-IP: 198.51.100.199\r\n"+
+			"X-Real-IP: 198.51.100.198\r\n"+
+			"X-Forwarded-For: 198.51.100.197, 198.51.100.66\r\n")
+	alive3 := tr.SnapshotAliveMap()
+	foundHAProxyReal := false
+	for _, ip := range alive3[1] {
+		if ip == "198.51.100.66" {
+			foundHAProxyReal = true
+		}
+		if ip == "198.51.100.199" || ip == "198.51.100.198" || ip == "198.51.100.197" {
+			t.Fatalf("spoofed header bypassed non-Cloudflare HAProxy relay: %v", alive3[1])
+		}
+	}
+	if !foundHAProxyReal {
+		t.Fatalf("expected HAProxy real client IP 198.51.100.66, got %v", alive3[1])
+	}
+
+	// 4. Real Cloudflare CDN edge peer 172.64.15.9 -> CF-Connecting-IP 198.51.100.67 wins over spoofed X-Real-IP!
+	sendViaProxy("172.64.15.9", "X-Real-IP: 198.51.100.200\r\nCF-Connecting-IP: 198.51.100.67\r\n")
+	alive4 := tr.SnapshotAliveMap()
+	foundCFReal := false
+	for _, ip := range alive4[1] {
+		if ip == "198.51.100.67" {
+			foundCFReal = true
+		}
+		if ip == "198.51.100.200" {
+			t.Fatalf("Cloudflare edge peer accepted spoofed X-Real-IP: %v", alive4[1])
+		}
+	}
+	if !foundCFReal {
+		t.Fatalf("expected Cloudflare CF-Connecting-IP 198.51.100.67, got %v", alive4[1])
+	}
+
+	// 5. Explicit forwarded_ip_header=x-real-ip server strictly honors X-Real-IP over client-spoofed XFF/CF headers!
+	t.Run("ExplicitForwardedIPHeaderXRealIP", func(t *testing.T) {
+		cfg2 := config.Default()
+		cfg2.ForceCloseSSL = true
+		cfg2.ProxyProtocol = true
+		cfg2.TrustForwardedIP = false
+		cfg2.TrustedProxyCIDRs = []string{"203.175.12.253/32"}
+		cfg2.ForwardedIPHeader = "x-real-ip"
+
+		tr2 := stats.NewTracker(cfg2)
+		u2, _, _, _ := tr2.ReconcileUsers([]stats.SyncUserSpec{{ID: 2, UUIDOrPass: uuidStr}})
+		p2 := freeTCPPort(t)
+		srv2, err := NewServer(cfg2, &panel.NodeSpec{
+			Protocol:   "vless",
+			ListenIP:   "127.0.0.1",
+			ServerPort: p2,
+			Network:    "ws",
+			WSPath:     "/ws",
+		}, tr2, BuildUserIndexForProtocol("vless", u2, 0), acl.NewEngine(false, "", "", "", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv2.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer srv2.Close()
+
+		c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p2)), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		upgrade := "PROXY TCP4 203.175.12.253 127.0.0.1 45001 8080\r\n" +
+			"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" +
+			"CF-Connecting-IP: 198.51.100.210\r\n" +
+			"X-Forwarded-For: 198.51.100.211\r\n" +
+			"X-Real-IP: 198.51.100.68\r\n\r\n"
+		if _, err := c.Write([]byte(upgrade)); err != nil {
+			t.Fatal(err)
+		}
+		respBuf := make([]byte, 512)
+		n, err := c.Read(respBuf)
+		if err != nil || !strings.Contains(string(respBuf[:n]), "101 Switching Protocols") {
+			t.Fatalf("ws upgrade failed: %q err=%v", respBuf[:n], err)
+		}
+
+		var vlessHdr bytes.Buffer
+		vlessHdr.WriteByte(0x00)
+		vlessHdr.Write(u2[0].UUIDBytes[:])
+		vlessHdr.WriteByte(0x00)
+		vlessHdr.WriteByte(0x01)
+		_ = binary.Write(&vlessHdr, binary.BigEndian, echoPort)
+		vlessHdr.WriteByte(0x01)
+		vlessHdr.Write([]byte{127, 0, 0, 1})
+		vlessHdr.WriteString("hello-x-real-ip")
+		raw := vlessHdr.Bytes()
+		wsFrame := make([]byte, 2+4+len(raw))
+		wsFrame[0] = 0x82
+		wsFrame[1] = 0x80 | byte(len(raw))
+		mask := [4]byte{0x11, 0x22, 0x33, 0x44}
+		copy(wsFrame[2:6], mask[:])
+		for i := range raw {
+			wsFrame[6+i] = raw[i] ^ mask[i&3]
+		}
+		if _, err := c.Write(wsFrame); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Read(respBuf); err != nil {
+			t.Fatalf("echo read failed: %v", err)
+		}
+
+		aliveX := tr2.SnapshotAliveMap()
+		if len(aliveX[2]) != 1 || aliveX[2][0] != "198.51.100.68" {
+			t.Fatalf("expected tracked IP [198.51.100.68] under forwarded_ip_header=x-real-ip, got %v", aliveX[2])
+		}
+	})
 }
 
 func TestBUG2BUG4BUG7DomainSniffDirectOverrideBanPrivateIPAndFastPortBlock(t *testing.T) {

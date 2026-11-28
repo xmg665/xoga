@@ -1091,6 +1091,64 @@ log_level=info
 		if r4, err := sendVLESS(c4, "spoofed-leading-xff"); err == nil && bytes.Contains(r4, []byte("spoofed-leading-xff")) {
 			t.Fatalf("NEW-1 security regression: client-spoofed leftmost X-Forwarded-For bypassed device_limit behind trusted relay!")
 		}
+
+		// Conn 5 from trusted non-Cloudflare HAProxy relay 203.175.12.253 where an attacker injects
+		// CF-Connecting-IP: 198.51.100.77 and X-Real-IP: 198.51.100.77 while HAProxy (`option forwardfor`)
+		// appends real attacker IP 198.51.100.89 -> MUST extract 198.51.100.89 and reject under device_limit=1!
+		c5 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21005 8080\r\n",
+			"CF-Connecting-IP: 198.51.100.77\r\nX-Real-IP: 198.51.100.77\r\nX-Forwarded-For: 198.51.100.77, 198.51.100.89\r\n")
+		defer c5.Close()
+		if r5, err := sendVLESS(c5, "spoofed-cf-and-xrealip-behind-haproxy"); err == nil && bytes.Contains(r5, []byte("spoofed-cf-and-xrealip-behind-haproxy")) {
+			t.Fatalf("security regression: spoofed CF-Connecting-IP/X-Real-IP bypassed device_limit behind HAProxy relay!")
+		}
+
+		// Conn 6 from trusted non-Cloudflare relay 203.175.12.253 sending ONLY CF-Connecting-IP: 198.51.100.77
+		// (without XFF or X-Real-IP) -> non-Cloudflare public peer MUST NOT trust CF-Connecting-IP, so IP stays
+		// 203.175.12.253 (!= 198.51.100.77) and MUST be rejected under device_limit=1!
+		c6 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21006 8080\r\n", "CF-Connecting-IP: 198.51.100.77\r\n")
+		defer c6.Close()
+		if r6, err := sendVLESS(c6, "spoofed-cf-only-behind-haproxy"); err == nil && bytes.Contains(r6, []byte("spoofed-cf-only-behind-haproxy")) {
+			t.Fatalf("security regression: non-Cloudflare relay trusted CF-Connecting-IP alone!")
+		}
+
+		// Conn 7 from real Cloudflare CDN edge 172.64.15.9 (in 172.64.0.0/13) with CF-Connecting-IP: 198.51.100.77
+		// and spoofed X-Real-IP: 198.51.100.99 -> Cloudflare edge trusts CF-Connecting-IP, sharing active slot 198.51.100.77!
+		c7 := dialWS(port781, "/vless", "PROXY TCP4 172.64.15.9 127.0.0.1 21007 8080\r\n",
+			"X-Real-IP: 198.51.100.99\r\nX-Forwarded-For: 198.51.100.99, 198.51.100.77\r\nCF-Connecting-IP: 198.51.100.77\r\n")
+		defer c7.Close()
+		r7, err := sendVLESS(c7, "cf-edge-real-user1")
+		if err != nil || !bytes.Contains(r7, []byte("cf-edge-real-user1")) {
+			t.Fatalf("real Cloudflare CDN edge CF-Connecting-IP failed to share active slot: %q err=%v", r7, err)
+		}
+
+		// Conn 8 from real Cloudflare CDN edge 172.64.15.9 with DIFFERENT CF-Connecting-IP: 198.51.100.91
+		// and client-spoofed X-Real-IP: 198.51.100.77 -> MUST reject under device_limit=1!
+		c8 := dialWS(port781, "/vless", "PROXY TCP4 172.64.15.9 127.0.0.1 21008 8080\r\n",
+			"X-Real-IP: 198.51.100.77\r\nCF-Connecting-IP: 198.51.100.91\r\n")
+		defer c8.Close()
+		if r8, err := sendVLESS(c8, "cf-edge-different-user"); err == nil && bytes.Contains(r8, []byte("cf-edge-different-user")) {
+			t.Fatalf("Cloudflare edge peer allowed spoofed X-Real-IP over CF-Connecting-IP!")
+		}
+
+		// Conn 9 chained Cloudflare (172.64.15.9) -> HAProxy (203.175.12.253) -> xoga for SAME client 198.51.100.77:
+		// right-to-left XFF skips trusted CF hop 172.64.15.9 and extracts 198.51.100.77 -> MUST succeed!
+		c9 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21009 8080\r\n",
+			"CF-Connecting-IP: 198.51.100.77\r\nX-Forwarded-For: 8.8.8.8, 198.51.100.77, 172.64.15.9\r\n")
+		defer c9.Close()
+		r9, err := sendVLESS(c9, "chained-cf-haproxy-ok")
+		if err != nil || !bytes.Contains(r9, []byte("chained-cf-haproxy-ok")) {
+			t.Fatalf("chained CF->HAProxy failed to extract real client IP: %q err=%v", r9, err)
+		}
+
+		// Conn 10 direct attacker (198.51.100.92) -> HAProxy (203.175.12.253) spoofing BOTH CF-Connecting-IP: 198.51.100.77
+		// AND a fake Cloudflare hop in XFF (`198.51.100.77, 172.64.15.9`) while HAProxy appends real 198.51.100.92:
+		// right-to-left stops at 198.51.100.92 and MUST reject under device_limit=1!
+		c10 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21010 8080\r\n",
+			"CF-Connecting-IP: 198.51.100.77\r\nX-Forwarded-For: 198.51.100.77, 172.64.15.9, 198.51.100.92\r\n")
+		defer c10.Close()
+		if r10, err := sendVLESS(c10, "spoofed-chained-cf-hop"); err == nil && bytes.Contains(r10, []byte("spoofed-chained-cf-hop")) {
+			t.Fatalf("security regression: attacker spoofed chained Cloudflare hop behind HAProxy!")
+		}
 	})
 
 	// BUG-5: Legacy MD5 VMess client with +81s clock skew succeeds end-to-end!

@@ -51,8 +51,9 @@ type Config struct {
 	ProxyProtocol      bool
 	ForceProxyProtocol bool
 	UDPProxyProtocol   bool
-	TrustForwardedIP   bool     // explicitly trust HTTP CF-Connecting-IP/X-Forwarded-For/X-Real-IP headers from any peer
-	TrustedProxyCIDRs  []string // specific public relay/CDN IPs or CIDRs whose forwarded HTTP headers are trusted
+	TrustForwardedIP   bool     // explicitly trust HTTP forwarded client-IP headers from any peer
+	TrustedProxyCIDRs  []string // specific public relay/CDN IPs, CIDRs, or "cloudflare" whose forwarded HTTP headers are trusted
+	ForwardedIPHeader  string   // header selection mode: "auto" (default), "x-forwarded-for", "x-real-ip", or "cf-connecting-ip"
 	ListenIP           string
 	ListenPort         int // optional local port override (0 = follow panel server_port)
 
@@ -133,6 +134,7 @@ func Default() *Config {
 		ServerType:          "auto",
 		API:                 "webapi",
 		CertKeyLength:       "ec-256",
+		ForwardedIPHeader:   "auto",
 		RedisIPLimitExpiry:  60,
 		DyLimitTriggerTime:  60,
 		DyLimitTriggerSpeed: 100,
@@ -252,6 +254,12 @@ func (c *Config) ApplyKV(key, val string) {
 			if p := strings.TrimSpace(part); p != "" {
 				c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, p)
 			}
+		}
+	case "forwarded_ip_header", "trusted_proxy_header":
+		if strings.TrimSpace(val) == "" {
+			c.ForwardedIPHeader = "auto"
+		} else {
+			c.ForwardedIPHeader = strings.ToLower(strings.TrimSpace(val))
 		}
 	case "listen_ip":
 		c.ListenIP = val
@@ -531,7 +539,7 @@ var knownEnvKeys = []string{
 	"type", "server_type", "node_id", "soga_key", "api",
 	"webapi_url", "webapi_key", "webapi_mukey",
 	"cert_file", "key_file", "cert_mode", "cert_domain", "cert_key_length", "dns_provider", "force_close_ssl",
-	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "trust_forwarded_ip", "trusted_proxy_cidrs", "listen_ip", "listen_port",
+	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "trust_forwarded_ip", "trusted_proxy_cidrs", "forwarded_ip_header", "trusted_proxy_header", "listen_ip", "listen_port",
 	"redis_ip_limit_enable", "redis_enable", "redis_ip_limit_addr", "redis_addr",
 	"redis_ip_limit_password", "redis_password", "redis_ip_limit_db", "redis_db",
 	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",
@@ -752,8 +760,10 @@ force_close_ssl=false
 proxy_protocol=false
 udp_proxy_protocol=false
 trust_forwarded_ip=false
-# 指定信任的公网 L7 中转/CDN IP 或 CIDR（逗号分隔），仅信任来自这些源 IP 的 X-Forwarded-For / CF-Connecting-IP / X-Real-IP
+# 指定信任的公网 L7 中转/CDN IP 或 CIDR（逗号分隔，支持 cloudflare 简写）
 trusted_proxy_cidrs=
+# 转发 IP 头选择策略: auto(默认: CF边缘优先CF-Connecting-IP，其他L7中转优先X-Forwarded-For防伪造) / x-forwarded-for / x-real-ip / cf-connecting-ip
+forwarded_ip_header=auto
 
 # 全局限制用户 IP 数配置 (原生轻量 RESP 协议，无需重量级 SDK)
 redis_ip_limit_enable=false

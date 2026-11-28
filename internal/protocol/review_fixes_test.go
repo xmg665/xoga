@@ -761,7 +761,7 @@ outbound_tag = "s5out"
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv.testIdleOverride = 220 * time.Millisecond
+		srv.testUDPIdleOverride = 250 * time.Millisecond
 		if err := srv.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -949,7 +949,9 @@ outbound_tag = "s5out"
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv.testIdleOverride = 220 * time.Millisecond
+		// Only override UDP/UoT idle duration (keeping outer AnyTLS TCP session connIdleDur at default)
+		// so the outer TLS session does not race with inner UoT downlink idle FIN emission (M4).
+		srv.testUDPIdleOverride = 250 * time.Millisecond
 		if err := srv.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -1055,7 +1057,7 @@ outbound_tag = "s5out"
 
 	// 4. Shadowsocks UDP: concurrent multi-route + IPv6 switching under -race (verifies lock release during slow SOCKS5 dial!)
 	t.Run("ShadowsocksUDP_ConcurrentMultiRouteAndIPv6", func(t *testing.T) {
-		port := freeLocalPort(t, "udp")
+		port := freeLocalPort(t, "tcp+udp")
 		cfg := config.Default()
 		cfg.ListenIP = "127.0.0.1"
 		cfg.ListenPort = port
@@ -1071,6 +1073,9 @@ outbound_tag = "s5out"
 			t.Fatal(err)
 		}
 		defer srv.Close()
+		if srv.udpConn == nil {
+			t.Fatalf("Shadowsocks UDP listener failed to bind on 127.0.0.1:%d", port)
+		}
 
 		cliPC, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
