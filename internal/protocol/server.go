@@ -678,7 +678,7 @@ func (s *Server) peekInitialPayloadWithTimeout(clientConn net.Conn, wait time.Du
 }
 
 func remainingIdleWait(lastActive *atomic.Int64, idleDur time.Duration) (time.Duration, bool) {
-	if lastActive == nil {
+	if lastActive == nil || idleDur <= 0 {
 		return 0, false
 	}
 	elapsed := time.Since(time.Unix(0, lastActive.Load()))

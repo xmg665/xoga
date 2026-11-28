@@ -66,6 +66,22 @@ func TestReadFullActiveAndVMessFinalChunkOnNWithEOF(t *testing.T) {
 		t.Fatalf("readFullActive unexpected bytes %q", out[:])
 	}
 
+	// 1b. remainingIdleWait must never spin when idleDur <= 0 (even with backward clock skew) or lastActive == nil.
+	if rem, ok := remainingIdleWait(nil, time.Second); ok || rem != 0 {
+		t.Fatalf("remainingIdleWait(nil) = (%v, %v), want (0, false)", rem, ok)
+	}
+	var futureActive atomic.Int64
+	futureActive.Store(time.Now().Add(5 * time.Second).UnixNano())
+	if rem, ok := remainingIdleWait(&futureActive, 0); ok || rem != 0 {
+		t.Fatalf("remainingIdleWait(future, 0) = (%v, %v), want (0, false)", rem, ok)
+	}
+	if rem, ok := remainingIdleWait(&futureActive, -time.Second); ok || rem != 0 {
+		t.Fatalf("remainingIdleWait(future, -1s) = (%v, %v), want (0, false)", rem, ok)
+	}
+	if rem, ok := remainingIdleWait(&futureActive, 250*time.Millisecond); !ok || rem != 250*time.Millisecond {
+		t.Fatalf("remainingIdleWait(future, 250ms) = (%v, %v), want (250ms, true)", rem, ok)
+	}
+
 	// 2. vmessStreamConn.Read must NOT drop final chunk when underlying reader returns (remaining, io.EOF).
 	var reqKey, reqIV [16]byte
 	_, _ = rand.Read(reqKey[:])
@@ -834,7 +850,7 @@ outbound_tag = "s5out"
 			t.Fatalf("expected S5:p3 on SOCKS5 route switch in same Trojan UDP session, got %q", got)
 		}
 
-		// M4: Stop sending; once all UDP sockets idle out (~220ms), downlink exit MUST close client TCP stream!
+		// M4: Stop sending; once all UDP sockets idle out (~250ms), downlink exit MUST close client TCP stream!
 		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 		var one [1]byte
 		if _, err := c.Read(one[:]); err == nil {

@@ -207,6 +207,115 @@ func TestNEW1TrustedProxyCIDRsWebSocketForwardedIP(t *testing.T) {
 	if got := runWS("::ffff:172.64.15.9", "X-Forwarded-For: 198.51.100.1\r\nCF-Connecting-IP: 198.51.100.62\r\n", false); got != "198.51.100.62" {
 		t.Fatalf("v4-in-v6 Cloudflare peer did not trust CF-Connecting-IP: got %s want 198.51.100.62", got)
 	}
+
+	// 20. Transit HAProxy (trusted 203.175.12.253) -> Cloudflare CDN (172.64.15.9) -> xoga:
+	//     Cloudflare sets CF-Connecting-IP to the transit HAProxy IP (203.175.12.253) and appends it to XFF.
+	//     Because 203.175.12.253 is itself a trusted proxy, auto mode MUST unwind XFF right-to-left to the
+	//     real client IP (198.51.100.63) instead of collapsing all users onto 203.175.12.253, while blocking
+	//     client-spoofed leading XFF tokens (8.8.8.8).
+	if got := runWS("172.64.15.9",
+		"CF-Connecting-IP: 203.175.12.253\r\nX-Forwarded-For: 8.8.8.8, 198.51.100.63, 203.175.12.253\r\n", false); got != "198.51.100.63" {
+		t.Fatalf("Transit HAProxy -> Cloudflare unwinding failed: got %s want 198.51.100.63", got)
+	}
+	//     When XFF is absent in Transit HAProxy -> Cloudflare, fall back safely to CF-Connecting-IP (203.175.12.253):
+	if got := runWS("172.64.15.9", "CF-Connecting-IP: 203.175.12.253\r\n", false); got != "203.175.12.253" {
+		t.Fatalf("Transit HAProxy -> Cloudflare without XFF fallback failed: got %s want 203.175.12.253", got)
+	}
+
+	// 21. RFC 9110 §5.1 HTTP header-name whitespace & obs-fold smuggling MUST NOT overwrite trusted headers
+	//     or inject trailing X-Forwarded-For tokens:
+	if got := runWS("172.64.15.9", "CF-Connecting-IP: 198.51.100.99\r\nCF-Connecting-IP : 198.51.100.77\r\n", false); got != "198.51.100.99" {
+		t.Fatalf("whitespace before colon smuggled CF-Connecting-IP: got %s want 198.51.100.99", got)
+	}
+	if got := runWS("172.64.15.9", "CF-Connecting-IP: 198.51.100.99\r\n CF-Connecting-IP: 198.51.100.77\r\n", false); got != "198.51.100.99" {
+		t.Fatalf("obs-fold leading space smuggled CF-Connecting-IP: got %s want 198.51.100.99", got)
+	}
+	if got := runWS("203.175.12.253", "X-Real-IP: 198.51.100.99\r\nX-Real-IP\t: 198.51.100.77\r\n", false); got != "198.51.100.99" {
+		t.Fatalf("tab before colon smuggled X-Real-IP: got %s want 198.51.100.99", got)
+	}
+	if got := runWS("203.175.12.253", "X-Forwarded-For: 198.51.100.99\r\nX-Forwarded-For : 198.51.100.77\r\n", false); got != "198.51.100.99" {
+		t.Fatalf("whitespace before colon smuggled trailing X-Forwarded-For: got %s want 198.51.100.99", got)
+	}
+
+	// 22. Invalid/unusable forwarded IP literals (0.0.0.0, ::, ::ffff:0.0.0.0, multicast, zoned IPv6,
+	//     unbalanced brackets) MUST be rejected and never trusted (or allow walking past them in XFF):
+	for _, bad := range []string{"0.0.0.0", "::", "::ffff:0.0.0.0", "224.0.0.1", "ff02::1", "fe80::1%eth0", "[198.51.100.1", "]198.51.100.1["} {
+		if got := runWS("203.175.12.253", "X-Forwarded-For: 198.51.100.77, "+bad+"\r\n", false); got != "203.175.12.253" {
+			t.Fatalf("invalid XFF token %q was accepted or walked past: got %s want 203.175.12.253", bad, got)
+		}
+		if got := runWS("172.64.15.9", "CF-Connecting-IP: "+bad+"\r\n", false); got != "172.64.15.9" {
+			t.Fatalf("invalid CF-Connecting-IP %q was accepted: got %s want 172.64.15.9", bad, got)
+		}
+	}
+	//     Valid bracketed IPv6 literal and host:port remain accepted:
+	if got := runWS("203.175.12.253", "X-Forwarded-For: [2001:db8::9]:54321\r\n", false); got != "2001:db8::9" {
+		t.Fatalf("valid bracketed IPv6 host:port rejected: got %s want 2001:db8::9", got)
+	}
+	if got := runWS("203.175.12.253", "X-Real-IP: [2001:db8::10]\r\n", false); got != "2001:db8::10" {
+		t.Fatalf("valid bracketed IPv6 rejected: got %s want 2001:db8::10", got)
+	}
+}
+
+func TestZeroConfigLocalAndTrustAllCloudflareChaining(t *testing.T) {
+	runWithCIDRs := func(peerIP, extraHeaders string, trustAll bool, cidrs []string, mode ForwardedIPHeaderMode) string {
+		t.Helper()
+		prefixes, _ := ParseTrustedProxyCIDRs(cidrs)
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+
+		go func() {
+			req := "GET /ws HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n" +
+				extraHeaders + "\r\n"
+			_, _ = c2.Write([]byte(req))
+			buf := make([]byte, 512)
+			_, _ = c2.Read(buf)
+		}()
+
+		fc := &fakePeerConn{
+			Conn: c1,
+			peer: &net.TCPAddr{IP: net.ParseIP(peerIP), Port: 54321},
+		}
+		ws, err := AcceptWebSocketWithTrustedProxies(fc, "/ws", trustAll, prefixes, mode)
+		if err != nil {
+			t.Fatalf("AcceptWebSocketWithTrustedProxies failed: %v", err)
+		}
+		defer ws.Close()
+		return ws.RemoteAddr().(*net.TCPAddr).IP.String()
+	}
+
+	// 1. Zero-config Cloudflare -> local Nginx/Caddy/HAProxy (127.0.0.1, trusted_proxy_cidrs empty)
+	//    MUST still extract real client IP 198.51.100.42 instead of collapsing onto Cloudflare edge 172.64.15.9!
+	cfLocalHdrs := "CF-Connecting-IP: 198.51.100.42\r\nX-Real-IP: 172.64.15.9\r\nX-Forwarded-For: 8.8.8.8, 198.51.100.42, 172.64.15.9\r\n"
+	if got := runWithCIDRs("127.0.0.1", cfLocalHdrs, false, nil, ForwardedIPHeaderAuto); got != "198.51.100.42" {
+		t.Fatalf("zero-config Cloudflare->local proxy broke: got %s want 198.51.100.42", got)
+	}
+	//    Anti-spoofing: direct attacker (198.51.100.92) -> local HAProxy (127.0.0.1, empty trusted_proxy_cidrs)
+	//    spoofing CF-Connecting-IP and a fake Cloudflare hop still has real 198.51.100.92 appended rightmost -> blocked!
+	localSpoof := "CF-Connecting-IP: 198.51.100.77\r\nX-Forwarded-For: 198.51.100.77, 172.64.15.9, 198.51.100.92\r\n"
+	if got := runWithCIDRs("127.0.0.1", localSpoof, false, nil, ForwardedIPHeaderAuto); got != "198.51.100.92" {
+		t.Fatalf("zero-config local proxy allowed spoofed Cloudflare hop: got %s want 198.51.100.92", got)
+	}
+
+	// 2. Legacy trust_forwarded_ip=true (empty trusted_proxy_cidrs) with Cloudflare -> HAProxy -> xoga:
+	//    skips Cloudflare hop 172.64.15.9 and extracts 198.51.100.42 while still blocking direct spoofers!
+	if got := runWithCIDRs("203.175.12.253", cfLocalHdrs, true, nil, ForwardedIPHeaderAuto); got != "198.51.100.42" {
+		t.Fatalf("trust_forwarded_ip=true Cloudflare->HAProxy broke: got %s want 198.51.100.42", got)
+	}
+	if got := runWithCIDRs("203.175.12.253", localSpoof, true, nil, ForwardedIPHeaderAuto); got != "198.51.100.92" {
+		t.Fatalf("trust_forwarded_ip=true allowed spoofed Cloudflare hop behind HAProxy: got %s want 198.51.100.92", got)
+	}
+
+	// 3. Explicit trusted_proxy_cidrs=[203.175.12.253/32] WITHOUT cloudflare strictly enforces the CIDR allowlist
+	//    and does NOT skip unconfigured Cloudflare hops in XFF:
+	if got := runWithCIDRs("203.175.12.253", cfLocalHdrs, false, []string{"203.175.12.253/32"}, ForwardedIPHeaderAuto); got != "172.64.15.9" {
+		t.Fatalf("explicit CIDR allowlist without cloudflare unexpectedly skipped CF hop: got %s want 172.64.15.9", got)
+	}
 }
 
 func TestParseTrustedProxyCIDRsCloudflareShorthandAndHeaderModes(t *testing.T) {

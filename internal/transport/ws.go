@@ -158,6 +158,43 @@ func isLocalProxyAddr(ip netip.Addr) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
+func stripMatchedBrackets(s string) string {
+	if len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func isUsableForwardedClientAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.Zone() != "" {
+		return false
+	}
+	addr = addr.Unmap()
+	return !addr.IsUnspecified() && !addr.IsMulticast()
+}
+
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca == cb {
+			continue
+		}
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // ParseTrustedProxyCIDRs parses a list of IP addresses, CIDR ranges (e.g. "203.0.113.10" or
 // "172.64.0.0/13"), or the "cloudflare" shorthand into canonical netip.Prefix entries,
 // returning any invalid tokens separately.
@@ -196,7 +233,7 @@ func ParseTrustedProxyCIDRs(entries []string) ([]netip.Prefix, []string) {
 			prefixes = append(prefixes, netip.PrefixFrom(addr, bits).Masked())
 			continue
 		}
-		addr, err := netip.ParseAddr(strings.Trim(s, "[]"))
+		addr, err := netip.ParseAddr(stripMatchedBrackets(s))
 		if err != nil {
 			invalid = append(invalid, s)
 			continue
@@ -254,11 +291,17 @@ func parseForwardedClientAddr(raw string) (netip.Addr, bool) {
 	if s == "" {
 		return netip.Addr{}, false
 	}
-	if addr, err := netip.ParseAddr(strings.Trim(s, "[]")); err == nil {
+	if addr, err := netip.ParseAddr(stripMatchedBrackets(s)); err == nil {
+		if !isUsableForwardedClientAddr(addr) {
+			return netip.Addr{}, false
+		}
 		return addr.Unmap(), true
 	}
 	if host, _, err := net.SplitHostPort(s); err == nil {
-		if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		if addr, err := netip.ParseAddr(host); err == nil {
+			if !isUsableForwardedClientAddr(addr) {
+				return netip.Addr{}, false
+			}
 			return addr.Unmap(), true
 		}
 	}
@@ -272,7 +315,7 @@ func parseForwardedClientIP(raw string) net.IP {
 	return nil
 }
 
-func selectXFFClientIP(xffTokens []string, peerIP netip.Addr, trustedCIDRs []netip.Prefix) (ip net.IP, sawTrustedCloudflare bool, foundUntrusted bool) {
+func selectXFFClientIP(xffTokens []string, peerIP netip.Addr, trustedCIDRs []netip.Prefix, trustCloudflareHop bool) (ip net.IP, sawTrustedCloudflare bool, foundUntrusted bool) {
 	if len(xffTokens) == 0 {
 		return nil, false, false
 	}
@@ -284,8 +327,9 @@ func selectXFFClientIP(xffTokens []string, peerIP netip.Addr, trustedCIDRs []net
 			// cannot be trusted behind garbage injected by an untrusted client.
 			break
 		}
-		if (peerIP.IsValid() && addr == peerIP) || isTrustedProxyAddr(addr, trustedCIDRs) {
-			if isCloudflareAddr(addr) {
+		isCF := isCloudflareAddr(addr)
+		if (peerIP.IsValid() && addr == peerIP) || isTrustedProxyAddr(addr, trustedCIDRs) || (trustCloudflareHop && isCF) {
+			if isCF {
 				sawTrustedCloudflare = true
 			}
 			leftmostTrusted = addr
@@ -307,7 +351,9 @@ func selectXFFClientIP(xffTokens []string, peerIP netip.Addr, trustedCIDRs []net
 //     only that configured header without falling back to client-spoofable headers.
 //   - Default "auto" mode:
 //     1. Immediate Cloudflare CDN edge peer: CF-Connecting-IP > X-Forwarded-For (right-to-left)
-//        > X-Real-IP (only when XFF is absent).
+//        > X-Real-IP (only when XFF is absent). If CF-Connecting-IP itself points to a trusted
+//        upstream proxy (e.g. Transit HAProxy -> Cloudflare -> xoga), unwind X-Forwarded-For
+//        right-to-left past trusted proxies so clients do not collapse onto the transit relay IP.
 //     2. Non-Cloudflare trusted proxies (HAProxy, Nginx, Caddy, etc.): right-to-left
 //        X-Forwarded-For unwinding first (falling back to CF-Connecting-IP only if the
 //        trusted XFF chain genuinely traversed a trusted Cloudflare hop with no untrusted
@@ -319,7 +365,7 @@ func selectForwardedClientIP(cfIP, xRealIP string, xffTokens []string, peerAddr 
 	peerIP := extractPeerNetIP(peerAddr)
 	switch mode {
 	case ForwardedIPHeaderXFF:
-		ip, _, _ := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs)
+		ip, _, _ := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs, trustAllForwarded)
 		return ip
 	case ForwardedIPHeaderCF:
 		return parseForwardedClientIP(cfIP)
@@ -328,18 +374,31 @@ func selectForwardedClientIP(cfIP, xRealIP string, xffTokens []string, peerAddr 
 	}
 
 	if isCloudflareAddr(peerIP) {
-		if ip := parseForwardedClientIP(cfIP); ip != nil {
-			return ip
+		if cfAddr, ok := parseForwardedClientAddr(cfIP); ok {
+			if !isTrustedProxyAddr(cfAddr, trustedCIDRs) {
+				return net.IP(cfAddr.AsSlice())
+			}
+			if len(xffTokens) > 0 {
+				if ip, _, _ := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs, true); ip != nil {
+					return ip
+				}
+			}
+			return net.IP(cfAddr.AsSlice())
 		}
 		if len(xffTokens) > 0 {
-			ip, _, _ := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs)
+			ip, _, _ := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs, true)
 			return ip
 		}
 		return parseForwardedClientIP(xRealIP)
 	}
 
 	if len(xffTokens) > 0 {
-		ip, sawTrustedCF, foundUntrusted := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs)
+		// Recognize Cloudflare edge hops inside X-Forwarded-For when trust_forwarded_ip=true
+		// or when behind a zero-config local/private reverse proxy (no explicit trusted_proxy_cidrs
+		// allowlist) that also forwarded a valid CF-Connecting-IP, preserving out-of-the-box
+		// Cloudflare -> local Nginx/Caddy/HAProxy -> xoga without weakening anti-spoofing.
+		trustCFHop := trustAllForwarded || (isLocalProxyAddr(peerIP) && len(trustedCIDRs) == 0 && parseForwardedClientIP(cfIP) != nil)
+		ip, sawTrustedCF, foundUntrusted := selectXFFClientIP(xffTokens, peerIP, trustedCIDRs, trustCFHop)
 		if !foundUntrusted && sawTrustedCF {
 			if cf := parseForwardedClientIP(cfIP); cf != nil {
 				return cf
@@ -429,21 +488,27 @@ func AcceptWebSocketWithTrustedProxies(c net.Conn, expectedPath string, trustAll
 		if line == "" {
 			break
 		}
+		// Ignore obsolete obs-fold continuation lines and enforce strict RFC 9110 §5.1
+		// header field-name matching (no leading/trailing whitespace before ':') to prevent
+		// header-name-whitespace smuggling from overwriting CF-Connecting-IP/X-Real-IP/XFF.
+		if line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
 		k, v, ok := strings.Cut(line, ":")
 		if !ok {
 			continue
 		}
 		v = strings.TrimSpace(v)
-		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "sec-websocket-key":
+		switch {
+		case asciiEqualFold(k, "sec-websocket-key"):
 			wsKey = v
-		case "sec-websocket-protocol":
+		case asciiEqualFold(k, "sec-websocket-protocol"):
 			wsProto = v
-		case "cf-connecting-ip":
+		case asciiEqualFold(k, "cf-connecting-ip"):
 			cfIP = v
-		case "x-real-ip":
+		case asciiEqualFold(k, "x-real-ip"):
 			xRealIP = v
-		case "x-forwarded-for":
+		case asciiEqualFold(k, "x-forwarded-for"):
 			for _, part := range strings.Split(v, ",") {
 				if tok := strings.TrimSpace(part); tok != "" {
 					xffTokens = append(xffTokens, tok)

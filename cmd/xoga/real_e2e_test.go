@@ -1149,6 +1149,272 @@ log_level=info
 		if r10, err := sendVLESS(c10, "spoofed-chained-cf-hop"); err == nil && bytes.Contains(r10, []byte("spoofed-chained-cf-hop")) {
 			t.Fatalf("security regression: attacker spoofed chained Cloudflare hop behind HAProxy!")
 		}
+
+		// Conn 11 Transit HAProxy (203.175.12.253) -> Cloudflare (172.64.15.9) -> xoga for SAME client 198.51.100.77:
+		// Cloudflare sets CF-Connecting-IP to the trusted transit HAProxy IP 203.175.12.253; xoga MUST unwind
+		// XFF past BOTH Cloudflare and trusted HAProxy to 198.51.100.77 (sharing active slot, not collapsing to HAProxy IP)!
+		c11 := dialWS(port781, "/vless", "PROXY TCP4 172.64.15.9 127.0.0.1 21011 8080\r\n",
+			"CF-Connecting-IP: 203.175.12.253\r\nX-Forwarded-For: 8.8.8.8, 198.51.100.77, 203.175.12.253\r\n")
+		defer c11.Close()
+		r11, err := sendVLESS(c11, "transit-haproxy-to-cf-ok")
+		if err != nil || !bytes.Contains(r11, []byte("transit-haproxy-to-cf-ok")) {
+			t.Fatalf("Transit HAProxy->Cloudflare failed to unwind to active client IP: %q err=%v", r11, err)
+		}
+
+		// Conn 12 Transit HAProxy (203.175.12.253) -> Cloudflare (172.64.15.9) -> xoga for DIFFERENT client 198.51.100.93
+		// spoofing leading XFF 198.51.100.77 -> MUST unwind to 198.51.100.93 and reject under device_limit=1!
+		c12 := dialWS(port781, "/vless", "PROXY TCP4 172.64.15.9 127.0.0.1 21012 8080\r\n",
+			"CF-Connecting-IP: 203.175.12.253\r\nX-Forwarded-For: 198.51.100.77, 198.51.100.93, 203.175.12.253\r\n")
+		defer c12.Close()
+		if r12, err := sendVLESS(c12, "transit-haproxy-to-cf-spoof"); err == nil && bytes.Contains(r12, []byte("transit-haproxy-to-cf-spoof")) {
+			t.Fatalf("security regression: Transit HAProxy->Cloudflare allowed spoofed leading XFF!")
+		}
+
+		// Conn 13 RFC 9110 header-name whitespace smuggling on Cloudflare edge peer 172.64.15.9:
+		// real CF-Connecting-IP is 198.51.100.94, attacker injects `CF-Connecting-IP : 198.51.100.77` -> MUST reject!
+		c13 := dialWS(port781, "/vless", "PROXY TCP4 172.64.15.9 127.0.0.1 21013 8080\r\n",
+			"CF-Connecting-IP: 198.51.100.94\r\nCF-Connecting-IP : 198.51.100.77\r\n")
+		defer c13.Close()
+		if r13, err := sendVLESS(c13, "whitespace-smuggle-cf"); err == nil && bytes.Contains(r13, []byte("whitespace-smuggle-cf")) {
+			t.Fatalf("security regression: header-name whitespace smuggling bypassed CF-Connecting-IP!")
+		}
+	})
+
+	// Real HAProxy binary (`mode http` + `option forwardfor` + Unix-socket ingress) forwarding to a real staged xoga binary!
+	t.Run("RealHAProxyForwardForLiveDaemon", func(t *testing.T) {
+		haproxyBin, err := exec.LookPath("haproxy")
+		if err != nil {
+			if _, serr := os.Stat("/usr/local/sbin/haproxy"); serr == nil {
+				haproxyBin = "/usr/local/sbin/haproxy"
+			} else {
+				t.Skip("haproxy binary not installed; skipping real HAProxy E2E subtest")
+			}
+		}
+
+		haPorts := freeUniquePorts(t, "tcp", 2)
+		xogaBackendPort, haproxyFEPort := haPorts[0], haPorts[1]
+		haDir := t.TempDir()
+		// Keep Unix socket path short (<40 bytes) because Linux sun_path is capped at 108 bytes
+		// and HAProxy appends ".<pid>.tmp" when binding Unix sockets.
+		haUnixDir, err := os.MkdirTemp("", "xoga-ha-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(haUnixDir)
+		unixSock := filepath.Join(haUnixDir, "ws.sock")
+
+		// Start a dedicated staged xoga daemon behind real HAProxy with strict forwarded_ip_header=x-forwarded-for.
+		haXogaConf := filepath.Join(haDir, "xoga-ha.conf")
+		haXogaConfText := fmt.Sprintf(`type=sspanel-uim
+server_type=auto
+node_id=781
+listen_ip=127.0.0.1
+listen_port=%d
+webapi_url=%s
+webapi_key=e2e-sspanel-key
+force_close_ssl=true
+proxy_protocol=false
+trust_forwarded_ip=false
+forwarded_ip_header=x-forwarded-for
+device_limit_enable=true
+user_conn_limit=1
+check_interval=60
+submit_interval=60
+log_level=info
+`, xogaBackendPort, panelSrv.URL)
+		if err := os.WriteFile(haXogaConf, []byte(haXogaConfText), 0600); err != nil {
+			t.Fatal(err)
+		}
+		haXogaLogPath := filepath.Join(haDir, "xoga-ha.log")
+		haXogaLogFile, err := os.Create(haXogaLogPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer haXogaLogFile.Close()
+		haXogaCmd := exec.Command(binPath, "run", "-c", haXogaConf)
+		haXogaCmd.Stdout = haXogaLogFile
+		haXogaCmd.Stderr = haXogaLogFile
+		if err := haXogaCmd.Start(); err != nil {
+			t.Fatalf("start staged xoga behind HAProxy: %v", err)
+		}
+		defer func() {
+			if haXogaCmd.Process != nil {
+				_ = haXogaCmd.Process.Kill()
+				_ = haXogaCmd.Wait()
+			}
+		}()
+		waitPort(xogaBackendPort)
+
+		// Launch isolated ephemeral HAProxy (`mode http` + `option forwardfor` + Unix socket, mirroring production haproxy.cfg).
+		haCfgPath := filepath.Join(haDir, "haproxy.cfg")
+		haCfg := fmt.Sprintf(`global
+  maxconn 256
+defaults
+  mode http
+  timeout connect 2s
+  timeout client 10s
+  timeout server 10s
+  option http-server-close
+  option forwardfor
+frontend ws_in
+  bind 127.0.0.1:%d accept-proxy
+  bind unix@%s mode 666
+  default_backend xoga_be
+backend xoga_be
+  mode http
+  option forwardfor
+  server xoga1 127.0.0.1:%d
+`, haproxyFEPort, unixSock, xogaBackendPort)
+		if err := os.WriteFile(haCfgPath, []byte(haCfg), 0600); err != nil {
+			t.Fatal(err)
+		}
+		haLogPath := filepath.Join(haDir, "haproxy.log")
+		haLogFile, err := os.Create(haLogPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer haLogFile.Close()
+		haCmd := exec.Command(haproxyBin, "-W", "-f", haCfgPath)
+		haCmd.Stdout = haLogFile
+		haCmd.Stderr = haLogFile
+		if err := haCmd.Start(); err != nil {
+			t.Fatalf("start ephemeral haproxy: %v", err)
+		}
+		defer func() {
+			if haCmd.Process != nil {
+				_ = haCmd.Process.Signal(syscall.SIGTERM)
+				done := make(chan struct{})
+				go func() {
+					_ = haCmd.Wait()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					_ = haCmd.Process.Kill()
+					<-done
+				}
+			}
+		}()
+
+		// Wait until HAProxy accepts connections on both TCP and Unix socket.
+		haReady := false
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, serr := os.Stat(unixSock); serr == nil {
+				if tc, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", haproxyFEPort), 100*time.Millisecond); derr == nil {
+					_ = tc.Close()
+					haReady = true
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !haReady {
+			haLog, _ := os.ReadFile(haLogPath)
+			t.Fatalf("ephemeral haproxy failed to become ready on 127.0.0.1:%d / %s; log:\n%s", haproxyFEPort, unixSock, haLog)
+		}
+
+		dialViaConn := func(c net.Conn, proxyHdr, extraHdrs string) net.Conn {
+			t.Helper()
+			_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+			req := proxyHdr +
+				"GET /vless HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" +
+				extraHdrs + "\r\n"
+			if _, err := c.Write([]byte(req)); err != nil {
+				t.Fatalf("haproxy ws write: %v", err)
+			}
+			br := bufio.NewReader(c)
+			status, err := br.ReadString('\n')
+			if err != nil || !strings.Contains(status, "101") {
+				haLog, _ := os.ReadFile(haLogPath)
+				xogaLog, _ := os.ReadFile(haXogaLogPath)
+				t.Fatalf("haproxy ws upgrade failed: %q err=%v (haproxy=%s, xoga=%s)", status, err, haLog, xogaLog)
+			}
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil || strings.TrimSpace(line) == "" {
+					break
+				}
+			}
+			return c
+		}
+		dialHA := func(proxyHdr, extraHdrs string) net.Conn {
+			t.Helper()
+			c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", haproxyFEPort), 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial haproxy tcp: %v", err)
+			}
+			return dialViaConn(c, proxyHdr, extraHdrs)
+		}
+		dialHAUnix := func(extraHdrs string) net.Conn {
+			t.Helper()
+			c, err := net.DialTimeout("unix", unixSock, 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial haproxy unix: %v", err)
+			}
+			return dialViaConn(c, "", extraHdrs)
+		}
+		sendVLESSHA := func(c net.Conn, msg string) ([]byte, error) {
+			var b bytes.Buffer
+			b.WriteByte(0x00)
+			b.Write(u1Bytes[:])
+			b.WriteByte(0x00)
+			b.WriteByte(0x01)
+			_ = binary.Write(&b, binary.BigEndian, echoPort)
+			b.WriteByte(0x01)
+			b.Write([]byte{127, 0, 0, 1})
+			b.WriteString(msg)
+			if err := writeWSFrame(c, b.Bytes()); err != nil {
+				return nil, err
+			}
+			return readWSFrame(c)
+		}
+
+		// 1. Real client 198.51.100.77 via real HAProxy -> locks device_limit=1 slot to 198.51.100.77!
+		hc1 := dialHA("PROXY TCP4 198.51.100.77 127.0.0.1 31001 20001\r\n", "")
+		defer hc1.Close()
+		if r, err := sendVLESSHA(hc1, "real-haproxy-user1"); err != nil || !bytes.Contains(r, []byte("real-haproxy-user1")) {
+			t.Fatalf("real HAProxy conn 1 failed: %q err=%v", r, err)
+		}
+
+		// 2. Real attacker 198.51.100.88 via real HAProxy sending duplicate/mixed-case CF-Connecting-IP,
+		//    X-Real-IP, and multi-line X-Forwarded-For spoofing 198.51.100.77 -> HAProxy appends real
+		//    198.51.100.88 as final XFF line -> xoga MUST reject under device_limit=1!
+		hc2 := dialHA("PROXY TCP4 198.51.100.88 127.0.0.1 31002 20001\r\n",
+			"cf-connecting-ip: 198.51.100.77\r\nCF-Connecting-IP: 198.51.100.77\r\nX-Real-IP: 198.51.100.77\r\nX-Forwarded-For: 8.8.8.8\r\nX-Forwarded-For: 198.51.100.77\r\n")
+		defer hc2.Close()
+		if r, err := sendVLESSHA(hc2, "real-haproxy-spoof-v4"); err == nil && bytes.Contains(r, []byte("real-haproxy-spoof-v4")) {
+			t.Fatalf("security regression against real HAProxy: IPv4 attacker bypassed device_limit via spoofed headers!")
+		}
+
+		// 3. Same real client 198.51.100.77 via real HAProxy even with garbage/spoofed CF-Connecting-IP/X-Real-IP
+		//    -> HAProxy appends 198.51.100.77 -> shares active slot!
+		hc3 := dialHA("PROXY TCP4 198.51.100.77 127.0.0.1 31003 20001\r\n",
+			"CF-Connecting-IP: 8.8.8.8\r\nX-Real-IP: 8.8.4.4\r\nX-Forwarded-For: 9.9.9.9\r\n")
+		defer hc3.Close()
+		if r, err := sendVLESSHA(hc3, "real-haproxy-same-user"); err != nil || !bytes.Contains(r, []byte("real-haproxy-same-user")) {
+			t.Fatalf("real HAProxy same-client slot sharing failed: %q err=%v", r, err)
+		}
+
+		// 4. Real IPv6 attacker 2001:db8::88 via real HAProxy spoofing 198.51.100.77 in CF/X-Real-IP/XFF
+		//    -> HAProxy appends `x-forwarded-for: 2001:db8::88` -> xoga MUST reject under device_limit=1!
+		hc4 := dialHA("PROXY TCP6 2001:db8::88 ::1 31004 20001\r\n",
+			"CF-Connecting-IP: 198.51.100.77\r\nX-Real-IP: 198.51.100.77\r\nX-Forwarded-For: 198.51.100.77\r\n")
+		defer hc4.Close()
+		if r, err := sendVLESSHA(hc4, "real-haproxy-spoof-v6"); err == nil && bytes.Contains(r, []byte("real-haproxy-spoof-v6")) {
+			t.Fatalf("security regression against real HAProxy: IPv6 attacker bypassed device_limit via spoofed headers!")
+		}
+
+		// 5. Real Unix-socket ingress (`bind unix@...`, matching ws-tunnel -> /run/haproxy-ws.sock):
+		//    real HAProxy omits X-Forwarded-For completely and forwards client CF-Connecting-IP/X-Real-IP verbatim!
+		//    With forwarded_ip_header=x-forwarded-for, xoga MUST ignore both spoofed headers and reject!
+		hc5 := dialHAUnix("CF-Connecting-IP: 198.51.100.77\r\nX-Real-IP: 198.51.100.77\r\n")
+		defer hc5.Close()
+		if r, err := sendVLESSHA(hc5, "real-haproxy-unix-spoof"); err == nil && bytes.Contains(r, []byte("real-haproxy-unix-spoof")) {
+			t.Fatalf("security regression against real HAProxy Unix socket: spoofed CF-Connecting-IP/X-Real-IP bypassed device_limit!")
+		}
 	})
 
 	// BUG-5: Legacy MD5 VMess client with +81s clock skew succeeds end-to-end!
