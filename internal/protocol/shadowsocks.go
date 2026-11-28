@@ -613,7 +613,7 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 			sess = nil
 		}
 		if exists {
-			sess.lastSeen.Store(time.Now().Unix())
+			sess.lastSeen.Store(time.Now().UnixNano())
 			natMu.Unlock()
 			rcancel()
 		} else {
@@ -645,7 +645,7 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 				return
 			}
 			if existing, ok := sessions[key]; ok && existing.user == matchedUser && bytes.Equal(existing.masterKey, matchedKey) {
-				existing.lastSeen.Store(time.Now().Unix())
+				existing.lastSeen.Store(time.Now().UnixNano())
 				sess = existing
 				natMu.Unlock()
 				_ = natPC.Close()
@@ -661,7 +661,7 @@ func (s *Server) serveShadowsocksUDP(pc net.PacketConn) {
 					sessID:    sessID,
 					masterKey: matchedKey,
 				}
-				sess.lastSeen.Store(time.Now().Unix())
+				sess.lastSeen.Store(time.Now().UnixNano())
 				sessions[key] = sess
 				natMu.Unlock()
 				go s.pipeSSUDPReply(pc, clientAddr, sess, &natMu, sessions, key)
@@ -796,10 +796,7 @@ func (s *Server) pipeSSUDPReply(
 		natMu.Unlock()
 	}()
 
-	idle := time.Duration(s.cfg.UDPIdleSec) * time.Second
-	if idle < 10*time.Second {
-		idle = 60 * time.Second
-	}
+	idle := s.udpIdleDur(10*time.Second, 60*time.Second)
 	cs := s.ssSpec
 	var zeroNonce [12]byte
 
@@ -811,7 +808,7 @@ func (s *Server) pipeSSUDPReply(
 		n, raddr, rbuf, bp, err := relay.ReadPacketZeroIdle(sess.natConn)
 		if err != nil {
 			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idle {
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, sess.lastSeen.Load())) < idle {
 				continue
 			}
 			return
@@ -821,26 +818,31 @@ func (s *Server) pipeSSUDPReply(
 			bufpool.Put(bp)
 			continue
 		}
-		sess.lastSeen.Store(time.Now().Unix())
+		sess.lastSeen.Store(time.Now().UnixNano())
 		if ul := sess.user.EffectiveLimiter(); ul != nil {
 			ul.Wait(n)
 		}
 		s.tracker.NodeLimiter.Wait(n)
 		sess.user.AddDownload(int64(n))
 
-		// Build SOCKS5Addr + payload (guard nil IP from unexpected raddr types)
+		// Build SOCKS5Addr + payload (guard nil/invalid IP from unexpected raddr types)
 		if ua.IP == nil {
 			bufpool.Put(bp)
 			continue
 		}
 		ip4 := ua.IP.To4()
+		ip16 := ua.IP.To16()
+		if ip4 == nil && ip16 == nil {
+			bufpool.Put(bp)
+			continue
+		}
 		plain := make([]byte, 0, 22+n)
 		if ip4 != nil {
 			plain = append(plain, 0x01)
 			plain = append(plain, ip4...)
 		} else {
 			plain = append(plain, 0x04)
-			plain = append(plain, ua.IP.To16()...)
+			plain = append(plain, ip16...)
 		}
 		var pb [2]byte
 		binary.BigEndian.PutUint16(pb[:], uint16(ua.Port))

@@ -116,6 +116,8 @@ func (r *legacyRing) ensureInitLocked() {
 }
 
 func (r *legacyRing) reset() {
+	r.tickMu.Lock()
+	defer r.tickMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.baseTS = 0
@@ -368,11 +370,22 @@ func (r *legacyRing) applyUUIDDiff(added, removed [][16]byte) {
 // advance slides the active window to [now-60, now+60]. For normal small forward slides
 // (typically +1 second per tick), HMAC-MD5 computation runs outside the write lock.
 func (r *legacyRing) advance(now int64) {
+	r.advanceIfOpen(now, nil)
+}
+
+func (r *legacyRing) advanceIfOpen(now int64, stopCh <-chan struct{}) {
 	newStart := now - legacyAuthWindow
 	newEnd := now + legacyAuthWindow
 
 	r.tickMu.Lock()
 	defer r.tickMu.Unlock()
+	if stopCh != nil {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+	}
 
 	// Fast check + snapshot active UUIDs under RLock for small forward slides.
 	r.mu.RLock()
@@ -589,11 +602,26 @@ func diffIndexUUIDs(oldSet map[[16]byte]struct{}, idx *UserIndex) (added, remove
 			added = append(added, id)
 		}
 	}
-	if len(oldSet) > len(idx.VMessByUUID) {
-		for id := range oldSet {
-			if _, ok := idx.VMessByUUID[id]; !ok {
-				delete(oldSet, id)
-				removed = append(removed, id)
+	if len(idx.VMessByUUID) > 0 {
+		if len(oldSet) > len(idx.VMessByUUID) {
+			for id := range oldSet {
+				if _, ok := idx.VMessByUUID[id]; !ok {
+					delete(oldSet, id)
+					removed = append(removed, id)
+				}
+			}
+		}
+	} else {
+		curSet := make(map[[16]byte]struct{}, len(idx.VMessUsers))
+		for i := range idx.VMessUsers {
+			curSet[idx.VMessUsers[i].User.UUIDBytes] = struct{}{}
+		}
+		if len(oldSet) > len(curSet) {
+			for id := range oldSet {
+				if _, ok := curSet[id]; !ok {
+					delete(oldSet, id)
+					removed = append(removed, id)
+				}
 			}
 		}
 	}
@@ -703,7 +731,7 @@ func (m *sharedLegacyManager) runTicker(stopCh chan struct{}) {
 				m.ring.applyUUIDDiff(added, removed)
 			}
 			m.mu.Unlock()
-			m.ring.advance(time.Now().Unix())
+			m.ring.advanceIfOpen(time.Now().Unix(), stopCh)
 		}
 	}
 }

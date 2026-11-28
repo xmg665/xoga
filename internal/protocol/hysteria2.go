@@ -177,8 +177,8 @@ func (h *hy2ConnState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Release old mux session and reset authed before re-authenticating so a failed
 		// re-auth never leaves authed==true with user==nil.
+		h.authed.Store(false)
 		if oldUser := h.user.Swap(nil); oldUser != nil {
-			h.authed.Store(false)
 			oldUser.ReleaseMuxSession(h.sessConnID)
 			h.sessConnID = 0
 		}
@@ -242,6 +242,7 @@ func (s *Server) handleHy2Conn(qconn *quic.Conn) {
 		_ = qconn.CloseWithError(0, "")
 		state.authMu.Lock()
 		state.closed = true
+		state.authed.Store(false)
 		u := state.user.Swap(nil)
 		cid := state.sessConnID
 		state.sessConnID = 0
@@ -438,6 +439,18 @@ func (s *hy2UDPSess) rememberDomain(dst *net.UDPAddr, origAddr string) {
 	s.addrMu.Unlock()
 }
 
+func (s *hy2UDPSess) forgetDomain(dst *net.UDPAddr) {
+	ap, ok := normalizeUDPAddrPort(dst)
+	if !ok {
+		return
+	}
+	s.addrMu.Lock()
+	if s.addrMap != nil {
+		delete(s.addrMap, ap)
+	}
+	s.addrMu.Unlock()
+}
+
 func (s *hy2UDPSess) replyAddrString(raddr net.Addr) string {
 	if ap, ok := normalizeUDPAddrPort(raddr); ok {
 		s.addrMu.RLock()
@@ -460,10 +473,7 @@ type hy2FragAssembly struct {
 }
 
 func (h *hy2ConnState) serveDatagrams() {
-	idleDur := time.Duration(h.srv.cfg.UDPIdleSec) * time.Second
-	if idleDur < 10*time.Second {
-		idleDur = 60 * time.Second
-	}
+	idleDur := h.srv.udpIdleDur(10*time.Second, 60*time.Second)
 
 	var mu sync.Mutex
 	sessions := make(map[hy2UDPKey]*hy2UDPSess)
@@ -596,7 +606,7 @@ func (h *hy2ConnState) serveDatagrams() {
 			us = nil
 		}
 		if exists {
-			us.lastSeen.Store(time.Now().Unix())
+			us.lastSeen.Store(time.Now().UnixNano())
 			mu.Unlock()
 			rcancel()
 		} else {
@@ -627,7 +637,7 @@ func (h *hy2ConnState) serveDatagrams() {
 				return
 			}
 			if existing, ok := sessions[key]; ok && existing.user == user {
-				existing.lastSeen.Store(time.Now().Unix())
+				existing.lastSeen.Store(time.Now().UnixNano())
 				us = existing
 				mu.Unlock()
 				_ = uconn.Close()
@@ -638,7 +648,7 @@ func (h *hy2ConnState) serveDatagrams() {
 					_ = existing.udpConn.Close()
 				}
 				us = &hy2UDPSess{udpConn: uconn, user: user, udpSlotID: slotID}
-				us.lastSeen.Store(time.Now().Unix())
+				us.lastSeen.Store(time.Now().UnixNano())
 				sessions[key] = us
 				mu.Unlock()
 
@@ -654,14 +664,14 @@ func (h *hy2ConnState) serveDatagrams() {
 					}()
 
 					for {
-						if sess.user.IsDisabled() {
+						if cur := h.user.Load(); cur != sess.user || sess.user.IsDisabled() {
 							return
 						}
 						_ = sess.udpConn.SetReadDeadline(time.Now().Add(idleDur))
 						rn, raddr, rbuf, bp, rerr := relay.ReadPacketZeroIdle(sess.udpConn)
 						if rerr != nil {
 							var ne net.Error
-							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sess.lastSeen.Load(), 0)) < idleDur {
+							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, sess.lastSeen.Load())) < idleDur {
 								continue
 							}
 							return
@@ -670,7 +680,11 @@ func (h *hy2ConnState) serveDatagrams() {
 							bufpool.Put(bp)
 							continue
 						}
-						sess.lastSeen.Store(time.Now().Unix())
+						if cur := h.user.Load(); cur != sess.user || sess.user.IsDisabled() {
+							bufpool.Put(bp)
+							return
+						}
+						sess.lastSeen.Store(time.Now().UnixNano())
 						if ul := sess.user.EffectiveLimiter(); ul != nil {
 							ul.Wait(rn)
 						}
@@ -688,6 +702,8 @@ func (h *hy2ConnState) serveDatagrams() {
 
 		if isHostIP != nil {
 			us.rememberDomain(dstUDP, addrStr)
+		} else {
+			us.forgetDomain(dstUDP)
 		}
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(len(payload))

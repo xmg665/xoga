@@ -1145,6 +1145,12 @@ func ParseDNSYAML(content string, defStrat Strategy) ([]upstreamRule, []string) 
 					srv := strings.Trim(item, "\"'")
 					if srv != "" && !strings.Contains(srv, ": ") {
 						defaultServers = append(defaultServers, srv)
+						rules = append(rules, upstreamRule{
+							server:   srv,
+							strategy: defStrat,
+							isCatch:  true,
+							exact:    make(map[string]struct{}),
+						})
 					}
 					continue
 				}

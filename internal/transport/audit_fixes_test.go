@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -168,5 +169,90 @@ func TestL1L2TLSAndRealityEdgeCases(t *testing.T) {
 	}
 	if dest != "[2001:db8::1]:443" {
 		t.Fatalf("unexpected bracketed IPv6 dest: %q", dest)
+	}
+}
+
+func TestL1ACMEBindFailureAutomaticRetry(t *testing.T) {
+	// Occupy a local port so initial ACME listener bind MUST fail.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := blocker.Addr().String()
+
+	acmeHubMu.Lock()
+	origAddr := acmeListenAddr
+	origDelay := acmeRetryDelay
+	acmeListenAddr = addr
+	acmeRetryDelay = 30 * time.Millisecond
+	acmeHubMu.Unlock()
+	defer func() {
+		acmeHubMu.Lock()
+		acmeListenAddr = origAddr
+		acmeRetryDelay = origDelay
+		acmeHubMu.Unlock()
+	}()
+
+	// Single node registers ACME while port is busy -> initial bind fails.
+	_ = registerACMEManager("retry-acme.example.com", t.TempDir())
+	defer unregisterACMEManager("retry-acme.example.com")
+
+	time.Sleep(60 * time.Millisecond) // allow at least one failed bind attempt
+	_ = blocker.Close()               // free the port
+
+	// The existing registration MUST automatically retry and bind the port!
+	cli := &http.Client{Timeout: 300 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, rerr := cli.Get("http://" + addr + "/.well-known/acme-challenge/test-token")
+		if rerr == nil {
+			_ = resp.Body.Close()
+			return
+		}
+		lastErr = rerr
+		time.Sleep(30 * time.Millisecond)
+	}
+	t.Fatalf("ACME HTTP-01 listener never recovered after initial bind failure: %v", lastErr)
+}
+
+type eofOnLastChunkReader struct {
+	data []byte
+}
+
+func (r *eofOnLastChunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestWSConnReadCompletesOnNWithEOF(t *testing.T) {
+	// Build a single binary WS frame + trailing Pong control frame, fed via an io.Reader
+	// that returns (n, io.EOF) on the exact final byte.
+	payload := []byte("ws-eof-final")
+	var wire bytes.Buffer
+	// Pong frame with 2-byte payload (discarded by wsConn) followed by binary frame
+	wire.Write([]byte{0x8A, 0x02, 'o', 'k'})
+	wire.Write([]byte{0x82, byte(len(payload))})
+	wire.Write(payload)
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	wsc := &wsConn{
+		Conn: c1,
+		br:   bufio.NewReaderSize(&eofOnLastChunkReader{data: wire.Bytes()}, 64),
+	}
+	buf := make([]byte, 32)
+	n, err := wsc.Read(buf)
+	if n != len(payload) || string(buf[:n]) != string(payload) {
+		t.Fatalf("expected final WS payload %q on (n, io.EOF), got n=%d %q err=%v", payload, n, buf[:n], err)
 	}
 }

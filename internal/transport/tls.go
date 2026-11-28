@@ -31,11 +31,99 @@ type acmeDomainEntry struct {
 }
 
 var (
-	acmeHubMu    sync.RWMutex
-	acmeManagers = make(map[string]*acmeDomainEntry)
-	acmeServer   *http.Server
-	acmeRefCnt   int
+	acmeHubMu      sync.RWMutex
+	acmeManagers   = make(map[string]*acmeDomainEntry)
+	acmeServer     *http.Server
+	acmeStopCh     chan struct{}
+	acmeRunning    bool
+	acmeRefCnt     int
+	acmeListenAddr = ":80"
+	acmeRetryDelay = 5 * time.Second
 )
+
+func newACMEHTTPServer() *http.Server {
+	return &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			host := r.Host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			host = strings.ToLower(strings.TrimSpace(host))
+			acmeHubMu.RLock()
+			var h http.Handler
+			if e := acmeManagers[host]; e != nil {
+				h = e.handler
+			} else {
+				for _, cand := range acmeManagers {
+					h = cand.handler
+					break
+				}
+			}
+			acmeHubMu.RUnlock()
+			if h != nil {
+				h.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func runACMEHTTPListener(stopCh chan struct{}) {
+	for {
+		acmeHubMu.RLock()
+		stopped := acmeRefCnt <= 0 || acmeStopCh != stopCh
+		addr := acmeListenAddr
+		retryDelay := acmeRetryDelay
+		acmeHubMu.RUnlock()
+		if stopped {
+			return
+		}
+
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			logger.Warnf("ACME HTTP-01 challenge listener (%s) bind failed (retrying in %v): %v", addr, retryDelay, err)
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-stopCh:
+				timer.Stop()
+				return
+			case <-timer.C:
+				continue
+			}
+		}
+
+		srv := newACMEHTTPServer()
+		acmeHubMu.Lock()
+		if acmeRefCnt <= 0 || acmeStopCh != stopCh {
+			acmeHubMu.Unlock()
+			_ = ln.Close()
+			return
+		}
+		acmeServer = srv
+		acmeHubMu.Unlock()
+
+		err = srv.Serve(ln)
+		acmeHubMu.Lock()
+		if acmeServer == srv {
+			acmeServer = nil
+		}
+		stopped = acmeRefCnt <= 0 || acmeStopCh != stopCh
+		acmeHubMu.Unlock()
+		if stopped || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		logger.Warnf("ACME HTTP-01 challenge listener (%s) stopped (retrying in %v): %v", addr, retryDelay, err)
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-stopCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
 
 func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 	key := strings.ToLower(strings.TrimSpace(domain))
@@ -56,52 +144,16 @@ func registerACMEManager(domain, cacheDir string) *autocert.Manager {
 	ent.refs++
 	mgr := ent.mgr
 	acmeRefCnt++
-	needStart := acmeServer == nil
-	var srv *http.Server
-	if needStart {
-		srv = &http.Server{
-			Addr: ":80",
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				host := r.Host
-				if h, _, err := net.SplitHostPort(host); err == nil {
-					host = h
-				}
-				host = strings.ToLower(strings.TrimSpace(host))
-				acmeHubMu.RLock()
-				var h http.Handler
-				if e := acmeManagers[host]; e != nil {
-					h = e.handler
-				} else {
-					for _, cand := range acmeManagers {
-						h = cand.handler
-						break
-					}
-				}
-				acmeHubMu.RUnlock()
-				if h != nil {
-					h.ServeHTTP(w, r)
-					return
-				}
-				http.NotFound(w, r)
-			}),
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-		acmeServer = srv
+	var startStopCh chan struct{}
+	if !acmeRunning {
+		startStopCh = make(chan struct{})
+		acmeStopCh = startStopCh
+		acmeRunning = true
 	}
 	acmeHubMu.Unlock()
 
-	if needStart && srv != nil {
-		go func(s *http.Server) {
-			if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				logger.Warnf("ACME HTTP-01 challenge listener (:80) stopped: %v", err)
-				// Clear global acmeServer pointer so future registrations can retry binding :80.
-				acmeHubMu.Lock()
-				if acmeServer == s {
-					acmeServer = nil
-				}
-				acmeHubMu.Unlock()
-			}
-		}(srv)
+	if startStopCh != nil {
+		go runACMEHTTPListener(startStopCh)
 	}
 	return mgr
 }
@@ -119,11 +171,22 @@ func unregisterACMEManager(domain string) {
 		acmeRefCnt--
 	}
 	var srv *http.Server
-	if acmeRefCnt == 0 && acmeServer != nil {
-		srv = acmeServer
-		acmeServer = nil
+	var stopCh chan struct{}
+	if acmeRefCnt == 0 {
+		if acmeStopCh != nil {
+			stopCh = acmeStopCh
+			acmeStopCh = nil
+		}
+		acmeRunning = false
+		if acmeServer != nil {
+			srv = acmeServer
+			acmeServer = nil
+		}
 	}
 	acmeHubMu.Unlock()
+	if stopCh != nil {
+		close(stopCh)
+	}
 	if srv != nil {
 		_ = srv.Close()
 	}

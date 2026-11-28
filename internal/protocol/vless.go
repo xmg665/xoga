@@ -271,13 +271,10 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 	}
 	defer targetUDP.Close()
 
-	idleDur := time.Duration(s.cfg.UDPIdleSec) * time.Second
-	if idleDur < 10*time.Second {
-		idleDur = 60 * time.Second
-	}
+	idleDur := s.udpIdleDur(10*time.Second, 60*time.Second)
 
 	var lastActive atomic.Int64
-	lastActive.Store(time.Now().Unix())
+	lastActive.Store(time.Now().UnixNano())
 
 	done := make(chan struct{})
 	go func() {
@@ -294,12 +291,12 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 			n, _, err := targetUDP.ReadFrom(buf[2:])
 			if err != nil {
 				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 					continue
 				}
 				return
 			}
-			lastActive.Store(time.Now().Unix())
+			lastActive.Store(time.Now().UnixNano())
 			if ul := user.EffectiveLimiter(); ul != nil {
 				ul.Wait(n)
 			}
@@ -326,11 +323,12 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		rn, err := reader.Read(lb[:1])
 		if rn == 0 {
 			var ne net.Error
-			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 				continue
 			}
 			break
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		if _, err := io.ReadFull(reader, lb[1:]); err != nil {
 			break
 		}
@@ -341,7 +339,7 @@ func (s *Server) handleVLESSUDP(conn net.Conn, reader io.Reader, user *stats.Use
 		if _, err := io.ReadFull(reader, inBuf[:pktLen]); err != nil {
 			break
 		}
-		lastActive.Store(time.Now().Unix())
+		lastActive.Store(time.Now().UnixNano())
 		if ul := user.EffectiveLimiter(); ul != nil {
 			ul.Wait(pktLen)
 		}
@@ -380,12 +378,9 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 	}
 	defer user.ReleaseMuxSession(connID)
 
-	idleDur := time.Duration(s.cfg.UDPIdleSec) * time.Second
-	if idleDur < 10*time.Second {
-		idleDur = 60 * time.Second
-	}
+	idleDur := s.udpIdleDur(10*time.Second, 60*time.Second)
 	muxIdleDur := idleDur
-	if connIdle := time.Duration(s.cfg.ConnIdleSec) * time.Second; connIdle > muxIdleDur {
+	if connIdle := s.connIdleDur(15*time.Second, 60*time.Second); connIdle > muxIdleDur {
 		muxIdleDur = connIdle
 	}
 
@@ -579,6 +574,14 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 				hasAddr = true
 			}
 		} else {
+			if len(lastDests) >= 512 {
+				if _, exists := lastDests[sid]; !exists {
+					for k := range lastDests {
+						delete(lastDests, k)
+						break
+					}
+				}
+			}
 			lastDests[sid] = xudpDest{host: host, port: port}
 		}
 		sessMu.Unlock()
@@ -607,7 +610,7 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 		}
 		us := sessions[key]
 		if us != nil {
-			us.lastSeen.Store(time.Now().Unix())
+			us.lastSeen.Store(time.Now().UnixNano())
 			sessMu.Unlock()
 			rcancel()
 		} else {
@@ -632,13 +635,13 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 				return
 			}
 			if existing := sessions[key]; existing != nil {
-				existing.lastSeen.Store(time.Now().Unix())
+				existing.lastSeen.Store(time.Now().UnixNano())
 				us = existing
 				sessMu.Unlock()
 				_ = pc.Close()
 			} else {
 				us = &xudpSubSession{pc: pc}
-				us.lastSeen.Store(time.Now().Unix())
+				us.lastSeen.Store(time.Now().UnixNano())
 				sessions[key] = us
 				sessMu.Unlock()
 
@@ -663,16 +666,16 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 						rn, raddr, rerr := sub.pc.ReadFrom(rbuf)
 						if rerr != nil {
 							var ne net.Error
-							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(sub.lastSeen.Load(), 0)) < idleDur {
+							if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, sub.lastSeen.Load())) < idleDur {
 								continue
 							}
 							return
 						}
 						ua, ok := raddr.(*net.UDPAddr)
-						if !ok || rn <= 0 {
+						if !ok || ua == nil || ua.IP == nil || rn <= 0 {
 							continue
 						}
-						sub.lastSeen.Store(time.Now().Unix())
+						sub.lastSeen.Store(time.Now().UnixNano())
 						touchMux()
 						if ul := user.EffectiveLimiter(); ul != nil {
 							ul.Wait(rn)
@@ -681,7 +684,10 @@ func (s *Server) handleVLESSMux(conn net.Conn, user *stats.UserEntry, flow strin
 						user.AddDownload(int64(rn))
 
 						frame := encodeXUDPReplyFrame(k.sid, ua, rbuf[:rn])
-						if frame == nil || writeXUDP(frame) != nil {
+						if frame == nil {
+							continue
+						}
+						if writeXUDP(frame) != nil {
 							return
 						}
 					}
@@ -703,6 +709,10 @@ func encodeXUDPReplyFrame(sid uint16, ua *net.UDPAddr, data []byte) []byte {
 		return nil
 	}
 	ip4 := ua.IP.To4()
+	ip16 := ua.IP.To16()
+	if ip4 == nil && ip16 == nil {
+		return nil
+	}
 	metaLen := 4 + 1 + 2 + 1 + 16
 	if ip4 != nil {
 		metaLen = 4 + 1 + 2 + 1 + 4
@@ -722,7 +732,7 @@ func encodeXUDPReplyFrame(sid uint16, ua *net.UDPAddr, data []byte) []byte {
 	} else {
 		out[pos] = 0x03
 		pos++
-		pos += copy(out[pos:], ua.IP.To16())
+		pos += copy(out[pos:], ip16)
 	}
 	binary.BigEndian.PutUint16(out[pos:pos+2], uint16(len(data)))
 	copy(out[pos+2:], data)

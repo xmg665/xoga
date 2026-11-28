@@ -175,9 +175,12 @@ func dialDirectWithDNSAndRoute(
 			}
 			if ip.Is4() {
 				if out.ListenIPv4 != "" {
-					if lip := net.ParseIP(out.ListenIPv4); lip != nil {
-						d.LocalAddr = &net.TCPAddr{IP: lip}
+					lip := net.ParseIP(strings.Trim(out.ListenIPv4, "[]"))
+					if lip == nil || lip.To4() == nil {
+						lastDialErr = fmt.Errorf("invalid outbound listen_ipv4 %q", out.ListenIPv4)
+						continue
 					}
+					d.LocalAddr = &net.TCPAddr{IP: lip}
 				} else if out.ListenIPv6 != "" {
 					// IPv6-only bound route must never leak host default IPv4.
 					lastDialErr = errors.New("outbound route is bound to IPv6 only; refusing unbound IPv4 dial")
@@ -185,9 +188,12 @@ func dialDirectWithDNSAndRoute(
 				}
 			} else if ip.Is6() {
 				if out.ListenIPv6 != "" {
-					if lip := net.ParseIP(out.ListenIPv6); lip != nil {
-						d.LocalAddr = &net.TCPAddr{IP: lip}
+					lip := net.ParseIP(strings.Trim(out.ListenIPv6, "[]"))
+					if lip == nil || lip.To4() != nil {
+						lastDialErr = fmt.Errorf("invalid outbound listen_ipv6 %q", out.ListenIPv6)
+						continue
 					}
+					d.LocalAddr = &net.TCPAddr{IP: lip}
 				} else if out.ListenIPv4 != "" {
 					// IPv4-only bound route must never leak host default IPv6.
 					lastDialErr = errors.New("outbound route is bound to IPv4 only; refusing unbound IPv6 dial")
@@ -214,7 +220,8 @@ func dialDirectWithDNSAndRoute(
 	if !hasStrat {
 		effStrat = resolver.DefaultStrategy()
 	}
-	willFallbackV4 := effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() && !(out.ListenIPv6 != "" && out.ListenIPv4 == "")
+	_, isLiteralIP := netip.ParseAddr(host)
+	willFallbackV4 := isLiteralIP != nil && effStrat == dns.StrategyIPv6First && len(ips) > 0 && ips[0].Is6() && !(out.ListenIPv6 != "" && out.ListenIPv4 == "")
 
 	primaryCtx := dialCtx
 	primaryBudget := timeout
@@ -624,6 +631,9 @@ func (v *vlessClientConn) Read(p []byte) (int, error) {
 			for v.hdrRead < 2 {
 				n, err := v.Conn.Read(v.hdrBuf[v.hdrRead:2])
 				v.hdrRead += n
+				if v.hdrRead >= 2 {
+					break
+				}
 				if err != nil {
 					v.readMu.Unlock()
 					return 0, err
@@ -640,6 +650,9 @@ func (v *vlessClientConn) Read(p []byte) (int, error) {
 			}
 			n, err := v.Conn.Read(discard[:want])
 			v.addonRem -= n
+			if v.addonRem <= 0 {
+				break
+			}
 			if err != nil {
 				v.readMu.Unlock()
 				return 0, err
@@ -855,6 +868,9 @@ func (s *ssClientConn) Write(p []byte) (int, error) {
 func (s *ssClientConn) flushTargetHeaderIfNeeded() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.writeBroken {
+		return errors.New("ss outbound write stream desynchronized after partial write")
+	}
 	if err := s.drainUnsentLocked(); err != nil {
 		return err
 	}
@@ -927,6 +943,9 @@ func (s *ssClientConn) Read(p []byte) (int, error) {
 		for s.saltRead < s.keyLen {
 			n, err := s.Conn.Read(s.saltBuf[s.saltRead:s.keyLen])
 			s.saltRead += n
+			if s.saltRead >= s.keyLen {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -942,6 +961,9 @@ func (s *ssClientConn) Read(p []byte) (int, error) {
 		for s.lenRead < 18 {
 			n, err := s.Conn.Read(s.lenBuf[s.lenRead:18])
 			s.lenRead += n
+			if s.lenRead >= 18 {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -966,6 +988,9 @@ func (s *ssClientConn) Read(p []byte) (int, error) {
 	for s.chunkRead < s.chunkNeed {
 		n, err := s.Conn.Read(enc[s.chunkRead:s.chunkNeed])
 		s.chunkRead += n
+		if s.chunkRead >= s.chunkNeed {
+			break
+		}
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
@@ -1158,6 +1183,9 @@ func (w *wsClientConn) Read(p []byte) (int, error) {
 					n, err := w.br.Read(w.ctrlBuf[w.ctrlRead : w.ctrlRead+int(w.ctrlRem)])
 					w.ctrlRead += n
 					w.ctrlRem -= int64(n)
+					if w.ctrlRem <= 0 {
+						break
+					}
 					if err != nil {
 						return 0, err
 					}
@@ -1181,6 +1209,9 @@ func (w *wsClientConn) Read(p []byte) (int, error) {
 				}
 				n, err := w.br.Read(discardBuf[:want])
 				w.ctrlRem -= int64(n)
+				if w.ctrlRem <= 0 {
+					break
+				}
 				if err != nil {
 					return 0, err
 				}
@@ -1192,6 +1223,9 @@ func (w *wsClientConn) Read(p []byte) (int, error) {
 		for w.hdrRead < 2 {
 			n, err := w.br.Read(w.hdrBuf[w.hdrRead:2])
 			w.hdrRead += n
+			if w.hdrRead >= 2 {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -1211,6 +1245,9 @@ func (w *wsClientConn) Read(p []byte) (int, error) {
 		for w.hdrRead < need {
 			n, err := w.br.Read(w.hdrBuf[w.hdrRead:need])
 			w.hdrRead += n
+			if w.hdrRead >= need {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -1387,18 +1424,34 @@ func DialUDPForRoute(ctx context.Context, route acl.OutboundTarget, preferIPv6 b
 		case "direct", "":
 			if preferIPv6 {
 				if out.ListenIPv6 != "" {
-					if ip := net.ParseIP(out.ListenIPv6); ip != nil {
-						return net.ListenPacket("udp6", net.JoinHostPort(ip.String(), "0"))
+					ip := net.ParseIP(strings.Trim(out.ListenIPv6, "[]"))
+					if ip == nil || ip.To4() != nil {
+						lastErr = fmt.Errorf("invalid UDP route listen_ipv6 %q", out.ListenIPv6)
+						continue
 					}
+					pc, err := net.ListenPacket("udp6", net.JoinHostPort(ip.String(), "0"))
+					if err == nil {
+						return pc, nil
+					}
+					lastErr = err
+					continue
 				} else if out.ListenIPv4 != "" {
 					lastErr = errors.New("UDP route is bound to IPv4 only; refusing unbound IPv6 socket")
 					continue
 				}
 			} else {
 				if out.ListenIPv4 != "" {
-					if ip := net.ParseIP(out.ListenIPv4); ip != nil {
-						return net.ListenPacket("udp4", net.JoinHostPort(ip.String(), "0"))
+					ip := net.ParseIP(strings.Trim(out.ListenIPv4, "[]"))
+					if ip == nil || ip.To4() == nil {
+						lastErr = fmt.Errorf("invalid UDP route listen_ipv4 %q", out.ListenIPv4)
+						continue
 					}
+					pc, err := net.ListenPacket("udp4", net.JoinHostPort(ip.String(), "0"))
+					if err == nil {
+						return pc, nil
+					}
+					lastErr = err
+					continue
 				} else if out.ListenIPv6 != "" {
 					lastErr = errors.New("UDP route is bound to IPv6 only; refusing unbound IPv4 socket")
 					continue

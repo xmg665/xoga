@@ -197,10 +197,7 @@ func (s *Server) runMuxTCPSubSession(
 	sub.connMu.Unlock()
 	defer remoteConn.Close()
 
-	idleDur := time.Duration(s.cfg.ConnIdleSec) * time.Second
-	if idleDur < 15*time.Second {
-		idleDur = 120 * time.Second
-	}
+	idleDur := s.connIdleDur(15*time.Second, 120*time.Second)
 
 	var lastActive atomic.Int64
 	lastActive.Store(time.Now().UnixNano())

@@ -98,10 +98,7 @@ func (s *Server) handleAnyTLS(conn net.Conn) {
 	go sess.runCtrlWriter()
 	defer sess.closeAllStreams()
 
-	idleDur := time.Duration(s.cfg.ConnIdleSec) * time.Second
-	if idleDur < 30*time.Second {
-		idleDur = 120 * time.Second
-	}
+	idleDur := s.connIdleDur(30*time.Second, 120*time.Second)
 
 	var hdr [7]byte
 	for {
@@ -370,7 +367,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 
 	if err := s.user.AcquireSubStream(); err != nil {
 		if s.peerVersion.Load() >= 2 {
-			s.enqueueCtrl(anytlsCmdSYNACK, st.id, []byte(err.Error()))
+			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte(err.Error()))
 		}
 		return
 	}
@@ -380,7 +377,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 	destHost, destPort, err := parseSOCKS5Addr(st)
 	if err != nil {
 		if s.peerVersion.Load() >= 2 {
-			s.enqueueCtrl(anytlsCmdSYNACK, st.id, []byte("invalid destination address"))
+			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte("invalid destination address"))
 		}
 		return
 	}
@@ -439,10 +436,7 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 	}
 	defer remoteConn.Close()
 
-	idleDur := time.Duration(s.srv.cfg.ConnIdleSec) * time.Second
-	if idleDur < 15*time.Second {
-		idleDur = 120 * time.Second
-	}
+	idleDur := s.srv.connIdleDur(15*time.Second, 120*time.Second)
 	relay.PipeBidirectional(st, remoteConn, peeked, s.user, s.srv.tracker.NodeLimiter, idleDur, false)
 }
 
@@ -465,13 +459,10 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		}
 	}
 
-	idleDur := time.Duration(s.srv.cfg.UDPIdleSec) * time.Second
-	if idleDur < 10*time.Second {
-		idleDur = 60 * time.Second
-	}
+	idleDur := s.srv.udpIdleDur(10*time.Second, 60*time.Second)
 
 	var lastActive atomic.Int64
-	lastActive.Store(time.Now().Unix())
+	lastActive.Store(time.Now().UnixNano())
 
 	var writeMu sync.Mutex
 	writeFrameToStream := func(b []byte) error {
@@ -527,7 +518,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 				n, raddr, rerr := pc.ReadFrom(buf)
 				if rerr != nil {
 					var ne net.Error
-					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 						continue
 					}
 					return
@@ -536,7 +527,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 				if !ok || ua == nil || ua.IP == nil {
 					continue
 				}
-				lastActive.Store(time.Now().Unix())
+				lastActive.Store(time.Now().UnixNano())
 				if ul := s.user.EffectiveLimiter(); ul != nil {
 					ul.Wait(n)
 				}
@@ -635,11 +626,12 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 			var af [1]byte
 			rn, rerr := st.Read(af[:])
 			if rn == 0 {
-				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 					continue
 				}
 				break
 			}
+			_ = st.SetReadDeadline(time.Now().Add(idleDur))
 			var aerr error
 			host, port, aerr = readUoTAddrWithAF(st, af[0])
 			if aerr != nil {
@@ -651,11 +643,12 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 		} else {
 			rn, rerr := st.Read(l2[:1])
 			if rn == 0 {
-				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+				if errors.Is(rerr, context.DeadlineExceeded) && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 					continue
 				}
 				break
 			}
+			_ = st.SetReadDeadline(time.Now().Add(idleDur))
 			if _, err := io.ReadFull(st, l2[1:]); err != nil {
 				break
 			}
@@ -669,7 +662,7 @@ func (s *anytlsSession) handleUoTStream(st *anytlsStream, isV2 bool) {
 				break
 			}
 		}
-		lastActive.Store(time.Now().Unix())
+		lastActive.Store(time.Now().UnixNano())
 
 		route := s.srv.aclEng.Load().DecideForNode(s.srv.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {

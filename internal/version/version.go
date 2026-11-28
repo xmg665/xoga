@@ -12,6 +12,6 @@ var (
 )
 
 func Summary() string {
-	ver := strings.TrimPrefix(strings.TrimSpace(Version), "v")
+	ver := strings.TrimLeft(strings.TrimSpace(Version), "vV")
 	return "xoga v" + ver + " (" + runtime.GOOS + "/" + runtime.GOARCH + ", " + runtime.Version() + ", commit " + Commit + ")"
 }

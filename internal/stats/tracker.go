@@ -1050,48 +1050,46 @@ func (r *redisIPLimiter) CheckAndTouch(userID int, ip string, maxIPs int, expiry
 	}
 
 	key := fmt.Sprintf("xoga:ip:%d", userID)
-	rejected := false
-	needZRem := false
 
 	for attempt := 0; attempt < 2; attempt++ {
-		rc, err := r.borrowConn()
+		var rc *redisConn
+		var err error
+		if attempt == 0 {
+			rc, err = r.borrowConn()
+		} else {
+			// Always dial a fresh connection on retry so multiple stale pooled connections
+			// cannot exhaust retries and falsely fail open.
+			rc, err = r.dialConn()
+		}
 		if err != nil {
-			if rejected {
-				return false, nil
-			}
 			return true, err
 		}
-		if needZRem {
-			// Previous attempt already verified cnt > maxIPs and inserted ip; ONLY run ZREM
-			// so retrying never re-runs ZADD and never fails open after rejection.
-			if zerr := rc.execZRem(key, ip); zerr == nil {
-				r.returnConn(rc)
-				return false, nil
-			}
+		allowed, addedNew, err := rc.execPipeline(key, ip, maxIPs, expirySec)
+		if err != nil {
 			rc.close()
 			continue
 		}
-		allowed, addedNew, err := rc.execPipeline(key, ip, maxIPs, expirySec)
-		if err == nil {
-			if !allowed {
-				rejected = true
-				if addedNew {
-					if zerr := rc.execZRem(key, ip); zerr != nil {
-						rc.close()
-						needZRem = true
-						continue
+		if !allowed {
+			if addedNew {
+				if zerr := rc.execZRem(key, ip); zerr != nil {
+					rc.close()
+					// Dedicated retry of ONLY ZREM on a fresh connection so we never re-run
+					// ZADD, never lose the retry after an earlier pipeline reconnect, and never fail open.
+					if fresh, derr := r.dialConn(); derr == nil {
+						if rerr := fresh.execZRem(key, ip); rerr == nil {
+							r.returnConn(fresh)
+						} else {
+							fresh.close()
+						}
 					}
+					return false, nil
 				}
-				r.returnConn(rc)
-				return false, nil
 			}
 			r.returnConn(rc)
-			return true, nil
+			return false, nil
 		}
-		rc.close()
-	}
-	if rejected {
-		return false, nil
+		r.returnConn(rc)
+		return true, nil
 	}
 	return true, errors.New("redis pipeline failed after reconnect")
 }

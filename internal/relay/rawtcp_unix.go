@@ -100,6 +100,9 @@ func tryCopyFromRawTCP(
 
 			_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			nw, werr := writeFull(dst, (*bp)[:nr])
+			if nw > 0 && lastActive != nil {
+				lastActive.Store(time.Now().UnixNano())
+			}
 			if nr < slabSize {
 				bufpool.Put(bp)
 				bp = nil
@@ -130,8 +133,11 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 		bp := bufpool.Get(bufpool.MaxUDPSize)
 		buf := *bp
 		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
+		if err != nil || addr == nil {
 			bufpool.Put(bp)
+			if err == nil {
+				err = errors.New("udp readfrom: nil source address")
+			}
 			return 0, nil, nil, nil, err
 		}
 		return n, addr, buf, bp, nil
@@ -141,8 +147,11 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 		bp := bufpool.Get(bufpool.MaxUDPSize)
 		buf := *bp
 		n, addr, rerr := pc.ReadFrom(buf)
-		if rerr != nil {
+		if rerr != nil || addr == nil {
 			bufpool.Put(bp)
+			if rerr == nil {
+				rerr = errors.New("udp readfrom: nil source address")
+			}
 			return 0, nil, nil, nil, rerr
 		}
 		return n, addr, buf, bp, nil

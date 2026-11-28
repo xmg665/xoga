@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/xmg665/xoga/internal/acl"
+	"github.com/xmg665/xoga/internal/dns"
 	"github.com/xmg665/xoga/internal/limiter"
 )
 
@@ -381,4 +382,294 @@ func TestH4H5M8N10RelaySecurityAndRoutingFixes(t *testing.T) {
 			t.Fatalf("non-PROXY 8-byte payload stalled %v (expected <50ms)", elapsed)
 		}
 	})
+}
+
+func startMockDualStackUDPDNS(t *testing.T, v4 [4]byte, v6 [16]byte) (string, func()) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 16 {
+				continue
+			}
+			qtype := binary.BigEndian.Uint16(buf[n-4 : n-2])
+			resp := make([]byte, 0, n+32)
+			resp = append(resp, buf[0], buf[1], 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00)
+			resp = append(resp, buf[12:n]...)
+			resp = append(resp, 0xC0, 0x0C)
+			var tail [10]byte
+			binary.BigEndian.PutUint16(tail[0:2], qtype)
+			binary.BigEndian.PutUint16(tail[2:4], 1)
+			binary.BigEndian.PutUint32(tail[4:8], 60)
+			if qtype == 1 {
+				binary.BigEndian.PutUint16(tail[8:10], 4)
+				resp = append(resp, tail[:]...)
+				resp = append(resp, v4[:]...)
+			} else if qtype == 28 {
+				binary.BigEndian.PutUint16(tail[8:10], 16)
+				resp = append(resp, tail[:]...)
+				resp = append(resp, v6[:]...)
+			} else {
+				continue
+			}
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().String(), func() { _ = pc.Close() }
+}
+
+func TestM2BlackholedIPv6FallbackToIPv4WithinBudget(t *testing.T) {
+	// Real IPv4 TCP echo listener on 127.0.0.1; AAAA points to RFC 6666 discard/blackhole IPv6 (100::1)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = conn.Write([]byte("V4_FALLBACK_OK"))
+			}(c)
+		}
+	}()
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+
+	// RFC 6666 discard prefix 100::1 (blackholed or unreachable IPv6) + 127.0.0.1 IPv4
+	v6Discard := [16]byte{0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	dnsAddr, stopDNS := startMockDualStackUDPDNS(t, [4]byte{127, 0, 0, 1}, v6Discard)
+	defer stopDNS()
+
+	res := dns.NewResolver("", "", []string{dnsAddr}, "ipv6_first")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	c, err := DialOutbound(ctx, "dualstack-fb.example.com", port, acl.OutboundTarget{Action: acl.ActionDirect}, res, 1200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("M2 ipv6_first -> ipv4_only fallback failed: %v", err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	got, err := io.ReadAll(c)
+	if err != nil || string(got) != "V4_FALLBACK_OK" {
+		t.Fatalf("unexpected IPv4 fallback payload: got %q err=%v", got, err)
+	}
+}
+
+type scriptReadConn struct {
+	net.Conn
+	readBuf    []byte
+	eofOnLast  bool
+	writeLimit int
+	writeCalls int
+}
+
+func (c *scriptReadConn) Read(p []byte) (int, error) {
+	if len(c.readBuf) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.readBuf)
+	c.readBuf = c.readBuf[n:]
+	if len(c.readBuf) == 0 && c.eofOnLast {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (c *scriptReadConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	if c.writeLimit > 0 && len(p) > c.writeLimit {
+		return c.writeLimit, errors.New("simulated partial write error")
+	}
+	return len(p), nil
+}
+
+type nilAddrPacketConn struct {
+	net.PacketConn
+}
+
+func (n *nilAddrPacketConn) ReadFrom(_ []byte) (int, net.Addr, error) {
+	return 4, nil, nil
+}
+
+func TestOutboundWrappersEOFCompletionSSWriteBrokenAndDialUDPFailover(t *testing.T) {
+	// 1. ssClientConn.Read must NOT drop final chunk when underlying Conn.Read returns (remaining, io.EOF)
+	t.Run("ssClientConn_EOFOnFinalChunk", func(t *testing.T) {
+		mk := deriveEVPKey("eof-test-pass", 16)
+		ss := &ssClientConn{
+			keyLen:    16,
+			masterKey: mk,
+		}
+		var srvSalt [16]byte
+		_, _ = rand.Read(srvSalt[:])
+		aead, err := ss.makeSubAEAD(srvSalt[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nonce [12]byte
+		msg := []byte("ss-final-chunk-preserved")
+		var lb [2]byte
+		binary.BigEndian.PutUint16(lb[:], uint16(len(msg)))
+		encLen := aead.Seal(nil, nonce[:], lb[:], nil)
+		incSSNonce(&nonce)
+		encBody := aead.Seal(nil, nonce[:], msg, nil)
+		wire := append(append(srvSalt[:], encLen...), encBody...)
+
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		ss.Conn = &scriptReadConn{Conn: c1, readBuf: wire, eofOnLast: true}
+
+		dst := make([]byte, 64)
+		n, err := ss.Read(dst)
+		if err != nil || string(dst[:n]) != string(msg) {
+			t.Fatalf("ssClientConn dropped final chunk on (n, io.EOF): got %q err=%v", dst[:n], err)
+		}
+	})
+
+	// 2. ssClientConn.flushTargetHeaderIfNeeded MUST reject after Write hit partial write (writeBroken=true)
+	t.Run("ssClientConn_WriteBrokenGuardsFlush", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		sc := &scriptReadConn{Conn: c1, writeLimit: 5}
+		ss := &ssClientConn{
+			Conn:       sc,
+			keyLen:     16,
+			masterKey:  deriveEVPKey("broken-pass", 16),
+			pendingHdr: appendSOCKS5Target(nil, "127.0.0.1", 80),
+		}
+		if _, err := ss.Write([]byte("user-payload")); err == nil {
+			t.Fatal("expected partial write error")
+		}
+		callsAfterWrite := sc.writeCalls
+		if err := ss.flushTargetHeaderIfNeeded(); err == nil {
+			t.Fatal("expected flushTargetHeaderIfNeeded to reject when writeBroken=true")
+		}
+		if sc.writeCalls != callsAfterWrite {
+			t.Fatalf("flushTargetHeaderIfNeeded wrote to wire despite writeBroken=true (calls %d -> %d)", callsAfterWrite, sc.writeCalls)
+		}
+	})
+
+	// 3. vlessClientConn.Read completes header+addon on (n, io.EOF)
+	t.Run("vlessClientConn_EOFOnHeader", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		vc := &vlessClientConn{Conn: &scriptReadConn{Conn: c1, readBuf: []byte{0x00, 0x02, 0xaa, 0xbb}, eofOnLast: true}}
+		var dst [8]byte
+		n, err := vc.Read(dst[:])
+		if n != 0 || err != io.EOF || !vc.readHdr {
+			t.Fatalf("expected clean EOF after completing header+addon, got n=%d err=%v readHdr=%v", n, err, vc.readHdr)
+		}
+	})
+
+	// 4. DialUDPForRoute rejects invalid listen_ipv4/listen_ipv6 AND fails over across multiple direct outbounds
+	t.Run("DialUDPForRoute_InvalidListenAndFailover", func(t *testing.T) {
+		badRoute := acl.OutboundTarget{
+			Action: acl.ActionProxy,
+			Outbounds: []acl.OutboundNode{
+				{Type: "direct", ListenIPv4: "not-an-ip"},
+			},
+		}
+		if pc, err := DialUDPForRoute(context.Background(), badRoute, false, nil); err == nil {
+			_ = pc.Close()
+			t.Fatal("DialUDPForRoute leaked unbound socket on invalid listen_ipv4")
+		}
+		failoverRoute := acl.OutboundTarget{
+			Action: acl.ActionProxy,
+			Outbounds: []acl.OutboundNode{
+				{Type: "direct", ListenIPv4: "203.0.113.254"}, // non-local IP -> bind fails
+				{Type: "direct", ListenIPv4: "127.0.0.1"},     // local loopback -> succeeds!
+			},
+		}
+		pc, err := DialUDPForRoute(context.Background(), failoverRoute, false, nil)
+		if err != nil {
+			t.Fatalf("DialUDPForRoute failed to fail over to 2nd outbound: %v", err)
+		}
+		defer pc.Close()
+		if !strings.HasPrefix(pc.LocalAddr().String(), "127.0.0.1:") {
+			t.Fatalf("expected failover socket bound to 127.0.0.1, got %s", pc.LocalAddr())
+		}
+	})
+
+	// 5. ReadPacketZeroIdle rejects nil addr even on non-*net.UDPConn PacketConn
+	t.Run("ReadPacketZeroIdle_NonUDPConnNilAddr", func(t *testing.T) {
+		if _, addr, _, bp, err := ReadPacketZeroIdle(&nilAddrPacketConn{}); err == nil || addr != nil || bp != nil {
+			t.Fatalf("expected error on nil addr from non-*net.UDPConn, got addr=%v err=%v", addr, err)
+		}
+	})
+}
+
+func TestH3PipeBidirectionalUnidirectionalDownloadRawTCP(t *testing.T) {
+	// Source server streams unidirectional downloads continuously for ~450ms (> 2.5x 150ms idleTimeout)
+	// while client sends ZERO upload bytes. Exercises tryCopyFromRawTCP on remoteConn + shared lastActive!
+	srcLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcLn.Close()
+
+	go func() {
+		c, err := srcLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		chunk := bytes.Repeat([]byte("D"), 1024)
+		for i := 0; i < 11; i++ {
+			if _, err := c.Write(chunk); err != nil {
+				return
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	}()
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyLn.Close()
+
+	go func() {
+		cli, err := proxyLn.Accept()
+		if err != nil {
+			return
+		}
+		defer cli.Close()
+		rem, err := net.Dial("tcp", srcLn.Addr().String())
+		if err != nil {
+			return
+		}
+		defer rem.Close()
+		// Wrap clientConn so splice is disabled and remoteConn (*net.TCPConn) hits tryCopyFromRawTCP!
+		PipeBidirectional(&nonTCPWrapper{Conn: cli}, rem, nil, nil, limiter.NewBucketMbps(0), 150*time.Millisecond, false)
+	}()
+
+	cli, err := net.Dial("tcp", proxyLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	_ = cli.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(cli)
+	if err != nil {
+		t.Fatalf("unidirectional download via tryCopyFromRawTCP failed: %v", err)
+	}
+	if len(got) != 11*1024 {
+		t.Fatalf("expected %d downloaded bytes, got %d", 11*1024, len(got))
+	}
 }

@@ -82,13 +82,10 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 	}
 	defer user.ReleaseSession(connID)
 
-	idleDur := time.Duration(s.cfg.UDPIdleSec) * time.Second
-	if idleDur < 10*time.Second {
-		idleDur = 60 * time.Second
-	}
+	idleDur := s.udpIdleDur(10*time.Second, 60*time.Second)
 
 	var lastActive atomic.Int64
-	lastActive.Store(time.Now().Unix())
+	lastActive.Store(time.Now().UnixNano())
 
 	var writeMu sync.Mutex
 	var sockMu sync.Mutex
@@ -137,7 +134,7 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 				n, raddr, rerr := pc.ReadFrom(buf)
 				if rerr != nil {
 					var ne net.Error
-					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+					if errors.As(rerr, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 						continue
 					}
 					return
@@ -146,7 +143,7 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 				if !ok {
 					continue
 				}
-				lastActive.Store(time.Now().Unix())
+				lastActive.Store(time.Now().UnixNano())
 				if ul := user.EffectiveLimiter(); ul != nil {
 					ul.Wait(n)
 				}
@@ -224,11 +221,12 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		rn, err := conn.Read(atyp[:])
 		if rn == 0 {
 			var ne net.Error
-			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(lastActive.Load(), 0)) < idleDur {
+			if err != nil && errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, lastActive.Load())) < idleDur {
 				continue
 			}
 			break
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(idleDur))
 		host, port, err := parseSOCKS5AddrWithAtyp(conn, atyp[0])
 		if err != nil {
 			break
@@ -244,7 +242,7 @@ func (s *Server) handleTrojanUDP(conn net.Conn, user *stats.UserEntry) {
 		if _, err := io.ReadFull(conn, payload[:pktLen]); err != nil {
 			break
 		}
-		lastActive.Store(time.Now().Unix())
+		lastActive.Store(time.Now().UnixNano())
 
 		route := s.aclEng.Load().DecideForNode(s.cfg.NodeID, host, port, "", "")
 		if route.Action == acl.ActionBlock {

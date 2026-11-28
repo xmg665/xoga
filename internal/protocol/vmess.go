@@ -791,6 +791,9 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 		for v.hdrRead < 2 {
 			n, err := v.reader.Read(v.hdrBytes[v.hdrRead:2])
 			v.hdrRead += n
+			if v.hdrRead >= 2 {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -819,6 +822,9 @@ func (v *vmessStreamConn) readSingleChunk(dst []byte) (int, error) {
 	for v.pendingChunkRead < v.pendingChunkSize {
 		n, err := v.reader.Read(chunk[v.pendingChunkRead:v.pendingChunkSize])
 		v.pendingChunkRead += n
+		if v.pendingChunkRead >= v.pendingChunkSize {
+			break
+		}
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {

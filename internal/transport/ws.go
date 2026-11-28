@@ -334,6 +334,9 @@ func (w *wsConn) Read(p []byte) (int, error) {
 					n, err := w.br.Read(w.ctrlBuf[w.ctrlRead : w.ctrlRead+int(w.ctrlRem)])
 					w.ctrlRead += n
 					w.ctrlRem -= int64(n)
+					if w.ctrlRem <= 0 {
+						break
+					}
 					if err != nil {
 						return 0, err
 					}
@@ -357,6 +360,9 @@ func (w *wsConn) Read(p []byte) (int, error) {
 				}
 				n, err := w.br.Read(discardBuf[:want])
 				w.ctrlRem -= int64(n)
+				if w.ctrlRem <= 0 {
+					break
+				}
 				if err != nil {
 					return 0, err
 				}
@@ -370,6 +376,9 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		for w.hdrRead < 2 {
 			n, err := w.br.Read(w.hdrBuf[w.hdrRead:2])
 			w.hdrRead += n
+			if w.hdrRead >= 2 {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -389,6 +398,9 @@ func (w *wsConn) Read(p []byte) (int, error) {
 		for w.hdrRead < need {
 			n, err := w.br.Read(w.hdrBuf[w.hdrRead:need])
 			w.hdrRead += n
+			if w.hdrRead >= need {
+				break
+			}
 			if err != nil {
 				return 0, err
 			}

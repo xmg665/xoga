@@ -410,3 +410,60 @@ func TestDecodeDNSAnswersQNameQTypeValidationAndFailoverBudget(t *testing.T) {
 		t.Fatalf("expected failover to 2nd DNS server, got ip=%v err=%v", ip, err)
 	}
 }
+
+func TestMixedPlainAndStructuredCatchAllServersOrderingAndFailover(t *testing.T) {
+	udpPlain, stopPlain := startMockUDPDNS(t, [4]byte{198, 51, 100, 10})
+	defer stopPlain()
+	udpNetflix, stopNF := startMockUDPDNS(t, [4]byte{198, 51, 100, 20})
+	defer stopNF()
+	udpStruct, stopStruct := startMockUDPDNS(t, [4]byte{198, 51, 100, 30})
+	defer stopStruct()
+
+	// Case 1: plain server listed FIRST, structured catch-all listed THIRD.
+	// Plain server MUST take priority over the later structured catch-all (not be dropped!).
+	yml1 := `
+servers:
+  - "` + udpPlain + `"
+  - address: "` + udpNetflix + `"
+    domains:
+      - "geosite:netflix"
+  - address: "` + udpStruct + `"
+`
+	f1 := filepath.Join(t.TempDir(), "dns1.yml")
+	if err := os.WriteFile(f1, []byte(yml1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res1 := NewResolver(f1, "", nil, "ipv4_only")
+	ipNF, err := res1.Resolve(context.Background(), "www.netflix.com", 0, false)
+	if err != nil || ipNF.String() != "198.51.100.20" {
+		t.Fatalf("expected netflix explicit rule 198.51.100.20, got %v err=%v", ipNF, err)
+	}
+	ipOther, err := res1.Resolve(context.Background(), "plain-first.example.com", 0, false)
+	if err != nil || ipOther.String() != "198.51.100.10" {
+		t.Fatalf("expected plain first catch-all 198.51.100.10 (must not be dropped by later structured catch-all), got %v err=%v", ipOther, err)
+	}
+
+	// Case 2: dead structured catch-all FIRST, live plain server LAST -> MUST fail over to plain server!
+	deadPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deadPC.Close()
+	yml2 := `
+servers:
+  - address: "` + deadPC.LocalAddr().String() + `"
+  - address: "` + udpNetflix + `"
+    domains:
+      - "geosite:netflix"
+  - "` + udpPlain + `"
+`
+	f2 := filepath.Join(t.TempDir(), "dns2.yml")
+	if err := os.WriteFile(f2, []byte(yml2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res2 := NewResolver(f2, "", nil, "ipv4_only")
+	ipFailover, err := res2.Resolve(context.Background(), "failover-plain.example.com", 0, false)
+	if err != nil || ipFailover.String() != "198.51.100.10" {
+		t.Fatalf("expected failover from dead structured catch-all to trailing plain server, got %v err=%v", ipFailover, err)
+	}
+}

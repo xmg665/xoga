@@ -315,6 +315,32 @@ type Server struct {
 	connsMu     sync.Mutex
 	nextSrvConn uint64
 	activeConns map[uint64]io.Closer
+
+	// testIdleOverride is used solely by unit tests in package protocol to exercise
+	// idle timeout survival paths without waiting 10-30s; always 0 in production.
+	testIdleOverride time.Duration
+}
+
+func (s *Server) connIdleDur(minFloor, fallback time.Duration) time.Duration {
+	if s.testIdleOverride > 0 {
+		return s.testIdleOverride
+	}
+	d := time.Duration(s.cfg.ConnIdleSec) * time.Second
+	if d < minFloor {
+		return fallback
+	}
+	return d
+}
+
+func (s *Server) udpIdleDur(minFloor, fallback time.Duration) time.Duration {
+	if s.testIdleOverride > 0 {
+		return s.testIdleOverride
+	}
+	d := time.Duration(s.cfg.UDPIdleSec) * time.Second
+	if d < minFloor {
+		return fallback
+	}
+	return d
 }
 
 func (s *Server) trackConn(c io.Closer) uint64 {
@@ -647,6 +673,9 @@ func readFullActive(conn net.Conn, r io.Reader, buf []byte, idleDur time.Duratio
 		if n > 0 && lastActive != nil {
 			lastActive.Store(time.Now().UnixNano())
 		}
+		if off >= len(buf) {
+			return nil
+		}
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() && (isDisabled == nil || !isDisabled()) &&
@@ -700,9 +729,15 @@ func udpRouteKey(route acl.OutboundTarget, isIPv6 bool) string {
 		sb.WriteByte(':')
 		sb.WriteString(strconv.Itoa(o.Port))
 		sb.WriteByte(':')
+		sb.WriteString(o.Username)
+		sb.WriteByte(':')
+		sb.WriteString(o.Password)
+		sb.WriteByte(':')
 		sb.WriteString(o.ListenIPv4)
 		sb.WriteByte(':')
 		sb.WriteString(o.ListenIPv6)
+		sb.WriteByte(':')
+		sb.WriteString(o.ListenStrategy)
 	}
 	return sb.String()
 }

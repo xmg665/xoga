@@ -235,6 +235,9 @@ func copyOneWay(
 
 			_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
 			nw, werr := writeFull(dst, buf[:nr])
+			if nw > 0 && lastActive != nil {
+				lastActive.Store(time.Now().UnixNano())
+			}
 			if werr != nil || nw != nr {
 				return
 			}

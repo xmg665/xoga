@@ -3,6 +3,7 @@
 package relay
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"time"
@@ -31,8 +32,11 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 	bp := bufpool.Get(bufpool.MaxUDPSize)
 	buf := *bp
 	n, addr, err := pc.ReadFrom(buf)
-	if err != nil {
+	if err != nil || addr == nil {
 		bufpool.Put(bp)
+		if err == nil {
+			err = errors.New("udp readfrom: nil source address")
+		}
 		return 0, nil, nil, nil, err
 	}
 	return n, addr, buf, bp, nil

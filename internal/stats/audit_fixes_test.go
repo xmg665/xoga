@@ -170,3 +170,122 @@ func TestM9ReconcileUsersEmptyCredAndDuplicateIDDedup(t *testing.T) {
 		t.Fatalf("expected only deduplicated user 10, got entries=%d added=%d updated=%d removed=%d", len(entries), added, updated, removed)
 	}
 }
+
+func TestRedisIPLimiterStalePoolAndZRemRetryOnSecondAttempt(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	zsets := map[string]map[string]int64{
+		"xoga:ip:77": {"1.1.1.1": time.Now().Unix()},
+	}
+	var dropZRemOnce atomic.Bool
+	dropZRemOnce.Store(true)
+	var zaddCount atomic.Int32
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if !strings.HasPrefix(line, "*") {
+						continue
+					}
+					argc, _ := strconv.Atoi(strings.TrimSpace(line[1:]))
+					args := make([]string, 0, argc)
+					for i := 0; i < argc; i++ {
+						hdr, err := br.ReadString('\n')
+						if err != nil {
+							return
+						}
+						n, _ := strconv.Atoi(strings.TrimSpace(hdr[1:]))
+						buf := make([]byte, n+2)
+						if _, err := io.ReadFull(br, buf); err != nil {
+							return
+						}
+						args = append(args, string(buf[:n]))
+					}
+					if len(args) == 0 {
+						continue
+					}
+					switch strings.ToUpper(args[0]) {
+					case "ZREMRANGEBYSCORE":
+						_, _ = conn.Write([]byte(":0\r\n"))
+					case "ZADD":
+						zaddCount.Add(1)
+						mu.Lock()
+						m := zsets[args[1]]
+						if m == nil {
+							m = make(map[string]int64)
+							zsets[args[1]] = m
+						}
+						_, existed := m[args[3]]
+						m[args[3]] = time.Now().Unix()
+						mu.Unlock()
+						if existed {
+							_, _ = conn.Write([]byte(":0\r\n"))
+						} else {
+							_, _ = conn.Write([]byte(":1\r\n"))
+						}
+					case "ZCARD":
+						mu.Lock()
+						cnt := len(zsets[args[1]])
+						mu.Unlock()
+						_, _ = conn.Write([]byte(":" + strconv.Itoa(cnt) + "\r\n"))
+					case "EXPIRE":
+						_, _ = conn.Write([]byte(":1\r\n"))
+					case "ZREM":
+						if dropZRemOnce.CompareAndSwap(true, false) {
+							return // drop connection right after ZADD/ZCARD on attempt 1!
+						}
+						mu.Lock()
+						delete(zsets[args[1]], args[2])
+						mu.Unlock()
+						_, _ = conn.Write([]byte(":1\r\n"))
+					}
+				}
+			}(c)
+		}
+	}()
+
+	cfg := config.Default()
+	cfg.RedisIPLimitAddr = ln.Addr().String()
+	lim := newRedisIPLimiter(cfg)
+
+	// Poison the pool with 3 dead closed connections (simulating Redis restart/idle eviction).
+	// Previously: attempt 0 popped stale #1, attempt 1 popped stale #2 -> failed open!
+	// Even with 1 stale conn: attempt 0 failed pipeline, attempt 1 ran ZADD/ZCARD and then
+	// failed ZREM with NO retries left, polluting Redis ZSET!
+	for i := 0; i < 3; i++ {
+		c1, c2 := net.Pipe()
+		_ = c1.Close()
+		_ = c2.Close()
+		lim.pool <- &redisConn{conn: c1, br: bufio.NewReader(c1)}
+	}
+
+	ok, err := lim.CheckAndTouch(77, "2.2.2.2", 1, 60)
+	if err != nil || ok {
+		t.Fatalf("expected clean rejection (not fail-open) despite stale pool + ZREM drop: ok=%v err=%v", ok, err)
+	}
+	if got := zaddCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 ZADD (never re-run on ZREM retry), got %d", got)
+	}
+	mu.Lock()
+	_, polluted := zsets["xoga:ip:77"]["2.2.2.2"]
+	mu.Unlock()
+	if polluted {
+		t.Fatal("rejected IP 2.2.2.2 polluted Redis ZSET because ZREM retry was lost after stale pool reconnect")
+	}
+}
