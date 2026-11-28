@@ -62,9 +62,54 @@ func readLimitedWSLine(br *bufio.Reader, maxLen int) (string, error) {
 	}
 }
 
-// isTrustedProxyPeer reports whether the immediate TCP peer is loopback or private/link-local
-// (e.g. local Nginx/HAProxy/Caddy/cloudflared), preventing public clients from spoofing X-Forwarded-For / CF-Connecting-IP.
-func isTrustedProxyPeer(addr net.Addr) bool {
+// ParseTrustedProxyCIDRs parses a list of IP addresses or CIDR ranges (e.g. "203.0.113.10" or
+// "172.64.0.0/13") into canonical netip.Prefix entries, returning any invalid tokens separately.
+func ParseTrustedProxyCIDRs(entries []string) ([]netip.Prefix, []string) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	var prefixes []netip.Prefix
+	var invalid []string
+	for _, raw := range entries {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			pfx, err := netip.ParsePrefix(s)
+			if err != nil {
+				invalid = append(invalid, s)
+				continue
+			}
+			addr := pfx.Addr()
+			bits := pfx.Bits()
+			if addr.Is4In6() {
+				addr = addr.Unmap()
+				if bits >= 96 {
+					bits -= 96
+				} else {
+					bits = 0
+				}
+			}
+			prefixes = append(prefixes, netip.PrefixFrom(addr, bits).Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(strings.Trim(s, "[]"))
+		if err != nil {
+			invalid = append(invalid, s)
+			continue
+		}
+		addr = addr.Unmap()
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, invalid
+}
+
+// isTrustedProxyPeer reports whether the immediate TCP peer is loopback, private/link-local
+// (e.g. local Nginx/HAProxy/Caddy/cloudflared), or inside one of trustedCIDRs (e.g. public
+// L7 HTTP relays / Cloudflare CDN ranges), preventing untrusted public clients from spoofing
+// X-Forwarded-For / CF-Connecting-IP / X-Real-IP headers.
+func isTrustedProxyPeer(addr net.Addr, trustedCIDRs []netip.Prefix) bool {
 	if addr == nil {
 		return false
 	}
@@ -78,13 +123,50 @@ func isTrustedProxyPeer(addr net.Addr) bool {
 			ip = parsed.Unmap()
 		}
 	}
-	return ip.IsValid() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	for _, pfx := range trustedCIDRs {
+		if pfx.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseForwardedClientIP(raw string) net.IP {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	if addr, err := netip.ParseAddr(strings.Trim(s, "[]")); err == nil {
+		u := addr.Unmap()
+		return net.IP(u.AsSlice())
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+			u := addr.Unmap()
+			return net.IP(u.AsSlice())
+		}
+	}
+	return nil
 }
 
 // AcceptWebSocket performs a zero-dependency RFC 6455 HTTP Upgrade handshake, supports
 // Xray/Sing-box `Sec-WebSocket-Protocol` base64url Early Data (`?ed=2048`), and extracts
 // real client IPs from CDN/reverse-proxy headers ONLY when the immediate peer is a trusted proxy.
 func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (net.Conn, error) {
+	trustAll := len(trustForwarded) > 0 && trustForwarded[0]
+	return AcceptWebSocketWithTrustedProxies(c, expectedPath, trustAll, nil)
+}
+
+// AcceptWebSocketWithTrustedProxies performs the RFC 6455 WebSocket upgrade and trusts
+// CF-Connecting-IP / X-Real-IP / X-Forwarded-For headers when trustAllForwarded is true or
+// when the immediate peer is loopback/private/link-local or matches trustedCIDRs.
+func AcceptWebSocketWithTrustedProxies(c net.Conn, expectedPath string, trustAllForwarded bool, trustedCIDRs []netip.Prefix) (net.Conn, error) {
 	br := wsReaderPool.Get().(*bufio.Reader)
 	br.Reset(c)
 	reqLine, err := readLimitedWSLine(br, 4096)
@@ -118,7 +200,7 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 		}
 	}
 
-	var wsKey, wsProto, realIPStr string
+	var wsKey, wsProto, cfIP, xRealIP, xffIP string
 	headerBytes := 0
 	for lineCount := 0; ; lineCount++ {
 		if lineCount >= 64 {
@@ -152,17 +234,22 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 		case "sec-websocket-protocol":
 			wsProto = v
 		case "cf-connecting-ip":
-			realIPStr = v
+			cfIP = v
 		case "x-real-ip":
-			if realIPStr == "" {
-				realIPStr = v
-			}
+			xRealIP = v
 		case "x-forwarded-for":
-			if realIPStr == "" {
+			if xffIP == "" {
 				first, _, _ := strings.Cut(v, ",")
-				realIPStr = strings.TrimSpace(first)
+				xffIP = strings.TrimSpace(first)
 			}
 		}
+	}
+	realIPStr := cfIP
+	if realIPStr == "" {
+		realIPStr = xRealIP
+	}
+	if realIPStr == "" {
+		realIPStr = xffIP
 	}
 
 	if wsKey == "" {
@@ -215,9 +302,9 @@ func AcceptWebSocket(c net.Conn, expectedPath string, trustForwarded ...bool) (n
 	_ = c.SetWriteDeadline(time.Time{})
 
 	remoteAddr := c.RemoteAddr()
-	trustHeaders := (len(trustForwarded) > 0 && trustForwarded[0]) || isTrustedProxyPeer(remoteAddr)
+	trustHeaders := trustAllForwarded || isTrustedProxyPeer(remoteAddr, trustedCIDRs)
 	if trustHeaders && realIPStr != "" {
-		if ip := net.ParseIP(realIPStr); ip != nil {
+		if ip := parseForwardedClientIP(realIPStr); ip != nil {
 			port := 0
 			if ta, ok := remoteAddr.(*net.TCPAddr); ok {
 				port = ta.Port

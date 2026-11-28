@@ -9,11 +9,11 @@ import (
 )
 
 // legacyAuthWindow is the accepted clock offset for legacy MD5 AuthIDs. V2Ray-style
-// legacy clients randomize their timestamp by up to ±30 seconds; the extra margin
-// covers client clock drift.
+// legacy clients randomize their timestamp by up to ±30 seconds; matching AEAD's ±120s
+// window covers real-world client clock drift while remaining cheap in the shared noscan ring.
 const (
-	legacyAuthWindow = 60
-	legacyWindowSize = 2*legacyAuthWindow + 1 // 121 per-second buckets
+	legacyAuthWindow = 120
+	legacyWindowSize = 2*legacyAuthWindow + 1 // 241 per-second buckets
 )
 
 // hmacMD5Stamp computes HMAC-MD5(key=uuid, msg=stamp) purely on the stack with
@@ -73,7 +73,7 @@ type legacyActiveUUID struct {
 	uuid [16]byte
 }
 
-// legacyRing stores a sliding 121-second window of pointer-free HMAC-MD5 AuthIDs
+// legacyRing stores a sliding 241-second window of pointer-free HMAC-MD5 AuthIDs
 // indexed by the first 64 bits of the 128-bit AuthID, with full 128-bit verification
 // and collision overflow handling on lookup.
 type legacyRing struct {
@@ -367,7 +367,7 @@ func (r *legacyRing) applyUUIDDiff(added, removed [][16]byte) {
 	}
 }
 
-// advance slides the active window to [now-60, now+60]. For normal small forward slides
+// advance slides the active window to [now-120, now+120]. For normal small forward slides
 // (typically +1 second per tick), HMAC-MD5 computation runs outside the write lock.
 func (r *legacyRing) advance(now int64) {
 	r.advanceIfOpen(now, nil)

@@ -5,6 +5,7 @@ package relay
 import (
 	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -40,4 +41,15 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 		return 0, nil, nil, nil, err
 	}
 	return n, addr, buf, bp, nil
+}
+
+func isNoRouteOrUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "cannot assign requested address") ||
+		strings.Contains(msg, "address family not supported")
 }

@@ -156,18 +156,32 @@ func dialDirectWithDNSAndRoute(
 
 	tryDialCandidates := func(attemptCtx context.Context, cands []netip.Addr, budget time.Duration) (net.Conn, error) {
 		var lastDialErr error
+		var lastV4Err error
 		limit := min(len(cands), 3)
-		perAttempt := budget
-		if limit > 1 && budget > 4*time.Second {
-			// Cap each attempt when multiple candidates exist so one blackholed IP
-			// doesn't exhaust the entire dial budget before trying the next candidate.
-			perAttempt = max(budget/2, 4*time.Second)
-		}
 		for i := 0; i < limit; i++ {
+			if attemptCtx.Err() != nil {
+				break
+			}
 			ip := cands[i].Unmap()
 			if !route.AllowResolvedIP(ip) {
 				lastDialErr = errors.New("resolved IP blocked by ACL/private-IP policy")
 				continue
+			}
+			rem := budget
+			if dl, ok := attemptCtx.Deadline(); ok {
+				if until := time.Until(dl); until < rem {
+					rem = until
+				}
+			}
+			if rem <= 0 {
+				break
+			}
+			perAttempt := rem / time.Duration(limit-i)
+			if perAttempt < 200*time.Millisecond && rem >= 200*time.Millisecond {
+				perAttempt = 200 * time.Millisecond
+			}
+			if perAttempt <= 0 {
+				perAttempt = rem
 			}
 			d := net.Dialer{
 				Timeout:   perAttempt,
@@ -208,10 +222,19 @@ func dialDirectWithDNSAndRoute(
 			if derr == nil {
 				return c, nil
 			}
-			lastDialErr = derr
+			if ip.Is4() {
+				lastV4Err = derr
+				lastDialErr = derr
+			} else if lastV4Err == nil || (!isNoRouteOrUnreachable(derr) && !errors.Is(derr, context.DeadlineExceeded) && !errors.Is(derr, context.Canceled)) {
+				lastDialErr = derr
+			}
 		}
 		if lastDialErr == nil {
-			lastDialErr = errors.New("no dialable IP candidate")
+			if attemptCtx.Err() != nil {
+				lastDialErr = attemptCtx.Err()
+			} else {
+				lastDialErr = errors.New("no dialable IP candidate")
+			}
 		}
 		return nil, lastDialErr
 	}
@@ -267,6 +290,8 @@ func dialDirectWithDNSAndRoute(
 			}
 			if c4, err4 := tryDialCandidates(fbCtx, v4s, fbBudget); err4 == nil {
 				return c4, nil
+			} else if err4 != nil && isNoRouteOrUnreachable(dialErr) {
+				return nil, err4
 			}
 		}
 	}
@@ -389,6 +414,31 @@ func dialProxyTransport(ctx context.Context, out acl.OutboundNode, resolver *dns
 	return conn, nil
 }
 
+func socks5ReplyText(rep byte) string {
+	switch rep {
+	case 0x00:
+		return "succeeded"
+	case 0x01:
+		return "general SOCKS server failure"
+	case 0x02:
+		return "connection not allowed by ruleset"
+	case 0x03:
+		return "network unreachable"
+	case 0x04:
+		return "host unreachable"
+	case 0x05:
+		return "connection refused"
+	case 0x06:
+		return "TTL expired"
+	case 0x07:
+		return "command not supported"
+	case 0x08:
+		return "address type not supported"
+	default:
+		return "unassigned"
+	}
+}
+
 func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string, targetPort uint16, resolver *dns.Resolver, timeout time.Duration) (net.Conn, error) {
 	c, err := dialProxyTransport(ctx, out, resolver, timeout)
 	if err != nil {
@@ -404,9 +454,13 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 		return nil, err
 	}
 	var resp [2]byte
-	if _, err := io.ReadFull(c, resp[:]); err != nil || resp[0] != 0x05 {
+	if _, err := io.ReadFull(c, resp[:]); err != nil {
 		c.Close()
-		return nil, errors.New("socks5 greeting failed")
+		return nil, fmt.Errorf("socks5 greeting read: %w", err)
+	}
+	if resp[0] != 0x05 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 greeting failed: ver=0x%02x method=0x%02x", resp[0], resp[1])
 	}
 	if resp[1] == 0x02 {
 		if len(out.Username) > 255 || len(out.Password) > 255 {
@@ -422,13 +476,17 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 			c.Close()
 			return nil, err
 		}
-		if _, err := io.ReadFull(c, resp[:]); err != nil || resp[1] != 0x00 {
+		if _, err := io.ReadFull(c, resp[:]); err != nil {
 			c.Close()
-			return nil, errors.New("socks5 auth rejected")
+			return nil, fmt.Errorf("socks5 auth read: %w", err)
+		}
+		if resp[1] != 0x00 {
+			c.Close()
+			return nil, fmt.Errorf("socks5 auth rejected: ver=0x%02x status=0x%02x", resp[0], resp[1])
 		}
 	} else if resp[1] != 0x00 {
 		c.Close()
-		return nil, errors.New("socks5 unsupported auth method")
+		return nil, fmt.Errorf("socks5 unsupported auth method: ver=0x%02x method=0x%02x", resp[0], resp[1])
 	}
 
 	req := appendSOCKS5Target(append([]byte(nil), 0x05, 0x01, 0x00), targetHost, targetPort)
@@ -438,9 +496,13 @@ func dialNodeSOCKS5(ctx context.Context, out acl.OutboundNode, targetHost string
 	}
 
 	var rhead [4]byte
-	if _, err := io.ReadFull(c, rhead[:]); err != nil || rhead[1] != 0x00 {
+	if _, err := io.ReadFull(c, rhead[:]); err != nil {
 		c.Close()
-		return nil, errors.New("socks5 connect rejected")
+		return nil, fmt.Errorf("socks5 connect read: %w", err)
+	}
+	if rhead[0] != 0x05 || rhead[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 connect rejected: ver=0x%02x rep=0x%02x (%s)", rhead[0], rhead[1], socks5ReplyText(rhead[1]))
 	}
 	skip := 0
 	switch rhead[3] {
@@ -516,9 +578,13 @@ func dialNodeHTTPConnect(ctx context.Context, out acl.OutboundNode, targetHost s
 	}
 	br := bufio.NewReaderSize(c, 2048)
 	status, err := readBoundedHTTPHeaderLine(br, 4096)
-	if err != nil || (!strings.HasPrefix(status, "HTTP/1.1 200") && !strings.HasPrefix(status, "HTTP/1.0 200")) {
+	if err != nil {
 		c.Close()
-		return nil, errors.New("http connect proxy failed")
+		return nil, fmt.Errorf("http connect proxy read: %w", err)
+	}
+	if !strings.HasPrefix(status, "HTTP/1.1 200") && !strings.HasPrefix(status, "HTTP/1.0 200") {
+		c.Close()
+		return nil, fmt.Errorf("http connect proxy rejected: %q", status)
 	}
 	for hdrCnt := 0; ; hdrCnt++ {
 		if hdrCnt >= 64 {
@@ -1497,9 +1563,13 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 		return nil, err
 	}
 	var resp [2]byte
-	if _, err := io.ReadFull(c, resp[:]); err != nil || resp[0] != 0x05 {
+	if _, err := io.ReadFull(c, resp[:]); err != nil {
 		c.Close()
-		return nil, errors.New("socks5 udp greeting failed")
+		return nil, fmt.Errorf("socks5 udp greeting read: %w", err)
+	}
+	if resp[0] != 0x05 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 udp greeting failed: ver=0x%02x method=0x%02x", resp[0], resp[1])
 	}
 	if resp[1] == 0x02 {
 		auth := make([]byte, 0, 3+len(out.Username)+len(out.Password))
@@ -1511,13 +1581,17 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 			c.Close()
 			return nil, err
 		}
-		if _, err := io.ReadFull(c, resp[:]); err != nil || resp[1] != 0x00 {
+		if _, err := io.ReadFull(c, resp[:]); err != nil {
 			c.Close()
-			return nil, errors.New("socks5 udp auth rejected")
+			return nil, fmt.Errorf("socks5 udp auth read: %w", err)
+		}
+		if resp[1] != 0x00 {
+			c.Close()
+			return nil, fmt.Errorf("socks5 udp auth rejected: ver=0x%02x status=0x%02x", resp[0], resp[1])
 		}
 	} else if resp[1] != 0x00 {
 		c.Close()
-		return nil, errors.New("socks5 udp unsupported auth")
+		return nil, fmt.Errorf("socks5 udp unsupported auth: ver=0x%02x method=0x%02x", resp[0], resp[1])
 	}
 
 	// Send CMD = 0x03 (UDP ASSOCIATE) with 0.0.0.0:0
@@ -1526,9 +1600,13 @@ func dialSOCKS5UDPAssociate(ctx context.Context, out acl.OutboundNode, resolver 
 		return nil, err
 	}
 	var rhead [4]byte
-	if _, err := io.ReadFull(c, rhead[:]); err != nil || rhead[1] != 0x00 {
+	if _, err := io.ReadFull(c, rhead[:]); err != nil {
 		c.Close()
-		return nil, errors.New("socks5 udp associate rejected")
+		return nil, fmt.Errorf("socks5 udp associate read: %w", err)
+	}
+	if rhead[0] != 0x05 || rhead[1] != 0x00 {
+		c.Close()
+		return nil, fmt.Errorf("socks5 udp associate rejected: ver=0x%02x rep=0x%02x (%s)", rhead[0], rhead[1], socks5ReplyText(rhead[1]))
 	}
 	var bndIP net.IP
 	var bndPort int

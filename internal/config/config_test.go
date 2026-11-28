@@ -128,3 +128,58 @@ log_level=false
 		t.Fatalf("empty reality_short_ids= must leave slice empty, got %v", upperCfg.RealityShortIDs)
 	}
 }
+
+func TestTrustedProxyCIDRsAndGCPercentSet(t *testing.T) {
+	// Default config must NOT mark GCPercentSet=true so v2ray_reduce_memory can tune default 100 -> 75.
+	def := Default()
+	if def.GCPercent != 100 || def.GCPercentSet {
+		t.Fatalf("unexpected default GCPercent=%d GCPercentSet=%v", def.GCPercent, def.GCPercentSet)
+	}
+
+	tmp := filepath.Join(t.TempDir(), "xoga.conf")
+	raw := `
+type=sspanel
+node_id=781
+webapi_url=https://panel.example.com
+webapi_key=k
+v2ray_reduce_memory=true
+gc_percent=100
+trusted_proxy_cidrs=203.175.12.253, 172.64.0.0/13, 2606:4700::/32
+`
+	if err := os.WriteFile(tmp, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GCPercentSet || cfg.GCPercent != 100 {
+		t.Fatalf("explicit gc_percent=100 must set GCPercentSet=true, got %d (%v)", cfg.GCPercent, cfg.GCPercentSet)
+	}
+	wantCIDRs := []string{"203.175.12.253", "172.64.0.0/13", "2606:4700::/32"}
+	if len(cfg.TrustedProxyCIDRs) != len(wantCIDRs) {
+		t.Fatalf("TrustedProxyCIDRs mismatch: got %v want %v", cfg.TrustedProxyCIDRs, wantCIDRs)
+	}
+	for i := range wantCIDRs {
+		if cfg.TrustedProxyCIDRs[i] != wantCIDRs[i] {
+			t.Fatalf("TrustedProxyCIDRs[%d]=%q want %q", i, cfg.TrustedProxyCIDRs[i], wantCIDRs[i])
+		}
+	}
+
+	// Verify env var override for TRUSTED_PROXY_CIDRS and XOGA_GC_PERCENT
+	t.Setenv("TRUSTED_PROXY_CIDRS", "43.217.251.51/32,103.147.198.84")
+	t.Setenv("XOGA_GC_PERCENT", "120")
+	cfg.ApplyEnv()
+	if len(cfg.TrustedProxyCIDRs) != 2 || cfg.TrustedProxyCIDRs[0] != "43.217.251.51/32" || cfg.TrustedProxyCIDRs[1] != "103.147.198.84" {
+		t.Fatalf("env override for trusted_proxy_cidrs failed: %v", cfg.TrustedProxyCIDRs)
+	}
+	if cfg.GCPercent != 120 || !cfg.GCPercentSet {
+		t.Fatalf("env override for XOGA_GC_PERCENT failed: %d (%v)", cfg.GCPercent, cfg.GCPercentSet)
+	}
+
+	// CloneForNode must preserve GCPercentSet and TrustedProxyCIDRs
+	cloned := cfg.CloneForNode(782)
+	if !cloned.GCPercentSet || len(cloned.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("CloneForNode dropped GCPercentSet or TrustedProxyCIDRs: %+v", cloned)
+	}
+}

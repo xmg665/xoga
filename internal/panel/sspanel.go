@@ -28,9 +28,17 @@ type cachedDetectEntry struct {
 	expires int64
 }
 
+type detectInflightCall struct {
+	done  chan struct{}
+	rules []string
+	ok    bool
+}
+
 var (
-	detectCacheMu sync.RWMutex
-	detectCache   = make(map[string]cachedDetectEntry)
+	detectCacheMu    sync.RWMutex
+	detectCache      = make(map[string]cachedDetectEntry)
+	detectInflightMu sync.Mutex
+	detectInflight   = make(map[string]*detectInflightCall)
 )
 
 // SSPanelClient implements SSPanel-UIM and SSPanel-Metron `/mod_mu/*` WebAPI endpoints.
@@ -340,17 +348,11 @@ func (c *SSPanelClient) FetchNodeConfig(ctx context.Context) (*NodeSpec, error) 
 	return spec, nil
 }
 
-func (c *SSPanelClient) checkDetectRulesChanged(ctx context.Context) ([]string, bool) {
-	cacheKey := fmt.Sprintf("%s|%s|%d", c.baseURL, c.cfg.WebAPIKey, c.cfg.NodeID)
-	now := time.Now().Unix()
-	detectCacheMu.RLock()
-	_, fresh := detectCache[cacheKey]
-	if fresh && detectCache[cacheKey].expires > now {
-		detectCacheMu.RUnlock()
-		return nil, false
-	}
-	detectCacheMu.RUnlock()
+func (c *SSPanelClient) detectCacheKey() string {
+	return c.baseURL + "|" + c.cfg.WebAPIKey
+}
 
+func (c *SSPanelClient) checkDetectRulesChanged(ctx context.Context) ([]string, bool) {
 	c.mu.Lock()
 	prev := append([]string(nil), c.lastDetectRules...)
 	c.mu.Unlock()
@@ -368,13 +370,16 @@ func (c *SSPanelClient) checkDetectRulesChanged(ctx context.Context) ([]string, 
 }
 
 func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
-	cacheKey := fmt.Sprintf("%s|%s|%d", c.baseURL, c.cfg.WebAPIKey, c.cfg.NodeID)
+	cacheKey := c.detectCacheKey()
 	now := time.Now().Unix()
 
 	detectCacheMu.RLock()
 	if ce, ok := detectCache[cacheKey]; ok && ce.expires > now {
-		rules := ce.rules
+		rules := append([]string(nil), ce.rules...)
 		detectCacheMu.RUnlock()
+		c.mu.Lock()
+		c.lastDetectRules = append([]string(nil), rules...)
+		c.mu.Unlock()
 		return rules
 	}
 	detectCacheMu.RUnlock()
@@ -385,41 +390,88 @@ func (c *SSPanelClient) fetchDetectRules(ctx context.Context) []string {
 		return append([]string(nil), c.lastDetectRules...)
 	}
 
-	body, _, status, err := c.doGet(ctx, c.modURL("/mod_mu/func/detect_rules", true), "")
-	if err != nil {
-		if status == http.StatusNotFound {
-			return nil
+	detectInflightMu.Lock()
+	// Re-check cache after acquiring singleflight lock to avoid duplicate requests across nodes.
+	detectCacheMu.RLock()
+	if ce, ok := detectCache[cacheKey]; ok && ce.expires > time.Now().Unix() {
+		rules := append([]string(nil), ce.rules...)
+		detectCacheMu.RUnlock()
+		detectInflightMu.Unlock()
+		c.mu.Lock()
+		c.lastDetectRules = append([]string(nil), rules...)
+		c.mu.Unlock()
+		return rules
+	}
+	detectCacheMu.RUnlock()
+
+	call, dup := detectInflight[cacheKey]
+	if !dup {
+		call = &detectInflightCall{done: make(chan struct{})}
+		detectInflight[cacheKey] = call
+		reqURL := c.modURL("/mod_mu/func/detect_rules", true)
+		go func() {
+			sfCtx, sfCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer sfCancel()
+
+			body, _, status, err := c.doGet(sfCtx, reqURL, "")
+			if err != nil {
+				if status == http.StatusNotFound {
+					call.rules = nil
+					call.ok = true
+					detectCacheMu.Lock()
+					detectCache[cacheKey] = cachedDetectEntry{
+						rules:   nil,
+						expires: time.Now().Unix() + 300,
+					}
+					detectCacheMu.Unlock()
+				}
+			} else {
+				var resp struct {
+					Ret  int `json:"ret"`
+					Data []struct {
+						Regex string `json:"regex"`
+						Type  int    `json:"type"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(body, &resp) == nil && resp.Ret == 1 {
+					var out []string
+					for _, r := range resp.Data {
+						if r.Regex != "" {
+							out = append(out, "regexp:"+r.Regex)
+						}
+					}
+					call.rules = out
+					call.ok = true
+					detectCacheMu.Lock()
+					detectCache[cacheKey] = cachedDetectEntry{
+						rules:   out,
+						expires: time.Now().Unix() + 300,
+					}
+					detectCacheMu.Unlock()
+				}
+			}
+
+			close(call.done)
+			detectInflightMu.Lock()
+			delete(detectInflight, cacheKey)
+			detectInflightMu.Unlock()
+		}()
+	}
+	detectInflightMu.Unlock()
+
+	select {
+	case <-call.done:
+		if !call.ok {
+			return fallback()
 		}
+		rules := append([]string(nil), call.rules...)
+		c.mu.Lock()
+		c.lastDetectRules = append([]string(nil), rules...)
+		c.mu.Unlock()
+		return rules
+	case <-ctx.Done():
 		return fallback()
 	}
-	var resp struct {
-		Ret  int `json:"ret"`
-		Data []struct {
-			Regex string `json:"regex"`
-			Type  int    `json:"type"`
-		} `json:"data"`
-	}
-	if json.Unmarshal(body, &resp) != nil || resp.Ret != 1 {
-		return fallback()
-	}
-	var out []string
-	for _, r := range resp.Data {
-		if r.Regex != "" {
-			out = append(out, "regexp:"+r.Regex)
-		}
-	}
-
-	c.mu.Lock()
-	c.lastDetectRules = append([]string(nil), out...)
-	c.mu.Unlock()
-
-	detectCacheMu.Lock()
-	detectCache[cacheKey] = cachedDetectEntry{
-		rules:   out,
-		expires: now + 300,
-	}
-	detectCacheMu.Unlock()
-	return out
 }
 
 func parseMetronServerString(srv string, spec *NodeSpec) {

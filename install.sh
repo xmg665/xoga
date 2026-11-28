@@ -145,8 +145,8 @@ install_xoga() {
     done
 
     local installed_ver
-    installed_ver="$(/usr/local/xoga/xoga version 2>/dev/null || echo "latest")"
-    echo -e "${green}xoga v${installed_ver}${plain} 安装完成！"
+    installed_ver="$(/usr/local/xoga/xoga version 2>/dev/null || echo "xoga")"
+    echo -e "${green}${installed_ver}${plain} 安装完成！"
 
     # Always restart any previously active `xoga@*.service` template instances!
     for u in "${active_tpl_units[@]}"; do

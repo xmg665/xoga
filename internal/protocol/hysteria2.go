@@ -64,7 +64,7 @@ func normalizeHy2Obfs(raw string) string {
 func (s *Server) startHysteria2(addr string) error {
 	rawUDP, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		return fmt.Errorf("listen hysteria2 udp %s: %w", addr, err)
+		return fmt.Errorf("hysteria2: %w", err)
 	}
 
 	pktConn := rawUDP
@@ -84,14 +84,12 @@ func (s *Server) startHysteria2(addr string) error {
 		_ = rawUDP.Close()
 		return fmt.Errorf("init hysteria2: unsupported obfs type %q", s.spec.Hy2Obfs)
 	}
-	s.udpConn = pktConn
 
 	tp, err := transport.BuildTLSConfigWithALPN(s.cfg, s.spec.ServerName, []string{http3.NextProtoH3})
 	if err != nil {
 		_ = pktConn.Close()
 		return fmt.Errorf("init hysteria2 TLS: %w", err)
 	}
-	s.tlsProv = tp
 	tlsCfg := tp.Config().Clone()
 	tlsCfg.MinVersion = tls.VersionTLS13
 	tlsCfg.NextProtos = []string{http3.NextProtoH3}
@@ -115,6 +113,8 @@ func (s *Server) startHysteria2(addr string) error {
 		tp.Close()
 		return fmt.Errorf("listen hysteria2 quic %s: %w", addr, err)
 	}
+	s.udpConn = pktConn
+	s.tlsProv = tp
 	s.hy2Transport = qtr
 	s.hy2Listener = qln
 
@@ -339,12 +339,20 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	destPort := uint16(portNum)
 	_ = sc.SetReadDeadline(time.Time{})
 
-	// Pre-check ACL before dialing so blocked targets receive clean Hysteria error status
+	// Pre-check forbidden_ports (and domain-level ACL when domain_sniff cannot rewrite an IP literal)
+	// before peeking so blocked targets receive clean Hysteria error status without a 50ms stall.
 	aclEng := h.srv.aclEng.Load()
-	preRoute := aclEng.DecideForNode(h.srv.cfg.NodeID, host, destPort, "", "")
-	if preRoute.Action == acl.ActionBlock {
+	if aclEng.IsPortForbidden(destPort) {
 		_ = writeHy2TCPResponse(sc, false, "blocked by policy")
 		return
+	}
+	_, hostIsIP := netip.ParseAddr(host)
+	if hostIsIP != nil || !(h.srv.cfg.DomainSniff || h.srv.cfg.ForceDomainSniff) {
+		preRoute := aclEng.DecideForNode(h.srv.cfg.NodeID, host, destPort, "", "")
+		if preRoute.Action == acl.ActionBlock {
+			_ = writeHy2TCPResponse(sc, false, "blocked by policy")
+			return
+		}
 	}
 
 	// Peek any 0-RTT initial payload (bounded 50ms wait so wait-for-response clients aren't delayed)
@@ -355,19 +363,11 @@ func (h *hy2ConnState) handleTCPStream(qstr *quic.Stream) {
 	}
 
 	sn := sniff.Inspect(peeked)
-	route := aclEng.DecideForNode(h.srv.cfg.NodeID, host, destPort, sn.Domain, sn.Protocol)
+	effectiveHost := h.srv.resolveEffectiveHost(host, sn.Domain)
+	route := aclEng.DecideForNode(h.srv.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		_ = writeHy2TCPResponse(sc, false, "blocked by policy")
 		return
-	}
-
-	effectiveHost := host
-	if sn.Domain != "" && h.srv.cfg.DomainSniff {
-		if _, isIP := netip.ParseAddr(host); isIP == nil {
-			if h.srv.cfg.ForceDomainSniff || route.IsRemoteProxy || h.srv.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
-				effectiveHost = sn.Domain
-			}
-		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(h.qconn.Context(), 10*time.Second)

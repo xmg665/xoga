@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -152,6 +151,12 @@ func (s *Server) runMuxTCPSubSession(
 		return
 	}
 
+	aclEng := s.aclEng.Load()
+	if aclEng.IsPortForbidden(destPort) {
+		_ = writeFrame(encodeMuxTCPEndFrame(sid, true))
+		return
+	}
+
 	// Peek first queued payload (up to 60ms if not already sent with SessionStatusNew) for SNI/HTTP domain sniffing
 	var firstChunk []byte
 	select {
@@ -163,20 +168,11 @@ func (s *Server) runMuxTCPSubSession(
 	}
 
 	sn := sniff.Inspect(firstChunk)
-	aclEng := s.aclEng.Load()
-	route := aclEng.DecideForNode(s.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
+	effectiveHost := s.resolveEffectiveHost(destHost, sn.Domain)
+	route := aclEng.DecideForNode(s.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		_ = writeFrame(encodeMuxTCPEndFrame(sid, true))
 		return
-	}
-
-	effectiveHost := destHost
-	if sn.Domain != "" && s.cfg.DomainSniff {
-		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
-			if s.cfg.ForceDomainSniff || route.IsRemoteProxy || s.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
-				effectiveHost = sn.Domain
-			}
-		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

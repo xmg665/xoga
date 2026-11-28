@@ -6,12 +6,13 @@ import (
 	"crypto/hmac"
 	"crypto/md5"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"time"
 )
 
-// Legacy authentication is limited to explicitly configured users. The
-// 30-second window covers legacy clients that randomize their timestamps.
+// Legacy authentication is limited to explicitly configured users. The ±120-second
+// window matches AEAD and covers legacy clients that randomize timestamps plus clock drift.
 // M4 fix: cap alterID iteration count at 16 to limit CPU cost from probe traffic.
 func (s *Server) readLegacyVMessHeader(idx *UserIndex, reader io.Reader, authID [16]byte) (*VMessUserEntry, []byte) {
 	now := time.Now().Unix()
@@ -26,14 +27,10 @@ func (s *Server) readLegacyVMessHeader(idx *UserIndex, reader io.Reader, authID 
 		}
 		id := entry.User.UUIDBytes
 		for n := 0; n <= count; n++ {
-			mac := hmac.New(md5.New, id[:])
 			var stamp [8]byte
-			var tag [16]byte
-			for ts := now - 30; ts <= now+30; ts++ {
+			for ts := now - legacyAuthWindow; ts <= now+legacyAuthWindow; ts++ {
 				binary.BigEndian.PutUint64(stamp[:], uint64(ts))
-				mac.Reset()
-				_, _ = mac.Write(stamp[:])
-				mac.Sum(tag[:0])
+				tag := hmacMD5Stamp(id, stamp)
 				if hmac.Equal(authID[:], tag[:]) {
 					header, err := decodeLegacyVMessHeader(reader, entry.CmdKey, stamp)
 					if err != nil {
@@ -97,7 +94,7 @@ func decodeLegacyVMessHeader(reader io.Reader, key [16]byte, stamp [8]byte) ([]b
 		case 3:
 			end += 16
 		default:
-			return nil, io.ErrUnexpectedEOF
+			return nil, fmt.Errorf("invalid legacy atyp=0x%02x ver=0x%02x cmd=0x%02x", header[40], header[0], header[37])
 		}
 	}
 	total := end + int(header[35]>>4) + 4

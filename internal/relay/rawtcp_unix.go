@@ -208,3 +208,10 @@ func ReadPacketZeroIdle(pc net.PacketConn) (int, net.Addr, []byte, *[]byte, erro
 	}
 	return nr, raddr, *bp, bp, nil
 }
+
+func isNoRouteOrUnreachable(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		errors.Is(err, syscall.EAFNOSUPPORT)
+}

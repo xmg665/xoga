@@ -391,14 +391,24 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 		return
 	}
 
-	// Pre-check ACL on destination host/port so blocked targets receive clean v2 SYNACK error immediately
+	// Pre-check forbidden_ports (and domain-level ACL when domain_sniff cannot rewrite an IP literal)
+	// so blocked targets receive clean v2 SYNACK error immediately without blocking Fake-IP / GFW-poisoned SNI.
 	aclEng := s.srv.aclEng.Load()
-	preRoute := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, "", "")
-	if preRoute.Action == acl.ActionBlock {
+	if aclEng.IsPortForbidden(destPort) {
 		if s.peerVersion.Load() >= 2 {
 			_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte("blocked by audit policy"))
 		}
 		return
+	}
+	_, hostIsIP := netip.ParseAddr(destHost)
+	if hostIsIP != nil || !(s.srv.cfg.DomainSniff || s.srv.cfg.ForceDomainSniff) {
+		preRoute := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, "", "")
+		if preRoute.Action == acl.ActionBlock {
+			if s.peerVersion.Load() >= 2 {
+				_ = s.writeFrame(anytlsCmdSYNACK, st.id, []byte("blocked by audit policy"))
+			}
+			return
+		}
 	}
 
 	// Acknowledge stream (v=2) BEFORE peeking so AnyTLS v2 clients transmit their first payload
@@ -414,18 +424,10 @@ func (s *anytlsSession) serveStream(st *anytlsStream) {
 		return
 	}
 	sn := sniff.Inspect(peeked)
-	route := aclEng.DecideForNode(s.srv.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
+	effectiveHost := s.srv.resolveEffectiveHost(destHost, sn.Domain)
+	route := aclEng.DecideForNode(s.srv.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
 		return
-	}
-
-	effectiveHost := destHost
-	if sn.Domain != "" && s.srv.cfg.DomainSniff {
-		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
-			if s.srv.cfg.ForceDomainSniff || route.IsRemoteProxy || s.srv.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
-				effectiveHost = sn.Domain
-			}
-		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

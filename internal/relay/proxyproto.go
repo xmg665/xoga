@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -33,13 +34,14 @@ func (l *ProxyProtoListener) Accept() (net.Conn, error) {
 
 type proxyProtoConn struct {
 	net.Conn
-	requireHdr bool
-	parseOnce  sync.Once
-	parseErr   error
-	remoteAddr net.Addr
-	readMu     sync.Mutex
-	leftover   []byte
-	drained    atomic.Bool
+	requireHdr   bool
+	parseTimeout time.Duration // defaults to 5s when <= 0
+	parseOnce    sync.Once
+	parseErr     error
+	remoteAddr   net.Addr
+	readMu       sync.Mutex
+	leftover     []byte
+	drained      atomic.Bool
 }
 
 func (p *proxyProtoConn) ensureParsed() error {
@@ -112,17 +114,28 @@ func (p *proxyProtoConn) Read(b []byte) (int, error) {
 	return p.Conn.Read(b)
 }
 
-func (p *proxyProtoConn) parseHeader() error {
-	_ = p.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	// Restore a bounded 12s handshake deadline (instead of infinite time.Time{}) so post-PROXY
-	// TLS/WS/protocol Slowloris stalls always time out cleanly!
-	defer func() { _ = p.Conn.SetReadDeadline(time.Now().Add(12 * time.Second)) }()
+func (p *proxyProtoConn) parseHeader() (retErr error) {
+	timeout := p.parseTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	_ = p.Conn.SetReadDeadline(time.Now().Add(timeout))
+	// Restore a bounded 12s handshake deadline ONLY when header parsing succeeds;
+	// on read error (EOF, reset, timeout, or rejected required header) never extend the deadline.
+	defer func() {
+		if retErr == nil {
+			_ = p.Conn.SetReadDeadline(time.Now().Add(12 * time.Second))
+		}
+	}()
 
 	var hdr [16]byte
 	n, err := io.ReadAtLeast(p.Conn, hdr[:], 6)
 	if err != nil {
 		if p.requireHdr {
-			return errors.New("missing required PROXY protocol header")
+			return fmt.Errorf("missing required PROXY protocol header: %w", err)
+		}
+		if n == 0 || isNetTimeout(err) {
+			return err
 		}
 		p.leftover = append(p.leftover, hdr[:n]...)
 		return nil

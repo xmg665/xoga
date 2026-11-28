@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"io"
@@ -244,8 +245,8 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	}
 
 	var authID [16]byte
-	if _, err := io.ReadFull(br, authID[:]); err != nil {
-		return nil, nil, "", 0, 0, "read_authid"
+	if n, err := io.ReadFull(br, authID[:]); err != nil {
+		return nil, nil, "", 0, 0, fmt.Sprintf("read_authid n=%d err=%v", n, err)
 	}
 
 	idx := s.userIdx.Load()
@@ -324,7 +325,7 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 			}
 			hdr, err := decodeLegacyVMessHeader(br, entry.CmdKey, stamp)
 			if err != nil {
-				return nil, nil, "", 0, 0, "legacy_header"
+				return nil, nil, "", 0, 0, fmt.Sprintf("legacy_header user=%d err=%v", entry.User.ID, err)
 			}
 			return s.finishVMessHandshake(conn, br, entry, hdr, true)
 		}
@@ -352,8 +353,8 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 
 	// Read 18-byte encrypted header length + 8-byte connection nonce
 	var encLenAndNonce [26]byte
-	if _, err := io.ReadFull(br, encLenAndNonce[:]); err != nil {
-		return nil, nil, "", 0, 0, "read_header_len"
+	if n, err := io.ReadFull(br, encLenAndNonce[:]); err != nil {
+		return nil, nil, "", 0, 0, fmt.Sprintf("read_header_len user=%d n=%d err=%v", matched.User.ID, n, err)
 	}
 	encHdrLen := encLenAndNonce[:18]
 	connNonce := encLenAndNonce[18:26]
@@ -370,11 +371,11 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	}
 	var hdrLenBytes [2]byte
 	if _, err := lenGCM.Open(hdrLenBytes[:0], lenNonce[:12], encHdrLen, authID[:]); err != nil {
-		return nil, nil, "", 0, 0, "header_len_decrypt"
+		return nil, nil, "", 0, 0, fmt.Sprintf("header_len_decrypt user=%d err=%v", matched.User.ID, err)
 	}
 	hdrLen := int(binary.BigEndian.Uint16(hdrLenBytes[:])) + 16
 	if hdrLen <= 16 || hdrLen > 2048 {
-		return nil, nil, "", 0, 0, "header_len_invalid"
+		return nil, nil, "", 0, 0, fmt.Sprintf("header_len_invalid user=%d hdrLen=%d", matched.User.ID, hdrLen)
 	}
 
 	var stackHdr [512]byte
@@ -384,8 +385,8 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	} else {
 		encHdr = make([]byte, hdrLen)
 	}
-	if _, err := io.ReadFull(br, encHdr); err != nil {
-		return nil, nil, "", 0, 0, "read_header"
+	if n, err := io.ReadFull(br, encHdr); err != nil {
+		return nil, nil, "", 0, 0, fmt.Sprintf("read_header user=%d hdrLen=%d n=%d err=%v", matched.User.ID, hdrLen, n, err)
 	}
 
 	payKey := vmessKDF3(matched.CmdKey[:], kdfSaltHdrKey, authID[:], connNonce)
@@ -400,19 +401,22 @@ func (s *Server) handshakeVMess(conn net.Conn) (*vmessStreamConn, *stats.UserEnt
 	}
 	hdrPlain, err := payGCM.Open(encHdr[:0], payNonce[:12], encHdr, authID[:])
 	if err != nil {
-		return nil, nil, "", 0, 0, "header_decrypt"
+		return nil, nil, "", 0, 0, fmt.Sprintf("header_decrypt legacy=false user=%d hdrLen=%d err=%v", matched.User.ID, hdrLen, err)
 	}
 	return s.finishVMessHandshake(conn, br, matched, hdrPlain, false)
 }
 
 func (s *Server) finishVMessHandshake(conn net.Conn, br io.Reader, matched *VMessUserEntry, hdrPlain []byte, legacy bool) (*vmessStreamConn, *stats.UserEntry, string, uint16, byte, string) {
 	if len(hdrPlain) < 42 {
-		return nil, nil, "", 0, 0, "header_too_short"
+		return nil, nil, "", 0, 0, fmt.Sprintf("header_too_short legacy=%v user=%d hdrLen=%d", legacy, matched.User.ID, len(hdrPlain))
 	}
 
 	// Verify FNV1a32 checksum at end of VMess command header
-	if fnv1a32(hdrPlain[:len(hdrPlain)-4]) != binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:]) || hdrPlain[0] != 0x01 {
-		return nil, nil, "", 0, 0, "header_checksum"
+	wantSum := fnv1a32(hdrPlain[:len(hdrPlain)-4])
+	gotSum := binary.BigEndian.Uint32(hdrPlain[len(hdrPlain)-4:])
+	if wantSum != gotSum || hdrPlain[0] != 0x01 {
+		return nil, nil, "", 0, 0, fmt.Sprintf("header_checksum legacy=%v user=%d ver=0x%02x cmd=0x%02x hdrLen=%d got=0x%08x want=0x%08x",
+			legacy, matched.User.ID, hdrPlain[0], hdrPlain[37], len(hdrPlain), gotSum, wantSum)
 	}
 
 	var reqBodyIV, reqBodyKey [16]byte

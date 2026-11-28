@@ -288,13 +288,14 @@ func evpBytesToKey(password string, keyLen int) []byte {
 
 // Server manages the active TCP/TLS/WS listener and UDP packet listener for a node.
 type Server struct {
-	cfg      *config.Config
-	spec     *panel.NodeSpec
-	tracker  *stats.Tracker
-	dnsRes   *dns.Resolver
-	ssSpec   ssCipherSpec
-	ssPSK    []byte
-	ssPSKBlk cipher.Block
+	cfg               *config.Config
+	spec              *panel.NodeSpec
+	tracker           *stats.Tracker
+	dnsRes            *dns.Resolver
+	ssSpec            ssCipherSpec
+	ssPSK             []byte
+	ssPSKBlk          cipher.Block
+	trustedProxyCIDRs []netip.Prefix
 
 	ipHints ipHintCache
 	hotRing hotUserRing
@@ -382,11 +383,16 @@ func NewServer(cfg *config.Config, spec *panel.NodeSpec, tracker *stats.Tracker,
 	} else {
 		res = dns.NewResolver(cfg.DNSConfigPath, cfg.DNSConfigURL, cfg.DefaultDNS, cfg.DNSStrategy)
 	}
+	trustedCIDRs, invalidCIDRs := transport.ParseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs)
+	if len(invalidCIDRs) > 0 {
+		logger.Warnf("[node %d] Ignoring invalid trusted_proxy_cidrs entries: %v", cfg.NodeID, invalidCIDRs)
+	}
 	s := &Server{
-		cfg:     cfg,
-		spec:    spec,
-		tracker: tracker,
-		dnsRes:  res,
+		cfg:               cfg,
+		spec:              spec,
+		tracker:           tracker,
+		dnsRes:            res,
+		trustedProxyCIDRs: trustedCIDRs,
 	}
 	s.aclEng.Store(initialACL)
 
@@ -454,7 +460,7 @@ func (s *Server) Start() error {
 
 	rawLn, err := listenTCP(context.Background(), addr)
 	if err != nil {
-		return fmt.Errorf("listen tcp %s: %w", addr, err)
+		return err
 	}
 
 	ln := rawLn
@@ -583,7 +589,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	if s.spec.Network == "ws" {
 		// Never conflate L4 ProxyProtocol with L7 HTTP forwarded headers: L4 relays pass
 		// real client IP via PROXY header and do not strip client-spoofed CF-Connecting-IP/XFF.
-		wsConn, err := transport.AcceptWebSocket(conn, s.spec.WSPath, s.cfg.TrustForwardedIP)
+		// Trust forwarded headers only when trust_forwarded_ip=true, peer is loopback/private,
+		// or peer matches explicitly configured trusted_proxy_cidrs.
+		wsConn, err := transport.AcceptWebSocketWithTrustedProxies(conn, s.spec.WSPath, s.cfg.TrustForwardedIP, s.trustedProxyCIDRs)
 		if err != nil {
 			logger.Debugf("ws upgrade failed from %s: %v", conn.RemoteAddr(), err)
 			return
@@ -756,6 +764,20 @@ func (s *Server) connectAndRelay(clientConn net.Conn, user *stats.UserEntry, des
 	s.connectStreamNoAcquire(clientConn, user, destHost, destPort, preread, nil)
 }
 
+// resolveEffectiveHost applies Soga/Xray-compatible domain_sniff (`destOverride: ["http","tls"]`,
+// `routeOnly=false`): whenever domain_sniff (or force_domain_sniff) is enabled, destHost is a
+// literal IP, and a valid non-IP SNI/HTTP Host was sniffed, override effectiveHost with
+// sniffDomain BEFORE ACL and literal ban_private_ip checks so Clash Fake-IPs (198.18.0.0/15),
+// GFW-poisoned IPs (127.0.0.1 / 0.0.0.1), and unreachable IPv6 literals resolve via DNS.
+func (s *Server) resolveEffectiveHost(destHost, sniffDomain string) string {
+	if sniffDomain != "" && (s.cfg.DomainSniff || s.cfg.ForceDomainSniff) {
+		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
+			return sniffDomain
+		}
+	}
+	return destHost
+}
+
 func (s *Server) connectStreamNoAcquire(
 	clientConn net.Conn,
 	user *stats.UserEntry,
@@ -767,6 +789,19 @@ func (s *Server) connectStreamNoAcquire(
 	if user == nil || user.IsDisabled() {
 		if onDial != nil {
 			onDial(stats.ErrUserDisabled)
+		}
+		return
+	}
+
+	// Short-circuit O(1) forbidden_ports BEFORE the 150ms peekInitialPayload wait so
+	// server-first protocols (IMAP/POP3/SMTP) on blocked ports never stall 150ms.
+	// Do NOT evaluate ban_private_ip before peeking, so Clash Fake-IP / GFW-poisoned
+	// literal IPs with valid TLS SNI / HTTP Host still get rewritten by domain_sniff!
+	aclEng := s.aclEng.Load()
+	if aclEng.IsPortForbidden(destPort) {
+		logger.Debugf("blocked user=%d dest=%s:%d rule=forbidden-port", user.ID, destHost, destPort)
+		if onDial != nil {
+			onDial(errors.New("blocked by audit policy"))
 		}
 		return
 	}
@@ -783,23 +818,14 @@ func (s *Server) connectStreamNoAcquire(
 	}
 
 	sn := sniff.Inspect(peeked)
-	aclEng := s.aclEng.Load()
-	route := aclEng.DecideForNode(s.cfg.NodeID, destHost, destPort, sn.Domain, sn.Protocol)
+	effectiveHost := s.resolveEffectiveHost(destHost, sn.Domain)
+	route := aclEng.DecideForNode(s.cfg.NodeID, effectiveHost, destPort, sn.Domain, sn.Protocol)
 	if route.Action == acl.ActionBlock {
-		logger.Debugf("blocked user=%d dest=%s:%d sni=%s proto=%s rule=%s", user.ID, destHost, destPort, sn.Domain, sn.Protocol, route.RuleName)
+		logger.Debugf("blocked user=%d dest=%s:%d effective=%s sni=%s proto=%s rule=%s", user.ID, destHost, destPort, effectiveHost, sn.Domain, sn.Protocol, route.RuleName)
 		if onDial != nil {
 			onDial(errors.New("blocked by audit policy"))
 		}
 		return
-	}
-
-	effectiveHost := destHost
-	if sn.Domain != "" && s.cfg.DomainSniff {
-		if _, isIP := netip.ParseAddr(destHost); isIP == nil {
-			if s.cfg.ForceDomainSniff || route.IsRemoteProxy || s.dnsRes.HasRuleForDomain(sn.Domain) || aclEng.HasRouteForDomain(sn.Domain) {
-				effectiveHost = sn.Domain
-			}
-		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

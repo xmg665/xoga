@@ -61,9 +61,13 @@ func (s Strategy) String() string {
 }
 
 const (
-	qTypeA          uint16 = 1
-	qTypeAAAA       uint16 = 28
-	maxCacheEntries        = 4096
+	qTypeA              uint16 = 1
+	qTypeAAAA           uint16 = 28
+	maxCacheEntries            = 4096
+	systemDNSServer            = "__system__"
+	defaultSystemDNSTTL uint32 = 60
+	negTTLNotFound      int64  = 15
+	negTTLTempFail      int64  = 5
 )
 
 type upstreamRule struct {
@@ -175,8 +179,10 @@ type cacheKey struct {
 }
 
 type cacheEntry struct {
-	addrs   []netip.Addr
-	expires int64 // Unix seconds
+	addrs      []netip.Addr
+	expires    int64 // Unix seconds for positive entry
+	negErr     error // non-nil when negative-cached
+	negExpires int64 // Unix seconds for negative cache entry
 }
 
 type inflightCall struct {
@@ -208,7 +214,8 @@ type Resolver struct {
 	inflightMu sync.Mutex
 	inflight   map[cacheKey]*inflightCall
 
-	dohClient *http.Client
+	dohClient    *http.Client
+	systemLookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
 func NewResolver(dnsYmlPath, dnsConfigURL string, defaultServers []string, defaultStrategy string) *Resolver {
@@ -342,9 +349,10 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 		strat = overrideStrategy
 	}
 
-	// If no custom DNS server matched and default_dns is empty, use Go system resolver with strategy filter
+	// If no custom DNS server matched and default_dns is empty, route Go system resolver
+	// through the same cache + context-isolated singleflight + serve-stale + negative cache.
 	if len(servers) == 0 {
-		return fallbackSystemResolveAll(ctx, domain, strat, true)
+		servers = []string{systemDNSServer}
 	}
 
 	ck := cacheKey{domain: domain, server: servers[0], strategy: strat}
@@ -352,15 +360,26 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 
 	var staleAddrs []netip.Addr
 	r.cacheMu.RLock()
-	if ce, ok := r.cache[ck]; ok && len(ce.addrs) > 0 {
-		if ce.expires > now {
-			addrs := ce.addrs
-			r.cacheMu.RUnlock()
-			return addrs, nil
+	if ce, ok := r.cache[ck]; ok {
+		if len(ce.addrs) > 0 {
+			if ce.expires > now {
+				addrs := ce.addrs
+				r.cacheMu.RUnlock()
+				return addrs, nil
+			}
+			// Keep recently expired IPs (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
+			if now-ce.expires <= 1800 {
+				staleAddrs = ce.addrs
+				if ce.negExpires > now {
+					r.cacheMu.RUnlock()
+					return staleAddrs, nil
+				}
+			}
 		}
-		// Keep recently expired IPs (up to 30m) for RFC 8767 serve-stale fallback on upstream timeout
-		if now-ce.expires <= 1800 {
-			staleAddrs = ce.addrs
+		if len(staleAddrs) == 0 && ce.negErr != nil && ce.negExpires > now {
+			negErr := ce.negErr
+			r.cacheMu.RUnlock()
+			return nil, negErr
 		}
 	}
 	r.cacheMu.RUnlock()
@@ -393,7 +412,11 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 			var lastErr error
 			for _, srv := range srvs {
 				srvCtx, srvCancel := context.WithTimeout(sfCtx, perSrv)
-				addrs, ttl, lastErr = r.queryServerWithStrategy(srvCtx, srv, domain, strat)
+				if srv == systemDNSServer {
+					addrs, ttl, lastErr = r.querySystemWithStrategy(srvCtx, domain, strat)
+				} else {
+					addrs, ttl, lastErr = r.queryServerWithStrategy(srvCtx, srv, domain, strat)
+				}
 				srvCancel()
 				if lastErr == nil && len(addrs) > 0 {
 					r.putCache(ck, addrs, ttl)
@@ -403,7 +426,14 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 			if lastErr == nil && len(addrs) == 0 {
 				lastErr = fmt.Errorf("no DNS answer for %s", domain)
 			} else if lastErr != nil {
-				lastErr = fmt.Errorf("dns resolve %s via %v: %w", domain, srvs, lastErr)
+				if len(srvs) == 1 && srvs[0] == systemDNSServer {
+					lastErr = fmt.Errorf("dns resolve %s via system: %w", domain, lastErr)
+				} else {
+					lastErr = fmt.Errorf("dns resolve %s via %v: %w", domain, srvs, lastErr)
+				}
+			}
+			if lastErr != nil {
+				r.putNegativeCache(ck, lastErr, negativeCacheTTL(lastErr))
 			}
 
 			call.addrs = addrs
@@ -435,6 +465,24 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string, overrideStrategy
 	}
 }
 
+func negativeCacheTTL(err error) int64 {
+	if err == nil {
+		return negTTLNotFound
+	}
+	if errors.Is(err, errDNSNXDomain) {
+		return negTTLNotFound
+	}
+	var dnserr *net.DNSError
+	if errors.As(err, &dnserr) && dnserr.IsNotFound {
+		return negTTLNotFound
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "no DNS answer") || strings.Contains(msg, "no IP found") || strings.Contains(msg, "NXDOMAIN") || strings.Contains(msg, "no such host") {
+		return negTTLNotFound
+	}
+	return negTTLTempFail
+}
+
 func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
 	maxSec := r.maxTTLSec.Load()
 	if maxSec <= 0 {
@@ -446,15 +494,23 @@ func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
 	} else if ttlSec > maxSec {
 		ttlSec = maxSec
 	}
-	exp := time.Now().Unix() + ttlSec
+	now := time.Now().Unix()
+	exp := now + ttlSec
 
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if len(r.cache) >= maxCacheEntries {
-		now := time.Now().Unix()
 		for k, v := range r.cache {
-			if v.expires <= now {
+			if (len(v.addrs) == 0 && v.negExpires <= now) || (len(v.addrs) > 0 && now-v.expires > 1800) {
 				delete(r.cache, k)
+			}
+		}
+		if len(r.cache) >= maxCacheEntries {
+			// Prefer evicting negative-only entries before touching positive entries.
+			for k, v := range r.cache {
+				if len(v.addrs) == 0 {
+					delete(r.cache, k)
+				}
 			}
 		}
 		if len(r.cache) >= maxCacheEntries {
@@ -470,6 +526,56 @@ func (r *Resolver) putCache(ck cacheKey, addrs []netip.Addr, ttl uint32) {
 		}
 	}
 	r.cache[ck] = cacheEntry{addrs: addrs, expires: exp}
+}
+
+func (r *Resolver) putNegativeCache(ck cacheKey, negErr error, ttlSec int64) {
+	if negErr == nil || ttlSec <= 0 {
+		return
+	}
+	now := time.Now().Unix()
+	negExp := now + ttlSec
+
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if cur, ok := r.cache[ck]; ok && len(cur.addrs) > 0 && now-cur.expires <= 1800 {
+		// Preserve valid RFC 8767 serve-stale addrs while backing off retries.
+		cur.negErr = negErr
+		cur.negExpires = negExp
+		r.cache[ck] = cur
+		return
+	}
+	if len(r.cache) >= maxCacheEntries {
+		for k, v := range r.cache {
+			if (len(v.addrs) == 0 && v.negExpires <= now) || (len(v.addrs) > 0 && now-v.expires > 1800) {
+				delete(r.cache, k)
+			}
+		}
+		if len(r.cache) >= maxCacheEntries {
+			// Evict a handful of existing negative-only entries; never evict positive entries for a negative entry.
+			evicted := 0
+			for k, v := range r.cache {
+				if len(v.addrs) == 0 {
+					delete(r.cache, k)
+					evicted++
+					if evicted >= 64 {
+						break
+					}
+				}
+			}
+		}
+		if len(r.cache) >= maxCacheEntries {
+			return
+		}
+	}
+	r.cache[ck] = cacheEntry{negErr: negErr, negExpires: negExp}
+}
+
+func (r *Resolver) querySystemWithStrategy(ctx context.Context, domain string, strat Strategy) ([]netip.Addr, uint32, error) {
+	addrs, err := systemResolveWithStrategy(ctx, r.systemLookup, domain, strat, true)
+	if err != nil || len(addrs) == 0 {
+		return nil, 0, err
+	}
+	return addrs, defaultSystemDNSTTL, nil
 }
 
 var errDNSNXDomain = errors.New("DNS rcode=3 (NXDOMAIN)")
@@ -905,43 +1011,106 @@ func skipDNSName(msg []byte, pos int) (int, error) {
 }
 
 func fallbackSystemResolveAll(ctx context.Context, host string, strat Strategy, filter bool) ([]netip.Addr, error) {
-	network := "ip"
-	if filter {
-		switch strat {
-		case StrategyIPv4Only:
-			network = "ip4"
-		case StrategyIPv6Only:
-			network = "ip6"
-		}
+	return systemResolveWithStrategy(ctx, net.DefaultResolver.LookupNetIP, host, strat, filter)
+}
+
+func systemResolveWithStrategy(
+	ctx context.Context,
+	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error),
+	host string,
+	strat Strategy,
+	filter bool,
+) ([]netip.Addr, error) {
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupNetIP
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, network, host)
-	if err != nil || len(ips) == 0 {
+	unmapAll := func(in []netip.Addr) []netip.Addr {
+		out := make([]netip.Addr, 0, len(in))
+		for _, ip := range in {
+			out = append(out, ip.Unmap())
+		}
+		return out
+	}
+	shouldFallback := func(err error) bool {
 		if err == nil {
-			err = fmt.Errorf("no IP found for %s", host)
+			return true
 		}
-		return nil, err
+		if ctx.Err() != nil {
+			return false
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+			return false
+		}
+		var de *net.DNSError
+		if errors.As(err, &de) && !de.IsNotFound {
+			return false
+		}
+		return true
 	}
-	out := make([]netip.Addr, 0, len(ips))
-	if filter && (strat == StrategyIPv4First || strat == StrategyIPv6First) {
-		wantV4 := strat == StrategyIPv4First
-		for _, ip := range ips {
-			u := ip.Unmap()
-			if u.Is4() == wantV4 {
-				out = append(out, u)
+
+	effStrat := strat
+	if !filter {
+		effStrat = StrategyIPv4First
+	}
+	switch effStrat {
+	case StrategyIPv4Only:
+		ips, err := lookup(ctx, "ip4", host)
+		if err != nil || len(ips) == 0 {
+			if err == nil {
+				err = fmt.Errorf("no IP found for %s", host)
 			}
+			return nil, err
 		}
-		for _, ip := range ips {
-			u := ip.Unmap()
-			if u.Is4() != wantV4 {
-				out = append(out, u)
+		return unmapAll(ips), nil
+	case StrategyIPv6Only:
+		ips, err := lookup(ctx, "ip6", host)
+		if err != nil || len(ips) == 0 {
+			if err == nil {
+				err = fmt.Errorf("no IP found for %s", host)
 			}
+			return nil, err
 		}
-		return out, nil
+		return unmapAll(ips), nil
+	case StrategyIPv6First:
+		ips, err := lookup(ctx, "ip6", host)
+		if err == nil && len(ips) > 0 {
+			return unmapAll(ips), nil
+		}
+		if !shouldFallback(err) {
+			return nil, err
+		}
+		ips4, err4 := lookup(ctx, "ip4", host)
+		if err4 == nil && len(ips4) > 0 {
+			return unmapAll(ips4), nil
+		}
+		if err4 != nil {
+			return nil, err4
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("no IP found for %s", host)
+	default: // StrategyIPv4First: query A ("ip4") first, fall back to AAAA ("ip6") only if empty
+		ips, err := lookup(ctx, "ip4", host)
+		if err == nil && len(ips) > 0 {
+			return unmapAll(ips), nil
+		}
+		if !shouldFallback(err) {
+			return nil, err
+		}
+		ips6, err6 := lookup(ctx, "ip6", host)
+		if err6 == nil && len(ips6) > 0 {
+			return unmapAll(ips6), nil
+		}
+		if err6 != nil {
+			return nil, err6
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("no IP found for %s", host)
 	}
-	for _, ip := range ips {
-		out = append(out, ip.Unmap())
-	}
-	return out, nil
 }
 
 // maybeHotReload checks `/etc/xoga/dns.yml` mtime at most once every 5 seconds and hot-swaps rules!

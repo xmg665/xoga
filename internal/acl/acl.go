@@ -2,7 +2,9 @@ package acl
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -18,22 +20,39 @@ import (
 	"github.com/xmg665/xoga/internal/logger"
 )
 
-var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+var (
+	zeroNetPrefix   = netip.MustParsePrefix("0.0.0.0/8")
+	cgnatPrefix     = netip.MustParsePrefix("100.64.0.0/10")
+	benchmarkPrefix = netip.MustParsePrefix("198.18.0.0/15")
+	reservedPrefix  = netip.MustParsePrefix("240.0.0.0/4")
+
+	errRoutesEmpty = errors.New("empty routes.toml")
+)
 
 // IsReservedOrPrivateIP reports whether ip belongs to loopback, RFC1918 private, link-local,
-// unspecified (`0.0.0.0`/`::`), multicast, or RFC6598 CGNAT (`100.64.0.0/10`, cloud metadata `100.100.100.200`) space.
+// unspecified/this-network (`0.0.0.0/8`, `::`), multicast, RFC6598 CGNAT (`100.64.0.0/10`,
+// cloud metadata `100.100.100.200`), RFC2544 benchmark/Fake-IP (`198.18.0.0/15`), or Class E
+// reserved (`240.0.0.0/4`) space.
 func IsReservedOrPrivateIP(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
 	}
 	ip = ip.Unmap()
-	return ip.IsPrivate() ||
+	if ip.IsPrivate() ||
 		ip.IsLoopback() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() ||
-		ip.IsUnspecified() ||
-		(ip.Is4() && cgnatPrefix.Contains(ip))
+		ip.IsUnspecified() {
+		return true
+	}
+	if ip.Is4() {
+		return zeroNetPrefix.Contains(ip) ||
+			cgnatPrefix.Contains(ip) ||
+			benchmarkPrefix.Contains(ip) ||
+			reservedPrefix.Contains(ip)
+	}
+	return false
 }
 
 type Action uint8
@@ -155,9 +174,16 @@ type DynamicRoute struct {
 }
 
 type aclSnapshot struct {
-	whitelist compiledRule
-	blocklist compiledRule
-	routes    []compiledRule
+	whitelist  compiledRule
+	blocklist  compiledRule
+	fileRoutes []compiledRule
+	routes     []compiledRule
+}
+
+type fileStat struct {
+	modTime time.Time
+	size    int64
+	exists  bool
 }
 
 // Engine evaluates whitelist, blocklist, BitTorrent policy, and panel/local route rules
@@ -174,11 +200,11 @@ type Engine struct {
 
 	snap atomic.Pointer[aclSnapshot]
 
-	reloadMu   sync.Mutex
-	whiteMtime time.Time
-	blockMtime time.Time
-	routeMtime time.Time
-	lastCheck  atomic.Int64
+	reloadMu  sync.Mutex
+	whiteStat fileStat
+	blockStat fileStat
+	routeStat fileStat
+	lastCheck atomic.Int64
 }
 
 func NewEngine(forbidBT bool, whitePath, blockPath, routesPath string, panelRoutes []DynamicRoute) *Engine {
@@ -206,34 +232,115 @@ func (e *Engine) reloadNow(initial bool) {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 
-	wMod := statMtime(e.whitePath)
-	bMod := statMtime(e.blockPath)
-	rMod := statMtime(e.routesPath)
+	wStat := statFile(e.whitePath)
+	bStat := statFile(e.blockPath)
+	rStat := statFile(e.routesPath)
 
-	if !initial && wMod.Equal(e.whiteMtime) && bMod.Equal(e.blockMtime) && rMod.Equal(e.routeMtime) {
+	wChanged := initial || wStat != e.whiteStat
+	bChanged := initial || bStat != e.blockStat
+	rChanged := initial || rStat != e.routeStat
+	if !wChanged && !bChanged && !rChanged {
 		return
 	}
-	e.whiteMtime = wMod
-	e.blockMtime = bMod
-	e.routeMtime = rMod
 
+	prevSnap := e.snap.Load()
 	sn := &aclSnapshot{
 		whitelist: newCompiledRule("whitelist", ActionDirect),
 		blocklist: newCompiledRule("blocklist", ActionBlock),
 	}
 
-	if lines, err := readRuleLines(e.whitePath); err == nil {
-		for _, l := range lines {
-			sn.whitelist.addPattern(l)
+	var appliedAny bool
+
+	// 1. whiteList: read and parse BEFORE updating whiteStat
+	if wChanged {
+		if e.whitePath == "" || !wStat.exists {
+			e.whiteStat = wStat
+			appliedAny = true
+		} else if lines, err := readRuleLines(e.whitePath); err == nil {
+			for _, l := range lines {
+				sn.whitelist.addPattern(l)
+			}
+			e.whiteStat = wStat
+			appliedAny = true
+		} else if errors.Is(err, os.ErrNotExist) {
+			e.whiteStat = fileStat{}
+			appliedAny = true
+		} else {
+			logger.Warnf("whiteList reload failed (%v); retaining previous rules", err)
+			if prevSnap != nil {
+				sn.whitelist = prevSnap.whitelist
+			}
 		}
+	} else if prevSnap != nil {
+		sn.whitelist = prevSnap.whitelist
 	}
-	if lines, err := readRuleLines(e.blockPath); err == nil {
-		for _, l := range lines {
-			sn.blocklist.addPattern(l)
+
+	// 2. blockList: read and parse BEFORE updating blockStat
+	if bChanged {
+		if e.blockPath == "" || !bStat.exists {
+			e.blockStat = bStat
+			appliedAny = true
+		} else if lines, err := readRuleLines(e.blockPath); err == nil {
+			for _, l := range lines {
+				sn.blocklist.addPattern(l)
+			}
+			e.blockStat = bStat
+			appliedAny = true
+		} else if errors.Is(err, os.ErrNotExist) {
+			e.blockStat = fileStat{}
+			appliedAny = true
+		} else {
+			logger.Warnf("blockList reload failed (%v); retaining previous rules", err)
+			if prevSnap != nil {
+				sn.blocklist = prevSnap.blocklist
+			}
 		}
+	} else if prevSnap != nil {
+		sn.blocklist = prevSnap.blocklist
 	}
-	if fileRoutes := ParseRoutesTOML(e.routesPath); len(fileRoutes) > 0 {
-		sn.routes = append(sn.routes, fileRoutes...)
+
+	// 3. routes.toml: read and validate BEFORE updating routeStat so transient truncation /
+	// partial writes never wipe active routes or latch a broken mtime.
+	var prevFileRoutes []compiledRule
+	if prevSnap != nil {
+		prevFileRoutes = prevSnap.fileRoutes
+	}
+	if rChanged {
+		if e.routesPath == "" || !rStat.exists {
+			e.routeStat = rStat
+			appliedAny = true
+		} else {
+			parsed, explicitlyDisabled, rerr := parseRoutesTOMLFile(e.routesPath)
+			switch {
+			case rerr != nil && errors.Is(rerr, os.ErrNotExist):
+				e.routeStat = fileStat{}
+				appliedAny = true
+			case !initial && len(prevFileRoutes) > 0 && (rerr != nil || (!explicitlyDisabled && len(parsed) == 0)):
+				reason := "produced 0 routes"
+				if rerr != nil {
+					reason = rerr.Error()
+				}
+				logger.Warnf("routes.toml reload skipped (%s); retaining %d previous route rules", reason, len(prevFileRoutes))
+				sn.fileRoutes = prevFileRoutes
+			case rerr != nil && !errors.Is(rerr, errRoutesEmpty):
+				logger.Warnf("routes.toml parse failed (%v); retaining previous route rules", rerr)
+				sn.fileRoutes = prevFileRoutes
+			default:
+				sn.fileRoutes = parsed
+				e.routeStat = rStat
+				appliedAny = true
+			}
+		}
+	} else {
+		sn.fileRoutes = prevFileRoutes
+	}
+
+	if !initial && !appliedAny {
+		return
+	}
+
+	if len(sn.fileRoutes) > 0 {
+		sn.routes = append(sn.routes, sn.fileRoutes...)
 	}
 	for _, pr := range e.panelRoutes {
 		act := strings.ToLower(strings.TrimSpace(pr.Action))
@@ -276,7 +383,7 @@ func (e *Engine) reloadNow(initial bool) {
 	}
 
 	e.snap.Store(sn)
-	if !initial {
+	if !initial && appliedAny {
 		logger.Infof("Hot-reloaded ACL & routes.toml (%d custom route rules)", len(sn.routes))
 	}
 }
@@ -616,14 +723,14 @@ func (r *compiledRule) matchDomain(d string) bool {
 	return false
 }
 
-func statMtime(path string) time.Time {
+func statFile(path string) fileStat {
 	if path == "" {
-		return time.Time{}
+		return fileStat{}
 	}
 	if st, err := os.Stat(path); err == nil {
-		return st.ModTime()
+		return fileStat{modTime: st.ModTime(), size: st.Size(), exists: true}
 	}
-	return time.Time{}
+	return fileStat{}
 }
 
 func readRuleLines(path string) ([]string, error) {
@@ -729,16 +836,38 @@ func ParseOutboundURL(raw string) (OutboundNode, bool) {
 // 2. Concise `[[routes]]` with `outbound = "socks5://..."`
 // 3. Xray-style `[[outbound]]` (`tag = "..."`) + `[[rule]]` (`domain = [...]`, `outboundTag = "..."`)
 func ParseRoutesTOML(path string) []compiledRule {
-	if path == "" {
-		return nil
-	}
-	rawBytes, err := os.ReadFile(path)
+	routes, _, err := parseRoutesTOMLFile(path)
 	if err != nil {
 		return nil
 	}
+	return routes
+}
+
+func parseRoutesTOMLFile(path string) ([]compiledRule, bool, error) {
+	if path == "" {
+		return nil, false, os.ErrNotExist
+	}
+	rawBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(bytes.TrimSpace(rawBytes)) == 0 {
+		return nil, false, errRoutesEmpty
+	}
 
 	// Coalesce multi-line `[ ... ]` arrays into single lines for clean zero-dependency TOML parsing
-	lines := coalesceMultilineArrays(string(rawBytes))
+	lines, unclosed := coalesceMultilineArraysChecked(string(rawBytes))
+	if unclosed {
+		return nil, false, errors.New("truncated or unclosed TOML array/section")
+	}
+	if len(lines) == 0 {
+		return nil, false, errRoutesEmpty
+	}
+	for _, l := range lines {
+		if strings.HasPrefix(l, "[") && (!strings.HasSuffix(l, "]") || countBrackets(l) != 0) {
+			return nil, false, errors.New("malformed TOML section header")
+		}
+	}
 
 	type routeDraft struct {
 		enable   bool
@@ -848,7 +977,7 @@ func ParseRoutesTOML(path string) []compiledRule {
 	}
 	flushNamed()
 	if !fileEnabled {
-		return nil
+		return nil, true, nil
 	}
 
 	var compiled []compiledRule
@@ -897,7 +1026,7 @@ func ParseRoutesTOML(path string) []compiledRule {
 		}
 		compiled = append(compiled, cr)
 	}
-	return compiled
+	return compiled, false, nil
 }
 
 func applyOutboundKV(out *OutboundNode, k, v string) {
@@ -960,6 +1089,11 @@ func applyOutboundKV(out *OutboundNode, k, v string) {
 }
 
 func coalesceMultilineArrays(raw string) []string {
+	out, _ := coalesceMultilineArraysChecked(raw)
+	return out
+}
+
+func coalesceMultilineArraysChecked(raw string) ([]string, bool) {
 	var out []string
 	var buf strings.Builder
 	bracketDepth := 0
@@ -975,6 +1109,9 @@ func coalesceMultilineArrays(raw string) []string {
 			buf.WriteString(line)
 			bracketDepth += countBrackets(line)
 			if bracketDepth <= 0 {
+				if bracketDepth < 0 {
+					return nil, true
+				}
 				bracketDepth = 0
 				out = append(out, buf.String())
 				buf.Reset()
@@ -988,12 +1125,15 @@ func coalesceMultilineArrays(raw string) []string {
 			buf.WriteString(line)
 			continue
 		}
+		if delta < 0 {
+			return nil, true
+		}
 		out = append(out, line)
 	}
-	if buf.Len() > 0 {
-		out = append(out, buf.String())
+	if sc.Err() != nil || bracketDepth != 0 || buf.Len() > 0 {
+		return nil, true
 	}
-	return out
+	return out, false
 }
 
 func countBrackets(s string) int {

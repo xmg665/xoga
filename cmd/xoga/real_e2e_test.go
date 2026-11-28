@@ -754,3 +754,491 @@ gc_percent=75
 		t.Fatal("expected final traffic flush to mock panel on SIGTERM")
 	}
 }
+
+// TestRealMachineLiveLogBugFixesE2E launches a real compiled `xoga` binary configured as a
+// multi-node SSPanel daemon and exercises NEW-1, NEW-3, BUG-2, BUG-4, BUG-5, BUG-7, BUG-8,
+// BUG-9, and BUG-10 end-to-end against real local TCP/UDP/DNS sockets and OS signals.
+func TestRealMachineLiveLogBugFixesE2E(t *testing.T) {
+	tmp := t.TempDir()
+	binPath := filepath.Join(tmp, "xoga")
+
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build xoga failed: %v\n%s", err, out)
+	}
+
+	// 1. Real TCP echo backend
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	echoPort := uint16(echoLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// 2. Real local UDP DNS server (answers 127.0.0.1 for A queries)
+	dnsPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dnsPC.Close()
+	var dnsHits atomic.Int32
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, addr, err := dnsPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 16 {
+				continue
+			}
+			dnsHits.Add(1)
+			qtype := binary.BigEndian.Uint16(buf[n-4 : n-2])
+			resp := make([]byte, 0, n+24)
+			resp = append(resp, buf[0], buf[1], 0x81, 0x80, 0x00, 0x01)
+			if qtype == 1 {
+				resp = append(resp, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00)
+				resp = append(resp, buf[12:n]...)
+				resp = append(resp, 0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 127, 0, 0, 1)
+			} else {
+				resp = append(resp, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+				resp = append(resp, buf[12:n]...)
+			}
+			_, _ = dnsPC.WriteTo(resp, addr)
+		}
+	}()
+	dnsAddr := dnsPC.LocalAddr().String()
+
+	// 3. Allocate ports for 3 SSPanel nodes: 781 (VLESS+WS), 782 (VMess+WS), 783 (Trojan+TCP)
+	port781 := freePort(t, "tcp")
+	port782 := freePort(t, "tcp")
+	port783 := freePort(t, "tcp")
+
+	u1Str, u1Bytes := deterministicUUID(101)
+	const trojanPass = "e2e-trojan-live-pass"
+
+	var detectRuleHits atomic.Int32
+	var trafficPushHits atomic.Int32
+	panelSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/mod_mu/nodes/781/info":
+			_, _ = fmt.Fprintf(w, `{"ret":1,"data":{"server":"127.0.0.1;%d;0;ws;;path=/vless","sort":13,"method":"none","traffic_rate":1,"node_connector":1}}`, port781)
+		case "/mod_mu/nodes/782/info":
+			_, _ = fmt.Fprintf(w, `{"ret":1,"data":{"server":"127.0.0.1;%d;0;ws;;path=/vmess","sort":11,"traffic_rate":1}}`, port782)
+		case "/mod_mu/nodes/783/info":
+			_, _ = fmt.Fprintf(w, `{"ret":1,"data":{"server":"127.0.0.1;%d;0;tcp","sort":14,"traffic_rate":1}}`, port783)
+		case "/mod_mu/func/detect_rules":
+			detectRuleHits.Add(1)
+			time.Sleep(40 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"ret":1,"data":[{"regex":"^audit-blocked\\.example\\.test$","type":1}]}`))
+		case "/mod_mu/users":
+			nid := r.URL.Query().Get("node_id")
+			if nid == "783" {
+				_, _ = fmt.Fprintf(w, `{"ret":1,"data":[{"id":101,"uuid":"%s","passwd":"%s","node_connector":0,"u":0,"d":0,"transfer_enable":1073741824}]}`, trojanPass, trojanPass)
+			} else {
+				_, _ = fmt.Fprintf(w, `{"ret":1,"data":[{"id":101,"uuid":"%s","passwd":"%s","node_connector":1,"u":0,"d":0,"transfer_enable":1073741824}]}`, u1Str, u1Str)
+			}
+		case "/mod_mu/users/traffic":
+			trafficPushHits.Add(1)
+			_, _ = w.Write([]byte(`{"ret":1,"data":"ok"}`))
+		default:
+			_, _ = w.Write([]byte(`{"ret":1,"data":[]}`))
+		}
+	}))
+	defer panelSrv.Close()
+
+	// Write whiteList (only 127.0.0.1 so local echo works under ban_private_ip=true while 169.254.169.254/0.0.0.1/198.18.0.5/240.0.0.1 remain blocked)
+	if err := os.WriteFile(filepath.Join(tmp, "whiteList"), []byte("127.0.0.1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	routesPath := filepath.Join(tmp, "routes.toml")
+	if err := os.WriteFile(routesPath, []byte(`
+[[routes]]
+name = "route-direct"
+rules = ["*"]
+[[routes.outs]]
+type = "direct"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	confPath := filepath.Join(tmp, "xoga.conf")
+	confText := fmt.Sprintf(`type=sspanel-uim
+server_type=auto
+node_id=781,782,783
+webapi_url=%s
+webapi_key=e2e-sspanel-key
+force_close_ssl=true
+vmess_auth_mode=auto
+proxy_protocol=true
+trust_forwarded_ip=false
+trusted_proxy_cidrs=203.175.12.253/32,172.64.0.0/13
+device_limit_enable=true
+user_conn_limit=1
+domain_sniff=true
+ban_private_ip=true
+forbidden_ports=143,110
+default_dns=%s
+dns_strategy=ipv4_only
+v2ray_reduce_memory=true
+gc_percent=100
+check_interval=60
+submit_interval=60
+log_level=info
+`, panelSrv.URL, dnsAddr)
+	if err := os.WriteFile(confPath, []byte(confText), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var daemonOut bytes.Buffer
+	var daemonOutMu sync.Mutex
+	cmd := exec.Command(binPath, "run", "-c", confPath)
+	stdoutPipe, _ := cmd.StdoutPipe()
+	stderrPipe, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start xoga daemon: %v", err)
+	}
+	copyLog := func(r io.Reader) {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				daemonOutMu.Lock()
+				daemonOut.Write(buf[:n])
+				daemonOutMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	go copyLog(stdoutPipe)
+	go copyLog(stderrPipe)
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+
+	waitPort := func(port int) {
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		daemonOutMu.Lock()
+		logs := daemonOut.String()
+		daemonOutMu.Unlock()
+		t.Fatalf("port %d did not start listening; logs:\n%s", port, logs)
+	}
+	waitPort(port781)
+	waitPort(port782)
+	waitPort(port783)
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify BUG-10 (explicit gc_percent=100 honored despite v2ray_reduce_memory=true)
+	daemonOutMu.Lock()
+	bootLogs := daemonOut.String()
+	daemonOutMu.Unlock()
+	if !strings.Contains(bootLogs, "gc=100%") {
+		t.Fatalf("BUG-10 regression: expected startup log to honor explicit gc=100%%, got:\n%s", bootLogs)
+	}
+
+	// Verify NEW-3: across 3 SSPanel nodes (781, 782, 783), /mod_mu/func/detect_rules fetched ONLY ONCE!
+	if got := detectRuleHits.Load(); got != 1 {
+		t.Fatalf("NEW-3 regression: expected 1 /mod_mu/func/detect_rules GET across 3 nodes, got %d", got)
+	}
+
+	dialWS := func(port int, path, proxyHdr, extraHdrs string) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d: %v", port, err)
+		}
+		_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+		req := proxyHdr +
+			"GET " + path + " HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" +
+			extraHdrs + "\r\n"
+		if _, err := c.Write([]byte(req)); err != nil {
+			t.Fatalf("ws write: %v", err)
+		}
+		br := bufio.NewReader(c)
+		status, err := br.ReadString('\n')
+		if err != nil || !strings.Contains(status, "101") {
+			t.Fatalf("ws upgrade failed: %q err=%v", status, err)
+		}
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || strings.TrimSpace(line) == "" {
+				break
+			}
+		}
+		return c
+	}
+	writeWSFrame := func(w io.Writer, payload []byte) error {
+		mask := [4]byte{0x21, 0x43, 0x65, 0x87}
+		var hdr []byte
+		hdr = append(hdr, 0x82)
+		if len(payload) < 126 {
+			hdr = append(hdr, 0x80|byte(len(payload)))
+		} else {
+			hdr = append(hdr, 0x80|126, byte(len(payload)>>8), byte(len(payload)))
+		}
+		hdr = append(hdr, mask[:]...)
+		masked := make([]byte, len(payload))
+		for i := range payload {
+			masked[i] = payload[i] ^ mask[i&3]
+		}
+		_, err := w.Write(append(hdr, masked...))
+		return err
+	}
+	readWSFrame := func(r io.Reader) ([]byte, error) {
+		var h [2]byte
+		if _, err := io.ReadFull(r, h[:]); err != nil {
+			return nil, err
+		}
+		plen := int(h[1] & 0x7f)
+		if plen == 126 {
+			var e [2]byte
+			if _, err := io.ReadFull(r, e[:]); err != nil {
+				return nil, err
+			}
+			plen = int(binary.BigEndian.Uint16(e[:]))
+		}
+		b := make([]byte, plen)
+		_, err := io.ReadFull(r, b)
+		return b, err
+	}
+
+	// NEW-1: Trusted public relay CIDR 203.175.12.253 trusts XFF while untrusted 203.0.113.50 cannot spoof!
+	t.Run("NEW1_TrustedProxyCIDRsLiveDaemon", func(t *testing.T) {
+		sendVLESS := func(c net.Conn, msg string) ([]byte, error) {
+			var b bytes.Buffer
+			b.WriteByte(0x00)
+			b.Write(u1Bytes[:])
+			b.WriteByte(0x00)
+			b.WriteByte(0x01)
+			_ = binary.Write(&b, binary.BigEndian, echoPort)
+			b.WriteByte(0x01)
+			b.Write([]byte{127, 0, 0, 1})
+			b.WriteString(msg)
+			if err := writeWSFrame(c, b.Bytes()); err != nil {
+				return nil, err
+			}
+			return readWSFrame(c)
+		}
+
+		// Conn 1 from trusted public relay 203.175.12.253 with XFF 198.51.100.77 -> succeeds and locks device slot to 198.51.100.77!
+		c1 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21001 8080\r\n", "X-Forwarded-For: 198.51.100.77\r\n")
+		defer c1.Close()
+		r1, err := sendVLESS(c1, "trusted-relay-user1")
+		if err != nil || !bytes.Contains(r1, []byte("trusted-relay-user1")) {
+			t.Fatalf("trusted relay conn 1 failed: %q err=%v", r1, err)
+		}
+
+		// Conn 2 from SAME trusted public relay 203.175.12.253 with DIFFERENT XFF 198.51.100.78 -> MUST be rejected by device_limit=1!
+		// (If relay IP were not trusted, both would collapse onto 203.175.12.253 and erroneously pass device_limit=1!)
+		c2 := dialWS(port781, "/vless", "PROXY TCP4 203.175.12.253 127.0.0.1 21002 8080\r\n", "X-Forwarded-For: 198.51.100.78\r\n")
+		defer c2.Close()
+		if r2, err := sendVLESS(c2, "trusted-relay-user2"); err == nil && bytes.Contains(r2, []byte("trusted-relay-user2")) {
+			t.Fatalf("NEW-1 regression: second distinct XFF IP behind trusted relay collapsed onto relay IP!")
+		}
+
+		// Conn 3 from untrusted public peer 203.0.113.50 spoofing XFF 198.51.100.77 -> MUST be rejected by device_limit=1!
+		c3 := dialWS(port781, "/vless", "PROXY TCP4 203.0.113.50 127.0.0.1 21003 8080\r\n", "X-Forwarded-For: 198.51.100.77\r\n")
+		defer c3.Close()
+		if r3, err := sendVLESS(c3, "spoofed-xff"); err == nil && bytes.Contains(r3, []byte("spoofed-xff")) {
+			t.Fatalf("NEW-1 security regression: untrusted public IP spoofed X-Forwarded-For to share active slot!")
+		}
+	})
+
+	// BUG-5: Legacy MD5 VMess client with +81s clock skew succeeds end-to-end!
+	t.Run("BUG5_LegacyVMess81sSkewLiveDaemon", func(t *testing.T) {
+		c := dialWS(port782, "/vmess", "PROXY TCP4 203.175.12.253 127.0.0.1 22001 8080\r\n", "X-Forwarded-For: 198.51.100.90\r\n")
+		defer c.Close()
+
+		var reqKey, reqIV [16]byte
+		_, _ = rand.Read(reqKey[:])
+		_, _ = rand.Read(reqIV[:])
+		var stamp [8]byte
+		binary.BigEndian.PutUint64(stamp[:], uint64(time.Now().Unix()+81))
+		mac := hmac.New(md5.New, u1Bytes[:])
+		_, _ = mac.Write(stamp[:])
+		authID := mac.Sum(nil)
+
+		mh := md5.New()
+		mh.Write(u1Bytes[:])
+		mh.Write([]byte("c48619fe-8f02-49e0-b9e9-edf763e17e21"))
+		cmdKey := mh.Sum(nil)
+		hdrIV := md5.Sum(bytes.Repeat(stamp[:], 4))
+
+		var hdr bytes.Buffer
+		hdr.WriteByte(0x01)
+		hdr.Write(reqIV[:])
+		hdr.Write(reqKey[:])
+		hdr.Write([]byte{0x55, 0x05, 0x01, 0x00, 0x01})
+		_ = binary.Write(&hdr, binary.BigEndian, echoPort)
+		hdr.Write([]byte{0x02, byte(len("127.0.0.1"))})
+		hdr.WriteString("127.0.0.1")
+		fh := fnv.New32a()
+		_, _ = fh.Write(hdr.Bytes())
+		_ = binary.Write(&hdr, binary.BigEndian, fh.Sum32())
+
+		hdrBlk, _ := aes.NewCipher(cmdKey)
+		encHdr := make([]byte, hdr.Len())
+		cipher.NewCFBEncrypter(hdrBlk, hdrIV[:]).XORKeyStream(encHdr, hdr.Bytes())
+
+		msg := []byte("legacy-81s-skew-live-ok!")
+		rm := sha3.NewShake128()
+		_, _ = rm.Write(reqIV[:])
+		var m1, m2 [2]byte
+		_, _ = rm.Read(m1[:])
+		_, _ = rm.Read(m2[:])
+		var bodyPlain bytes.Buffer
+		_ = binary.Write(&bodyPlain, binary.BigEndian, uint16(4+len(msg))^binary.BigEndian.Uint16(m1[:]))
+		pfh := fnv.New32a()
+		_, _ = pfh.Write(msg)
+		_ = binary.Write(&bodyPlain, binary.BigEndian, pfh.Sum32())
+		bodyPlain.Write(msg)
+		_ = binary.Write(&bodyPlain, binary.BigEndian, uint16(0)^binary.BigEndian.Uint16(m2[:]))
+
+		bodyBlk, _ := aes.NewCipher(reqKey[:])
+		encBody := make([]byte, bodyPlain.Len())
+		cipher.NewCFBEncrypter(bodyBlk, reqIV[:]).XORKeyStream(encBody, bodyPlain.Bytes())
+
+		wire := append(append(authID, encHdr...), encBody...)
+		if err := writeWSFrame(c, wire); err != nil {
+			t.Fatal(err)
+		}
+		var rawResp bytes.Buffer
+		respKey := md5.Sum(reqKey[:])
+		respIV := md5.Sum(reqIV[:])
+		respBlk, _ := aes.NewCipher(respKey[:])
+		dec := cipher.NewCFBDecrypter(respBlk, respIV[:])
+		for rawResp.Len() < 4+2+4+len(msg) {
+			f, err := readWSFrame(c)
+			if err != nil {
+				t.Fatalf("legacy +81s skew WS read failed: %v", err)
+			}
+			rawResp.Write(f)
+		}
+		plain := make([]byte, rawResp.Len())
+		dec.XORKeyStream(plain, rawResp.Bytes())
+		if plain[0] != 0x55 || !bytes.Contains(plain[4:], msg) {
+			t.Fatalf("legacy +81s skew response mismatch")
+		}
+	})
+
+	// BUG-2 + BUG-4 + BUG-7 on Trojan node 783 (with catch-all direct route, domain_sniff=true, ban_private_ip=true, forbidden_ports=143)
+	t.Run("BUG2_BUG4_BUG7_TrojanLiveDaemon", func(t *testing.T) {
+		dialTrojan := func(rawIP []byte, port uint16, payload []byte) net.Conn {
+			t.Helper()
+			c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port783), 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+			sum := sha256.Sum224([]byte(trojanPass))
+			var req bytes.Buffer
+			req.WriteString("PROXY TCP4 198.51.100.60 127.0.0.1 33001 443\r\n")
+			req.WriteString(hex.EncodeToString(sum[:]))
+			req.WriteString("\r\n")
+			req.WriteByte(0x01)
+			req.WriteByte(0x01)
+			req.Write(rawIP)
+			var pb [2]byte
+			binary.BigEndian.PutUint16(pb[:], port)
+			req.Write(pb[:])
+			req.WriteString("\r\n")
+			req.Write(payload)
+			if _, err := c.Write(req.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			return c
+		}
+
+		// Clash Fake-IP 198.18.0.5 + HTTP Host overrides under ActionDirect and succeeds!
+		httpReq := []byte("GET /fakeip HTTP/1.1\r\nHost: direct-fakeip.e2e\r\n\r\n")
+		cFake := dialTrojan([]byte{198, 18, 0, 5}, echoPort, httpReq)
+		got := make([]byte, len(httpReq))
+		if _, err := io.ReadFull(cFake, got); err != nil || !bytes.Equal(got, httpReq) {
+			_ = cFake.Close()
+			t.Fatalf("Clash Fake-IP direct domain_sniff override failed: got=%q err=%v", got, err)
+		}
+		_ = cFake.Close()
+
+		// GFW-poisoned 0.0.0.1 + HTTP Host overrides under ActionDirect and succeeds!
+		httpReq2 := []byte("GET /gfw HTTP/1.1\r\nHost: gfw-poisoned.e2e\r\n\r\n")
+		cGFW := dialTrojan([]byte{0, 0, 0, 1}, echoPort, httpReq2)
+		got2 := make([]byte, len(httpReq2))
+		if _, err := io.ReadFull(cGFW, got2); err != nil || !bytes.Equal(got2, httpReq2) {
+			_ = cGFW.Close()
+			t.Fatalf("GFW-poisoned 0.0.0.1 direct domain_sniff override failed: got=%q err=%v", got2, err)
+		}
+		_ = cGFW.Close()
+		if dnsHits.Load() < 2 {
+			t.Fatalf("expected mock DNS to resolve overridden direct domains, got %d hits", dnsHits.Load())
+		}
+
+		// Unresolved metadata 169.254.169.254, 0.0.0.1, 198.18.0.5, 240.0.0.1 MUST be blocked!
+		for _, rawIP := range [][]byte{{169, 254, 169, 254}, {0, 0, 0, 1}, {198, 18, 0, 9}, {240, 0, 0, 1}} {
+			cBlk := dialTrojan(rawIP, echoPort, []byte("RAW-NO-SNI"))
+			var b [1]byte
+			n, err := cBlk.Read(b[:])
+			_ = cBlk.Close()
+			if n != 0 || err == nil {
+				t.Fatalf("expected reserved/private IP %v to be blocked, got n=%d err=%v", rawIP, n, err)
+			}
+		}
+
+		// BUG-7: Forbidden port 143 with ZERO payload short-circuits BEFORE 150ms peek!
+		start := time.Now()
+		c143 := dialTrojan([]byte{1, 1, 1, 1}, 143, nil)
+		var b [1]byte
+		n, err := c143.Read(b[:])
+		elapsed := time.Since(start)
+		_ = c143.Close()
+		if n != 0 || err == nil {
+			t.Fatalf("expected forbidden port 143 to be closed, got n=%d err=%v", n, err)
+		}
+		if elapsed >= 100*time.Millisecond {
+			t.Fatalf("BUG-7 regression: forbidden port 143 stalled %v (want <100ms)", elapsed)
+		}
+	})
+
+	// Clean SIGTERM + final traffic flush
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM failed: %v", err)
+	}
+	doneWait := make(chan error, 1)
+	go func() { doneWait <- cmd.Wait() }()
+	select {
+	case werr := <-doneWait:
+		if werr != nil {
+			t.Fatalf("xoga did not exit cleanly on SIGTERM: %v", werr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("xoga hung >10s on SIGTERM")
+	}
+	if trafficPushHits.Load() == 0 {
+		t.Fatal("expected final traffic flush on SIGTERM")
+	}
+}

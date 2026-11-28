@@ -51,7 +51,8 @@ type Config struct {
 	ProxyProtocol      bool
 	ForceProxyProtocol bool
 	UDPProxyProtocol   bool
-	TrustForwardedIP   bool // explicitly trust HTTP CF-Connecting-IP/X-Forwarded-For/X-Real-IP headers from public CDN peers
+	TrustForwardedIP   bool     // explicitly trust HTTP CF-Connecting-IP/X-Forwarded-For/X-Real-IP headers from any peer
+	TrustedProxyCIDRs  []string // specific public relay/CDN IPs or CIDRs whose forwarded HTTP headers are trusted
 	ListenIP           string
 	ListenPort         int // optional local port override (0 = follow panel server_port)
 
@@ -103,7 +104,7 @@ type Config struct {
 	DNSStrategy        string // ipv4_first, ipv6_first, ipv4_only, ipv6_only
 	DNSCacheTime       int    // minutes (soga `dns_cache_time=10`)
 	DNSConfigURL       string // optional remote URL to fetch dns.yml
-	DomainSniff        bool   // rewrite target IP with sniffed SNI/Host when matching DNS/route unlock rules
+	DomainSniff        bool   // rewrite target IP with sniffed SNI/Host (Soga/Xray destOverride: ["http","tls"], routeOnly=false)
 	ForceDomainSniff   bool   // always rewrite target IP with sniffed SNI/Host
 	LogLevel           string
 
@@ -115,8 +116,9 @@ type Config struct {
 
 	// CPU & Memory optimization settings (xoga enhancements)
 	EnableZeroCopy bool   // Linux splice(2) kernel zero-copy when unthrottled
-	MemLimitMB     int    // Soft GOMEMLIMIT in MiB (0 = auto 512 MiB)
+	MemLimitMB     int    // Soft GOMEMLIMIT in MiB (0 = disabled / Go default)
 	GCPercent      int    // Go GOGC target percentage
+	GCPercentSet   bool   // true when gc_percent was explicitly set via config or env
 	ConnIdleSec    int    // Idle TCP stream timeout in seconds (default 300)
 	UDPIdleSec     int    // Idle UDP session timeout in seconds (default 60)
 	PprofAddr      string // Optional localhost pprof address (e.g. 127.0.0.1:16060)
@@ -244,6 +246,13 @@ func (c *Config) ApplyKV(key, val string) {
 		c.UDPProxyProtocol = parseBool(val, false)
 	case "trust_forwarded_ip":
 		c.TrustForwardedIP = parseBool(val, false)
+	case "trusted_proxy_cidrs":
+		c.TrustedProxyCIDRs = nil
+		for _, part := range strings.Split(val, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, p)
+			}
+		}
 	case "listen_ip":
 		c.ListenIP = val
 	case "listen_port":
@@ -410,6 +419,7 @@ func (c *Config) ApplyKV(key, val string) {
 	case "gc_percent":
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			c.GCPercent = n
+			c.GCPercentSet = true
 		}
 	case "conn_idle_sec":
 		if n, err := strconv.Atoi(val); err == nil && n >= 15 {
@@ -521,7 +531,7 @@ var knownEnvKeys = []string{
 	"type", "server_type", "node_id", "soga_key", "api",
 	"webapi_url", "webapi_key", "webapi_mukey",
 	"cert_file", "key_file", "cert_mode", "cert_domain", "cert_key_length", "dns_provider", "force_close_ssl",
-	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "trust_forwarded_ip", "listen_ip", "listen_port",
+	"proxy_protocol", "force_proxy_protocol", "udp_proxy_protocol", "trust_forwarded_ip", "trusted_proxy_cidrs", "listen_ip", "listen_port",
 	"redis_ip_limit_enable", "redis_enable", "redis_ip_limit_addr", "redis_addr",
 	"redis_ip_limit_password", "redis_password", "redis_ip_limit_db", "redis_db",
 	"redis_ip_limit_tls", "redis_tls", "redis_ip_limit_expiry", "conn_limit_expiry",
@@ -738,9 +748,12 @@ cert_domain=
 cert_key_length=ec-256
 force_close_ssl=false
 
-# proxy protocol 中转配置
+# proxy protocol 与 L7 中转/CDN 透传真实 IP 配置
 proxy_protocol=false
 udp_proxy_protocol=false
+trust_forwarded_ip=false
+# 指定信任的公网 L7 中转/CDN IP 或 CIDR（逗号分隔），仅信任来自这些源 IP 的 X-Forwarded-For / CF-Connecting-IP / X-Real-IP
+trusted_proxy_cidrs=
 
 # 全局限制用户 IP 数配置 (原生轻量 RESP 协议，无需重量级 SDK)
 redis_ip_limit_enable=false
